@@ -158,19 +158,41 @@ func fwdConcurrency() int {
 // 注：上游包体空闲超时复用 convert_stream.go 的 newIdleTimeoutBody +
 // streamIdleTimeout()（超时直接 Close 打断阻塞 Read），main.go 不另造类型。
 
-var httpClient = &http.Client{
-	Timeout: 0,
-	Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
-		ResponseHeaderTimeout: headerTimeout(),
-		// 透明 gzip 无上限解压=压缩炸弹敞口；SSE/JSON 体小，关了只多一点带宽。
-		DisableCompression: true,
-		// 代理/VPN 常静默掐空闲 keep-alive（对端 RST/半开），池里陈连接复用即
-		// unexpected EOF。用比缺省更短的空闲上限，宁可多建连，不复用僵尸连接。
-		IdleConnTimeout: 60 * time.Second,
-	},
+// zenTLS 选出口传输层：
+//
+//	bun（默认）  原生 Bun 兼容传输：uTLS 复刻 ClientHello + fetch 头序 + HTTP/1.1
+//	go           标准库（排障用；上游免费层按指纹 429）
+func zenTLS() string {
+	switch strings.ToLower(strings.TrimSpace(env("ZEN_TLS", "bun"))) {
+	case "go", "std", "stdlib":
+		return "go"
+	}
+	return "bun"
+}
+
+// httpClient 是通往上游的唯一出口。默认走原生 Bun 兼容传输，不再需要 bun 运行时。
+var httpClient = newUpstreamClient()
+
+func newUpstreamClient() *http.Client {
+	if zenTLS() == "bun" {
+		return &http.Client{
+			Transport: newBunTransport(proxyFromEnvironment(), headerTimeout(), 60*time.Second),
+		}
+	}
+	return &http.Client{
+		Timeout: 0,
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   20,
+			ResponseHeaderTimeout: headerTimeout(),
+			// 透明 gzip 无上限解压=压缩炸弹敞口；SSE/JSON 体小，关了只多一点带宽。
+			DisableCompression: true,
+			// 代理/VPN 常静默掐空闲 keep-alive（对端 RST/半开），池里陈连接复用即
+			// unexpected EOF。用比缺省更短的空闲上限，宁可多建连，不复用僵尸连接。
+			IdleConnTimeout: 60 * time.Second,
+		},
+	}
 }
 
 // isTransportRetryable 上游传输层失败是否值得同请求重试一次。
@@ -824,6 +846,11 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 
 	buildBody := func() []byte {
 		u := buildUpstream(entry, target, in)
+		// 免费层门禁：messages[0] 必须是 OpenCode 官方 system 提示词。
+		// 只在 chat 形请求上注入（与 sidecar 时代的行为一致）。
+		if entry == FmtChat {
+			injectOfficialSystemPrompt(u)
+		}
 		// FreeTier 门禁实测要求上游 stream:true（否则 403）；
 		// 客户端非流由网关聚 SSE 回 JSON（见 nonstream.go）。
 		u["stream"] = true

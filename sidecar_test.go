@@ -192,6 +192,8 @@ func TestSidecarNewConnPerRequest(t *testing.T) {
 	if bunBinary() == "" {
 		t.Skip("no bun on this machine")
 	}
+	// 原生传输默认接管后，sidecar 改为显式开启；本用例测的是 sidecar 自身。
+	t.Setenv("DIRECT_SIDECAR", "on")
 
 	var mu sync.Mutex
 	var ports []string
@@ -251,6 +253,8 @@ func TestSidecarSpawnInjectsPrompt(t *testing.T) {
 	if bunBinary() == "" {
 		t.Skip("no bun on this machine")
 	}
+	// 原生传输默认接管后，sidecar 改为显式开启；本用例测的是 sidecar 自身。
+	t.Setenv("DIRECT_SIDECAR", "on")
 
 	var gotBody []byte
 	var gotPath string

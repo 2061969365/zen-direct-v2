@@ -110,13 +110,19 @@ func newSidecarProc() *sidecarProc {
 
 var sidecar = newSidecarProc()
 
-// sidecarOff 读 DIRECT_SIDECAR；默认开启（免费层只有这条路能过）。
+// sidecarOff 读 DIRECT_SIDECAR。
+//
+// 三态：显式 off/on 按用户说的算；没设时看传输层——原生 Bun 兼容传输
+// （ZEN_TLS=bun，默认）已经接管 TLS 指纹与提示词注入，就不再拉 bun 进程；
+// ZEN_TLS=go 退回标准库时，仍按老路子拉起 sidecar 兜底指纹。
 func sidecarOff() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("DIRECT_SIDECAR"))) {
 	case "0", "off", "false", "no", "disable", "disabled":
 		return true
+	case "1", "on", "true", "yes", "enable", "enabled":
+		return false
 	}
-	return false
+	return zenTLS() == "bun"
 }
 
 // isLoopbackHost 判断 upstream 是否指向本机。

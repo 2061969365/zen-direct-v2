@@ -1316,6 +1316,11 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int
 }
 
 func main() {
+	// 传输层自检模式：只发一条上游请求就退出，不起网关、不碰会话池。
+	if os.Getenv("ZEN_PROBE_BODY") != "" {
+		runProbe()
+		return
+	}
 	var err error
 	// 网关自管日志文件：LOG_FILE 设路径即启用，按 LOG_MAX_MB（默认 200）总量轮转；
 	// 未设则沿用 stderr（旧行为）。自管后不再依赖外部重定向，Hidden 启动不丢日志。

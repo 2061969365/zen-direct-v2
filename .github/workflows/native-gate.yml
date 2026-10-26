@@ -1,0 +1,114 @@
+name: native-gate
+
+# 云端验证：不依赖本地 IP，验证「原生 Go 传输层能否过免费层门禁」。
+#
+# 每个 shard 一个独立出口 IP，同一份真实 CLI 抓包 body、同一个真 session：
+#   P1  zen-direct（ZEN_TLS=bun 默认）  期望 200
+#   C1  bun fetch（对照）               期望 200
+#   P2  zen-direct（ZEN_TLS=go）        期望 429（证明判据确实是传输层）
+#
+# 判定：
+#   P1=200 且 C1=200        → 原生传输可用
+#   P1=429 且 C1=200        → 我们的 hello/头序还有偏差
+#   C1=429                  → 本 shard 的 IP 脏，作废
+
+on:
+  workflow_dispatch:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: install bun + opencode cli
+        run: |
+          curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1 || true
+          "$HOME/.bun/bin/bun" --version
+          npm install -g @opencode/cli@latest 2>&1 | tail -1
+          opencode --version
+      - name: shard ${{ matrix.shard }}
+        run: |
+          set -u
+          export PATH="$HOME/.npm-global/bin:$HOME/.bun/bin:$PATH"
+          export OPENCODE_DISABLE_AUTOUPDATE=1
+          W="$PWD/_gate"; mkdir -p "$W"
+          IP=$(curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["query"])')
+          echo "shard=${{ matrix.shard }} ip=$IP"
+
+          set +e
+          timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free \
+            "Reply with the single word: ok" >"$W/c0.out" 2>"$W/c0.err"
+          C0=$?
+          set -e
+          echo "C0 exit=$C0 out=$(tail -1 "$W/c0.out")"
+          if [ "$C0" != "0" ]; then echo "SHARD ${{ matrix.shard }} IP=$IP DIRTY"; exit 0; fi
+          echo "SHARD ${{ matrix.shard }} IP=$IP CLEAN"
+
+          REAL=$(python3 - <<'PY'
+          import os, re, sqlite3
+          db = os.path.expanduser("~/.local/share/opencode/opencode.db")
+          try:
+              con = sqlite3.connect(db)
+              for t in [r[0] for r in con.execute("select name from sqlite_master where type='table'")]:
+                  try:
+                      rows = con.execute("select * from %s order by rowid desc limit 40" % t).fetchall()
+                  except Exception:
+                      continue
+                  for row in rows:
+                      for v in row:
+                          if isinstance(v, str):
+                              m = re.findall(r"ses_[0-9A-Za-z]{20,}", v)
+                              if m:
+                                  print(m[0]); raise SystemExit
+          except SystemExit:
+              raise
+          except Exception:
+              pass
+          PY
+          )
+          echo "REAL=$REAL"; [ -n "$REAL" ] || exit 0
+
+          go build -trimpath -o "$W/zen-direct" .
+          echo "built: $(ls -l "$W/zen-direct" | awk '{print $5}') bytes"
+
+          echo "=== P1: zen-direct native (ZEN_TLS=bun) ==="
+          ZEN_PROBE_BODY="$PWD/tools/cli_capture_body.json" ZEN_PROBE_SESSION="$REAL" \
+            "$W/zen-direct" || true
+          sleep 2
+
+          echo "=== C1: bun fetch (control) ==="
+          cat > "$W/bun.js" <<'JS'
+          const fs = require("fs");
+          const body = fs.readFileSync(process.env.BODY, "utf8");
+          const ses = process.env.SES;
+          const headers = {
+            "Authorization": "Bearer public",
+            "Content-Type": "application/json",
+            "User-Agent": "opencode/latest/2.0.29/cli",
+            "X-Opencode-Client": "cli",
+            "X-Opencode-Project": "global",
+            "X-Opencode-Session": ses,
+            "X-Opencode-Session-Id": ses,
+            "X-Session-Affinity": ses,
+            "X-Session-Id": ses,
+          };
+          const r = await fetch("https://opencode.ai/inference/v1/chat/completions",
+            { method: "POST", headers, body });
+          const t = await r.text();
+          console.log("bun ses=" + ses + " -> " + r.status + " " + JSON.stringify(t.slice(0, 160)));
+          process.exit(r.status === 200 ? 0 : 1);
+          JS
+          BODY="$PWD/tools/cli_capture_body.json" SES="$REAL" "$HOME/.bun/bin/bun" "$W/bun.js" || true
+          sleep 2
+
+          echo "=== P2: zen-direct stdlib (ZEN_TLS=go, 阴性对照) ==="
+          ZEN_TLS=go ZEN_PROBE_BODY="$PWD/tools/cli_capture_body.json" ZEN_PROBE_SESSION="$REAL" \
+            "$W/zen-direct" || true

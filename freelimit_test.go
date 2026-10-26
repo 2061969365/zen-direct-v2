@@ -95,6 +95,14 @@ func TestFreeLimitCooldownShortCircuits(t *testing.T) {
 	freeLimitUntil.Store(0)
 	t.Cleanup(func() { freeLimitUntil.Store(0) })
 
+	// 钉死出口 IP：否则别的用例/异步探测可能把 freeLimitIP 改成另一个值，
+	// 走「换 IP 清冷却」分支，本用例就会偶发地放行成 200。
+	origIP := egressIPFunc
+	egressIPFunc = func() string { return "203.0.113.7" }
+	freeLimitIP.Store("203.0.113.7")
+	freeLimitIPCheck.Store(0)
+	defer func() { egressIPFunc = origIP }()
+
 	freeLimitUntil.Store(time.Now().Add(time.Minute).UnixMilli())
 	req := httptest.NewRequest("POST", "http://x/v1/responses",
 		strings.NewReader(`{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":"cool"}]}`))

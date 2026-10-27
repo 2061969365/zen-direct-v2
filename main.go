@@ -123,7 +123,21 @@ func setZenHeaders(h http.Header, apiKey, project string) {
 	setDefault(h, "X-Opencode-Session-Id", ses)
 	setDefault(h, "X-Session-Affinity", ses)
 	setDefault(h, "X-Session-Id", ses)
-	setDefault(h, "X-Opencode-Project", project)
+
+	// project id 不能走 setDefault：它会把客户端原样值放过去，而 prj_* 这类
+	// 形状会被 v2 门禁直接 403。客户端声明了就按形状归一，没声明就现签一个
+	// ——免费层按 project + 出口记额度，发常量等于共用被烧穿的公共桶。
+	declared := strings.TrimSpace(h.Get("X-Opencode-Project"))
+	if declared == "" {
+		declared = project
+	}
+	pid := upstreamProjectID(declared)
+	h.Set("X-Opencode-Project", pid)
+	if diagOn() {
+		// 免费层按 project id + 出口记额度；把这行打出来，才能从日志确认
+		// 每次请求确实换了桶（也让云端回归能断言两个 id 不同）。
+		log.Printf("upstream project=%s", pid)
+	}
 }
 
 func writeErr(w http.ResponseWriter, code int, typ, msg string) {
@@ -439,6 +453,7 @@ func isPlainThrottle(body []byte) bool {
 //   - 同一 IP 紧接着发全新 session（从未上游出现过）-> 也 429，
 //     0s / +60s / +120s 三次都是 429；
 //   - 对照 IP 只发全新 session，2 分钟内四次全 200。
+//
 // 即额度按 session 计，但“碰一次毒 session”会把出口 IP 连坐数分钟。
 // 故吃了 free-limit 429 之后必须停手冷却：继续打只会把新 session 一起烧掉。
 var (
@@ -1357,7 +1372,9 @@ func main() {
 		os.Exit(0)
 	}()
 	apiKey = env("OPENCODE_ZEN_API_KEY", "public")
-	project = env("OPENCODE_ZEN_PROJECT", "global")
+	// 空 = 每次请求现签一个 project id。免费层按「project id + 出口 IP」记额度，
+	// 发常量等于所有人共用公共桶（热门出口早已烧穿）。显式设置则固定用它。
+	project = env("OPENCODE_ZEN_PROJECT", "")
 	seedBuiltinTable()
 	tableStartRefresher() // 官方 Endpoints 表刷新（失败则沿用内置快照）
 	poolLoad()

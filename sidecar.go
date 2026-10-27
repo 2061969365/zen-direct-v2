@@ -651,7 +651,11 @@ func sidecarUpstream(baseRaw string) string {
 		return baseRaw
 	}
 	if sidecarOff() {
-		log.Printf("sidecar: DIRECT_SIDECAR=off，直连 %s（免费层会 429）", baseRaw)
+		if zenTLS() == "bun" {
+			log.Printf("sidecar: 已停用，原生 Bun 兼容传输直连 %s（uTLS + fetch 头序）", baseRaw)
+		} else {
+			log.Printf("sidecar: 已停用，标准库 TLS 直连 %s（免费层会 429）", baseRaw)
+		}
 		return baseRaw
 	}
 	if isLoopbackHost(u.Hostname()) {
@@ -661,7 +665,7 @@ func sidecarUpstream(baseRaw string) string {
 	origin := u.Scheme + "://" + u.Host
 	base, err := startSidecar(origin, u.Path)
 	if err != nil {
-		log.Printf("sidecar 未启动，回退直连 %s（免费层会 429）：%v", baseRaw, err)
+		log.Printf("sidecar 未启动，回退直连 %s（传输层仍按 ZEN_TLS=%s 走）：%v", baseRaw, zenTLS(), err)
 		return baseRaw
 	}
 	return base

@@ -16,3 +16,8 @@ gw.log
 *_windows_amd64.syso
 
 /sidecar/
+
+# 运行时会话状态（含真实 session id，别进仓库）
+state/
+logs/
+dist/

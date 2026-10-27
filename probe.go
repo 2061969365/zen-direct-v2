@@ -45,7 +45,7 @@ func runProbe() {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", agent)
 	req.Header.Set("X-Opencode-Client", "cli")
-	req.Header.Set("X-Opencode-Project", "global")
+	req.Header.Set("X-Opencode-Project", upstreamProjectID(env("OPENCODE_ZEN_PROJECT", "")))
 	if session != "" {
 		for _, name := range []string{
 			"X-Opencode-Session", "X-Opencode-Session-Id", "X-Session-Affinity", "X-Session-Id",

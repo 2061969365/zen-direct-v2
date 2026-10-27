@@ -81,6 +81,20 @@ jobs:
           echo "E2E native status=$CODE chunks=$CHUNKS done=$DONE bytes=$(wc -c <"$W/stream.txt")"
           head -c 200 "$W/stream.txt"; echo
           tail -c 160 "$W/stream.txt"; echo
+
+          # 同一网关、同一份 body → 同一会话池指纹，但 project id 每次现签。
+          # 这一发验证：换 project 桶不会把多轮对话打回 403/429。
+          echo "=== N1b: same session, second turn (fresh project id) ==="
+          CODE1B=$(curl -sS --max-time 150 -o "$W/turn2.txt" -w '%{http_code}' \
+            -X POST http://127.0.0.1:18081/v1/chat/completions \
+            -H 'Content-Type: application/json' --data-binary @"$W/req.json" || echo 000)
+          DONE1B=$(grep -c '\[DONE\]' "$W/turn2.txt" 2>/dev/null || true)
+          echo "E2E native-turn2 status=$CODE1B done=$DONE1B bytes=$(wc -c <"$W/turn2.txt")"
+          PROJECTS=$(grep -o 'upstream project=[0-9a-f]*' "$W/gw-native.log" 2>/dev/null | sed 's/.*=//' | sort -u)
+          echo "E2E project ids:"; echo "$PROJECTS"
+          PROJECT_N=$(echo "$PROJECTS" | grep -c . || true)
+          echo "E2E distinct project ids=$PROJECT_N"
+
           kill $PID1 2>/dev/null; sleep 1
           echo "--- native gateway log ---"; tail -n 10 "$W/gw-native.log"
 
@@ -114,8 +128,16 @@ jobs:
             fi
           fi
 
-          if [ "$CODE" != "200" ] || [ "$DONE" -lt 1 ]; then
-            echo "RESULT native=FAIL status=$CODE done=$DONE stdlib=$CODE2"
+          LAST2=$(echo "$PROJECTS" | tail -2)
+          P_A=$(echo "$LAST2" | sed -n 1p)
+          P_B=$(echo "$LAST2" | sed -n 2p)
+          if [ -n "$P_A" ] && [ "$P_A" = "$P_B" ]; then
+            echo "RESULT project=FAIL 连续两发用了同一个 project id $P_A（应现签）"
             exit 1
           fi
-          echo "RESULT native=OK status=$CODE chunks=$CHUNKS done=$DONE stdlib=$CODE2"
+
+          if [ "$CODE" != "200" ] || [ "$DONE" -lt 1 ] || [ "$CODE1B" != "200" ]; then
+            echo "RESULT native=FAIL status=$CODE done=$DONE turn2=$CODE1B stdlib=$CODE2"
+            exit 1
+          fi
+          echo "RESULT native=OK status=$CODE chunks=$CHUNKS done=$DONE turn2=$CODE1B projects=$PROJECT_N stdlib=$CODE2"

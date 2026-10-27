@@ -25,6 +25,15 @@ import (
 	"time"
 )
 
+// probeProjectID 是自检模式的 project 选择：显式配置优先（A/B 时要能钉死
+// 一个值），没配就现签一个。
+func probeProjectID() string {
+	if v := strings.TrimSpace(os.Getenv("OPENCODE_ZEN_PROJECT")); v != "" {
+		return v
+	}
+	return randomProjectID()
+}
+
 func runProbe() {
 	bodyPath := os.Getenv("ZEN_PROBE_BODY")
 	body, err := os.ReadFile(bodyPath)
@@ -45,7 +54,8 @@ func runProbe() {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", agent)
 	req.Header.Set("X-Opencode-Client", "cli")
-	req.Header.Set("X-Opencode-Project", upstreamProjectID(env("OPENCODE_ZEN_PROJECT", "")))
+	pid := probeProjectID()
+	req.Header.Set("X-Opencode-Project", pid)
 	if session != "" {
 		for _, name := range []string{
 			"X-Opencode-Session", "X-Opencode-Session-Id", "X-Session-Affinity", "X-Session-Id",
@@ -68,8 +78,8 @@ func runProbe() {
 		n, _ = resp.Body.Read(head)
 	}
 	text := strings.ReplaceAll(strings.ToValidUTF8(string(head[:n]), "?"), "\n", " ")
-	fmt.Printf("probe tls=%s ses=%s bytes=%d -> %d %q retry-after=%q %dms\n",
-		zenTLS(), session, len(body), resp.StatusCode, text,
+	fmt.Printf("probe tls=%s proj=%s ses=%s bytes=%d -> %d %q retry-after=%q %dms\n",
+		zenTLS(), pid, session, len(body), resp.StatusCode, text,
 		resp.Header.Get("Retry-After"), time.Since(start).Milliseconds())
 	if resp.StatusCode != http.StatusOK {
 		os.Exit(1)

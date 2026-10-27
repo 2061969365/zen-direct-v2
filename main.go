@@ -125,17 +125,24 @@ func setZenHeaders(h http.Header, apiKey, project string) {
 	setDefault(h, "X-Session-Id", ses)
 
 	// project id 不能走 setDefault：它会把客户端原样值放过去，而 prj_* 这类
-	// 形状会被 v2 门禁直接 403。客户端声明了就按形状归一，没声明就现签一个
-	// ——免费层按 project + 出口记额度，发常量等于共用被烧穿的公共桶。
+	// 形状会被 v2 门禁直接 403。
+	//
+	// 优先级：客户端声明 > OPENCODE_ZEN_PROJECT（显式配置，原样发）> 现签。
+	// 现签是因为免费层按 project + 出口记额度，共用常量等于共用被烧穿的桶。
 	declared := strings.TrimSpace(h.Get("X-Opencode-Project"))
-	if declared == "" {
-		declared = project
+	var pid string
+	switch {
+	case declared != "":
+		pid = renderedProjectID(declared)
+	case project != "":
+		pid = project
+	default:
+		pid = randomProjectID()
 	}
-	pid := upstreamProjectID(declared)
 	h.Set("X-Opencode-Project", pid)
 	if diagOn() {
 		// 免费层按 project id + 出口记额度；把这行打出来，才能从日志确认
-		// 每次请求确实换了桶（也让云端回归能断言两个 id 不同）。
+		// 每次请求到底用了哪个桶（也让云端回归能断言）。
 		log.Printf("upstream project=%s", pid)
 	}
 }

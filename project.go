@@ -7,8 +7,13 @@ package main
 // 的调用方发同一个常量，等于所有人共用一个桶——热门出口上那个桶早被烧穿，
 // 于是同一份请求换个出口能过、原出口一直 429。
 //
-// 对策：每次请求现签一个 40 位小写 hex。官方 CLI 发的是 git root commit，
-// 正好是这形状；上游只校验形状，不校验值。
+// 对策：没有 project 可用时，每次请求现签一个 40 位小写 hex。官方 CLI 发的
+// 是 git root commit，正好是这形状。
+//
+// 注意：是否现签取决于「客户端声明了没有 / 运维配了没有」——
+//   - 客户端声明了 X-Opencode-Project：按形状归一后发送（保留客户端身份）
+//   - OPENCODE_ZEN_PROJECT 显式配置：原样发送（运维的明确选择，可回退 global）
+//   - 两者都没有：现签一个新号
 
 import (
 	"crypto/rand"
@@ -20,23 +25,15 @@ import (
 // gitCommitPattern 是官方 CLI 发的 project id 形状：git root commit，40 位小写 hex。
 var gitCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
-// upstreamProjectID 把 project 渲染成上游要的形状：
+// renderedProjectID 渲染客户端声明的 project：
 //
-//	"" / "global"   -> 现签一个 40 位 hex（默认；"global" 是公共桶，不共用）
-//	40 位小写 hex   -> 原样（真实 git root commit）
-//	其余            -> sha256 成 40 位 hex，稳定映射同一个上游 project
+//	40 位小写 hex 或 "global" -> 原样（官方 CLI 的两种真实取值）
+//	其余（如 prj_*）          -> sha256 成 40 位 hex，稳定映射同一个上游 project
 //
 // 之所以要哈希而不是原样发：上游 v2 门禁拒绝 prj_* 这类带前缀的 project id
 // （403 FreeTierError），形状不对的值同样有风险。
-func upstreamProjectID(project string) string {
-	switch {
-	case project == "":
-		return randomProjectID()
-	case project == "global":
-		// "global" 不是官方 CLI 的项目身份，只是「没有仓库」的占位，上游把它
-		// 当成一个所有人共用的桶。这里改签新号，避免继承被烧穿的公共桶。
-		return randomProjectID()
-	case gitCommitPattern.MatchString(project):
+func renderedProjectID(project string) string {
+	if project == "" || project == "global" || gitCommitPattern.MatchString(project) {
 		return project
 	}
 	sum := sha256.Sum256([]byte("opencode-project\x00" + project))

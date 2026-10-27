@@ -48,7 +48,7 @@ jobs:
           echo "SHARD ${{ matrix.shard }} IP=$IP CLEAN"
 
           go build -trimpath -ldflags "-X main.appVersion=e2e" -o "$W/zen-direct" .
-          trap 'kill ${PID1:-} ${PID2:-} ${PID3:-} 2>/dev/null' EXIT
+          trap 'kill ${PID1:-} ${PID2:-} ${PID3:-} 2>/dev/null || true' EXIT
           echo "built: $(ls -l "$W/zen-direct" | awk '{print $5}') bytes"
 
           cat > "$W/req.json" <<'JSON'

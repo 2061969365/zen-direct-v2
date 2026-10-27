@@ -83,7 +83,11 @@ func startUAVersionRefresher() {
 // refreshUAVersion 拉 npm 的 latest 版本并（同主版本时）提升。
 // 失败静默：拿不到就继续用已验证的版本，不能因为查询失败把网关带崩。
 func refreshUAVersion() {
-	client := &http.Client{Timeout: uaRefreshTimeout}
+	// 走环境里的代理：本机/国内直连 registry.npmjs.org 常常不通。
+	client := &http.Client{
+		Timeout:   uaRefreshTimeout,
+		Transport: &http.Transport{Proxy: http.ProxyFromEnvironment},
+	}
 	resp, err := client.Get(uaRefreshURL)
 	if err != nil {
 		return

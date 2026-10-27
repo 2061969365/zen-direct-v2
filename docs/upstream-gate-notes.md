@@ -102,9 +102,9 @@ fetch 头序、官方 system 提示词）仍然有效，但**版本号是第四�
 | 想回到公共 project 桶 | `OPENCODE_ZEN_PROJECT=global`（不推荐：热门出口会撞墙） |
 | 排障用标准库 TLS | `ZEN_TLS=go`（会 429，只用于确认「是不是传输层」） |
 
-## 7. 云端验证结果（2026-10-27 修复后）
+## 6. 验证结果（2026-10-27 修复后）
 
-### 7.1 同 IP 同轮序（`binary-ab`，IP 134.33.67.127）
+### 6.1 同 IP 同轮序（`binary-ab`，IP 134.33.67.127）
 
 | 步骤 | 实现 | 结果 |
 |---|---|---|
@@ -112,7 +112,7 @@ fetch 头序、官方 system 提示词）仍然有效，但**版本号是第四�
 | O1 | opencode2api v1.4.5 | 200 |
 | Z1 | zen-direct v2（现签 project + UA 自动跟到 2.2.0） | **200** |
 
-### 7.2 网关端到端（`gateway-e2e`，3 个独立 IP）
+### 6.2 网关端到端（`gateway-e2e`，3 个独立 IP）
 
 | shard | IP | 流式 | 第二发（换 project 桶） | project id 数 | 标准库对照 |
 |---|---|---|---|---|---|
@@ -123,9 +123,14 @@ fetch 头序、官方 system 提示词）仍然有效，但**版本号是第四�
 结论：**同一 session 连续两发、每次换 project 桶，仍然 200** —— 现签 project id
 不会打断多轮对话。
 
-## 8. 还没验证的
+### 6.3 本机常驻
+
+- 二进制：`v0.9.1-dev`（`dist/zen-direct-v0.9.1-dev-{windows-amd64.exe,linux-amd64}`）
+- 实测日志：`ua: client version 2.1.1 -> 2.2.0 (npm latest)`（走系统代理拉到的）
+- 注意：常驻进程重启后 project id 每次现签，会话池不受影响
+
+## 7. 还没验证的
 
 - `/v1/messages`、`/v1/responses` 端到端（10-26 只跑过 chat）
 - 代理链路（CONNECT / SOCKS5）
-- UA 自动跟随在长期运行下的行为（定时刷新、跨主版本不跟）
 - 上游下次会换什么判据（无法预测，只能保留排查工作流）

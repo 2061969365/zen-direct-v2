@@ -1,0 +1,99 @@
+name: prompt-ua-ab
+
+# 同一份抓包 body、真 session、我们的传输层（uTLS），只换「系统提示词」和「UA」：
+#
+#   p2u211  他们 v1.4.5 的 v2 提示词 + UA opencode/latest/2.1.1/cli
+#   p2u029  他们 v1.4.5 的 v2 提示词 + 我们原来的 UA 2.0.29
+#   p1u211  我们抓的提示词（v1 风格，2.0.29） + UA 2.1.1
+#
+# 每个变体一个独立 IP（一次 free-limit 429 会把出口连坐十几分钟）。
+# 判定：
+#   只有 p2u211 过        → 提示词和 UA 都要换
+#   p2u211 + p2u029 过    → 提示词是关键，UA 无所谓
+#   p2u211 + p1u211 过    → UA 是关键，提示词无所谓
+#   全不过                → 差异不在提示词/UA，是别的（头集合/body 整形）
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [p2u211, p2u029, p1u211]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: install opencode cli
+        run: |
+          npm install -g @opencode/cli@latest 2>&1 | tail -1
+          opencode --version
+      - name: variant ${{ matrix.variant }}
+        run: |
+          set -u
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export OPENCODE_DISABLE_AUTOUPDATE=1
+          W="$PWD/_pua"; mkdir -p "$W"
+          IP=$(curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["query"])')
+          echo "variant=${{ matrix.variant }} ip=$IP"
+
+          set +e
+          timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free \
+            "Reply with the single word: ok" >"$W/c0.out" 2>"$W/c0.err"
+          C0=$?
+          set -e
+          echo "C0 exit=$C0 out=$(tail -1 "$W/c0.out")"
+          if [ "$C0" != "0" ]; then echo "VARIANT ${{ matrix.variant }} IP=$IP DIRTY"; exit 0; fi
+          echo "VARIANT ${{ matrix.variant }} IP=$IP CLEAN"
+
+          REAL=$(python3 - <<'PY'
+          import os, re, sqlite3
+          db = os.path.expanduser("~/.local/share/opencode/opencode.db")
+          try:
+              con = sqlite3.connect(db)
+              for t in [r[0] for r in con.execute("select name from sqlite_master where type='table'")]:
+                  try:
+                      rows = con.execute("select * from %s order by rowid desc limit 40" % t).fetchall()
+                  except Exception:
+                      continue
+                  for row in rows:
+                      for v in row:
+                          if isinstance(v, str):
+                              m = re.findall(r"ses_[0-9A-Za-z]{20,}", v)
+                              if m:
+                                  print(m[0]); raise SystemExit
+          except SystemExit:
+              raise
+          except Exception:
+              pass
+          PY
+          )
+          echo "REAL=$REAL"; [ -n "$REAL" ] || exit 0
+
+          git clone --depth 1 --branch v1.4.5 https://github.com/jasonxu114514/opencode2api "$W/o2a" 2>&1 | tail -1
+          go build -trimpath -ldflags "-X main.appVersion=pua" -o "$W/zen-direct" .
+
+          VARIANT="${{ matrix.variant }}" python3 - "$W/o2a/internal/gateway/opencode_prompt_v2.txt" "$W/body.json" <<'PY'
+          import json, os, sys
+          prompt_path, out_path = sys.argv[1], sys.argv[2]
+          variant = os.environ["VARIANT"]
+          body = json.load(open("tools/cli_capture_body.json", encoding="utf-8"))
+          if variant.startswith("p2"):
+              prompt = open(prompt_path, encoding="utf-8").read().strip()
+              body["messages"][0] = {"role": "system", "content": prompt}
+          json.dump(body, open(out_path, "w", encoding="utf-8"), ensure_ascii=False)
+          print("variant:", variant, "system_len:", len(body["messages"][0]["content"]))
+          PY
+
+          case "${{ matrix.variant }}" in
+            p2u211|p1u211) UA="opencode/latest/2.1.1/cli" ;;
+            *)             UA="opencode/latest/2.0.29/cli" ;;
+          esac
+          echo "=== probe: variant=${{ matrix.variant }} ua=$UA ==="
+          ZEN_PROBE_BODY="$W/body.json" ZEN_PROBE_SESSION="$REAL" ZEN_PROBE_UA="$UA" \
+            "$W/zen-direct" || true

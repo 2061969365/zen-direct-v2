@@ -52,13 +52,21 @@ jobs:
             "listen": "127.0.0.1:18090",
             "server_keys": ["k"],
             "anonymous": true,
-            "warp": { "enabled": false },
+            "warp": { "enabled": false, "pool_size": 1, "stack": "ipv6" },
             "proxies": ["direct"],
             "upstream": { "anonymous": "https://opencode.ai/inference" },
-            "retry": { "max_attempts": 1, "timeout_seconds": 120 },
-            "models": { "refresh_seconds": 0, "free_only": true },
-            "performance": { "free_tier_block_seconds": 0, "max_anonymous_exits": 1 },
-            "logging": { "level": "info" }
+            "retry": { "max_attempts": 1, "timeout_seconds": 180 },
+            "models": { "refresh_seconds": 300, "free_only": true },
+            "performance": {
+              "max_idle_conns": 64,
+              "max_idle_conns_per_host": 16,
+              "idle_conn_timeout_seconds": 60,
+              "connect_timeout_seconds": 10,
+              "failure_cooldown_seconds": 15,
+              "max_anonymous_exits": 1,
+              "free_tier_block_seconds": 1
+            },
+            "logging": { "level": "info", "ring_size": 2000 }
           }
           JSON
 
@@ -69,31 +77,37 @@ jobs:
 
           "$W/o2a-gateway" -config "$W/o2a-config.json" >"$W/o2a.log" 2>&1 &
           O2A_PID=$!
+          READY=0
           for i in $(seq 1 40); do
-            curl -fsS http://127.0.0.1:18090/healthz >/dev/null 2>&1 && break
+            if curl -fsS http://127.0.0.1:18090/healthz >/dev/null 2>&1; then READY=1; break; fi
             sleep 0.5
           done
+          echo "O1 healthz ready=$READY pid_alive=$(kill -0 $O2A_PID 2>/dev/null && echo yes || echo no)"
+          if [ "$READY" != "1" ]; then echo "--- o2a log ---"; tail -n 40 "$W/o2a.log"; kill $O2A_PID 2>/dev/null || true; exit 0; fi
           O1=$(curl -sS --max-time 150 -o "$W/o1.json" -w '%{http_code}' \
             -X POST http://127.0.0.1:18090/v1/chat/completions \
             -H 'Content-Type: application/json' -H 'Authorization: Bearer k' \
             --data-binary @"$W/req.json" || echo 000)
           echo "O1 opencode2api status=$O1 body=$(head -c 240 "$W/o1.json")"
-          kill $O2A_PID 2>/dev/null; sleep 1
-          echo "--- o2a log tail ---"; tail -n 8 "$W/o2a.log"
+          echo "--- o2a log tail ---"; tail -n 12 "$W/o2a.log" || true
+          kill $O2A_PID 2>/dev/null || true
+          sleep 1
 
           # ---------- Z1: zen-direct v2 ----------
           go build -trimpath -ldflags "-X main.appVersion=bab" -o "$W/zen-direct" .
           PORT=18091 "$W/zen-direct" >"$W/zen.log" 2>&1 &
           Z_PID=$!
+          ZREADY=0
           for i in $(seq 1 40); do
-            curl -fsS http://127.0.0.1:18091/health >/dev/null 2>&1 && break
+            if curl -fsS http://127.0.0.1:18091/health >/dev/null 2>&1; then ZREADY=1; break; fi
             sleep 0.5
           done
+          if [ "$ZREADY" != "1" ]; then echo "Z1 gateway not ready"; tail -n 20 "$W/zen.log"; kill $Z_PID 2>/dev/null || true; exit 0; fi
           Z1=$(curl -sS --max-time 150 -o "$W/z1.json" -w '%{http_code}' \
             -X POST http://127.0.0.1:18091/v1/chat/completions \
             -H 'Content-Type: application/json' --data-binary @"$W/req.json" || echo 000)
           echo "Z1 zen-direct status=$Z1 body=$(head -c 240 "$W/z1.json")"
           grep -o 'upstream project=[0-9a-f]*' "$W/zen.log" | tail -1 || true
-          kill $Z_PID 2>/dev/null
+          kill $Z_PID 2>/dev/null || true
 
           echo "RESULT C0=$C0 O1=$O1 Z1=$Z1"

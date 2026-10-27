@@ -43,7 +43,7 @@ func runProbe() {
 	}
 	target := env("ZEN_PROBE_URL", "https://opencode.ai/inference/v1/chat/completions")
 	session := strings.TrimSpace(os.Getenv("ZEN_PROBE_SESSION"))
-	agent := env("ZEN_PROBE_UA", "opencode/latest/2.0.29/cli")
+	agent := env("ZEN_PROBE_UA", uaString())
 
 	req, err := http.NewRequest("POST", target, bytes.NewReader(body))
 	if err != nil {

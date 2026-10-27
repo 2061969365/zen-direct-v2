@@ -27,15 +27,6 @@ import (
 	"time"
 )
 
-// zenUA 上游 UA。DIRECT_UA 可覆盖（用来验证上游是否按客户端版本分额度桶）。
-// 2.0.29 是当初抓包时的版本；本机 CLI 已是 2.1.2。
-var zenUA = func() string {
-	if v := os.Getenv("DIRECT_UA"); v != "" {
-		return v
-	}
-	return "opencode/latest/2.0.29/cli"
-}()
-
 const mintChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 const mintHex = "0123456789abcdef"
 
@@ -113,7 +104,7 @@ func setZenHeaders(h http.Header, apiKey, project string) {
 	h.Del("Authorization")
 	h.Del("X-Api-Key")
 	h.Set("Authorization", "Bearer "+apiKey)
-	h.Set("User-Agent", zenUA)
+	h.Set("User-Agent", uaString())
 	ses := h.Get("X-Opencode-Session")
 	if ses == "" {
 		ses = mintID("ses")
@@ -1382,6 +1373,7 @@ func main() {
 	// 空 = 每次请求现签一个 project id。免费层按「project id + 出口 IP」记额度，
 	// 发常量等于所有人共用公共桶（热门出口早已烧穿）。显式设置则固定用它。
 	project = env("OPENCODE_ZEN_PROJECT", "")
+	startUAVersionRefresher() // 跟 npm 上的客户端版本（版本号已是门禁一部分）
 	seedBuiltinTable()
 	tableStartRefresher() // 官方 Endpoints 表刷新（失败则沿用内置快照）
 	poolLoad()

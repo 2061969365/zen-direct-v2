@@ -129,8 +129,58 @@ fetch 头序、官方 system 提示词）仍然有效，但**版本号是第四�
 - 实测日志：`ua: client version 2.1.1 -> 2.2.0 (npm latest)`（走系统代理拉到的）
 - 注意：常驻进程重启后 project id 每次现签，会话池不受影响
 
-## 7. 还没验证的
+## 7. 图片 / 多模态（2026-10-28）
+
+### 7.1 改动
+
+- 新增 `tool_images.go`（自 opencode2api v1.4.5 `internal/protocol/` 移植：
+  `decodeOpenAIBlocksChecked` / `chatToolImages` / `encodeChatBlocks`）。
+- 新增 `image_hoist.go`：Chat tool 消息里的图片抬成独立 user 消息，
+  tool 消息只留文本 + `[tool_image call_id=.. index=N]` 标记；
+  顺序保持 `assistant(tool_calls)` → `tool...` → `user(images)`。
+  无图请求一个字节都不改。
+- 删除 `clampMediaURL`（原 64KB 截断会把大图换成 `[omitted N bytes]` 坏 data URL），
+  改为原样透传；结构非法的 data URI 由上面两个函数返回 400。
+- `DIRECT_DUMP_SHAPE=1` 打开请求形状日志（只打角色/块类型/字节数，不打内容）。
+
+### 7.2 云端对照（`image-ab`，5 个独立 IP）
+
+| shard | 通道 | 形状 | 状态 | prompt_tokens |
+|---|---|---|---|---|
+| 1 | 官方 CLI `--file red.png` | 官方上传 | 200「Red」 | — |
+| 2 | 网关新 | 图在 user 消息 | 200「Red」 | 2669 |
+| 3 | 网关新 | 图在 tool 消息（抬升后） | 200「Red」 | 2751 |
+| 4 | 网关旧（HEAD） | 图在 tool 消息（不抬升） | 200「Red」 | 2722 |
+| 5 | 网关新 | 1.05MB 大图，不截断 | 200 | 2669 |
+
+shard 3 的形状日志：`assistant[] tool[text:56] user[text:37,image:466] user[text:60]`
+—— tool 消息只剩文本+标记，图片进了独立 user 消息。
+
+### 7.3 多轮缓存（`image-cache`，2 个独立 IP）
+
+| 组 | 第 1 轮 | 第 2 轮 | 第 3 轮 |
+|---|---|---|---|
+| 带图 | prompt 2654 / cached 2432 | 2669 / **2560** | 2684 / 2560 |
+| 纯文本 | 2470 / 2432 | 2485 / 2432 | 2500 / 1664 |
+
+图片进上下文后**没有破坏前缀缓存**（第 2 轮 cached 反而涨到 2560），
+每轮新增只有 ~120 token。
+
+### 7.4 结论（修正之前的猜测）
+
+- 图片本身**不是** 429 的成因：4 种形状全部 200，token 成本与纯文本同级，
+  1MB 大图也不触发限流。
+- shard 4 说明「图放在 tool 消息里」上游本来就认，A 方案属于**协议对齐**
+  （与 opencode2api / 官方客户端一致），不是 429 修复。
+- 真正烧额度的是**非缓存输入**：10-27 单日 `input` 合计 1 605 万 token
+  （`cacheRead` 2.68 亿），有 88 次单请求非缓存输入 > 50k。免费额度是
+  按 token 计的，长时间跑大上下文就会撞上 `FreeUsageLimitError`，
+  和是否带图无关。
+
+## 8. 还没验证的
 
 - `/v1/messages`、`/v1/responses` 端到端（10-26 只跑过 chat）
 - 代理链路（CONNECT / SOCKS5）
 - 上游下次会换什么判据（无法预测，只能保留排查工作流）
+- 免费额度的准确口径（按 token 还是按请求、窗口长度）仍只能从
+  `FreeUsageLimitError` 的时点反推

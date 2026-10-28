@@ -25,12 +25,15 @@ import (
 )
 
 const (
-	// uaDefaultVersion 是实测能过门禁的版本。不要随便降：2.0.29 已被拒。
-	uaDefaultVersion = "2.1.1"
-	uaRefreshURL     = "https://registry.npmjs.org/@opencode/cli/latest"
+	// uaDefaultVersion 是实测能过门禁的版本。不要随便降：2.0.29 已被拒，2.1.1 在
+	// npm 发布 2.2.0（2026-10-27 08:59Z）之后也被拒。宁可高一点。
+	uaDefaultVersion = "2.2.0"
 	uaRefreshEvery   = 6 * time.Hour
 	uaRefreshTimeout = 8 * time.Second
 )
+
+// uaRefreshURL 是测试可替换的变量（生产固定指向 npm latest）。
+var uaRefreshURL = "https://registry.npmjs.org/@opencode/cli/latest"
 
 // zenUAVersion 是当前使用的客户端版本，可被后台刷新提升。
 var zenUAVersion atomic.Value // string
@@ -83,31 +86,52 @@ func startUAVersionRefresher() {
 // refreshUAVersion 拉 npm 的 latest 版本并（同主版本时）提升。
 // 失败静默：拿不到就继续用已验证的版本，不能因为查询失败把网关带崩。
 func refreshUAVersion() {
+	refreshUAVersionWithin(uaRefreshTimeout, true)
+}
+
+// primeUAVersion 在开始监听前同步拉一次版本。起手探针只给几秒，
+// 等后台 goroutine 慢慢刷新必然吃 429 门禁（云端曾因此无限交班）。
+// 返回是否真的换了版本。
+func primeUAVersion(timeout time.Duration) bool {
+	return refreshUAVersionWithin(timeout, true)
+}
+
+func refreshUAVersionWithin(timeout time.Duration, verbose bool) bool {
 	// 走环境里的代理：本机/国内直连 registry.npmjs.org 常常不通。
 	client := &http.Client{
-		Timeout:   uaRefreshTimeout,
+		Timeout:   timeout,
 		Transport: &http.Transport{Proxy: http.ProxyFromEnvironment},
 	}
 	resp, err := client.Get(uaRefreshURL)
 	if err != nil {
-		return
+		if verbose {
+			log.Printf("ua: refresh failed (%v), keeping %s", err, uaVersion())
+		}
+		return false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return
+		if verbose {
+			log.Printf("ua: refresh status %d, keeping %s", resp.StatusCode, uaVersion())
+		}
+		return false
 	}
 	var payload struct {
 		Version string `json:"version"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return
+		return false
 	}
 	latest := strings.TrimSpace(payload.Version)
 	if !newerSameMajor(uaVersion(), latest) {
-		return
+		if verbose {
+			log.Printf("ua: npm latest %s, keeping %s", latest, uaVersion())
+		}
+		return false
 	}
 	zenUAVersion.Store(latest)
 	log.Printf("ua: client version %s -> %s (npm latest)", uaDefaultVersion, latest)
+	return true
 }
 
 // newerSameMajor 判断 candidate 是否比 current 新、且主版本相同。

@@ -1392,7 +1392,11 @@ func main() {
 	// 空 = 每次请求现签一个 project id。免费层按「project id + 出口 IP」记额度，
 	// 发常量等于所有人共用公共桶（热门出口早已烧穿）。显式设置则固定用它。
 	project = env("OPENCODE_ZEN_PROJECT", "")
-	startUAVersionRefresher() // 跟 npm 上的客户端版本（版本号已是门禁一部分）
+	// 起手同步拉一次 UA 版本再监听：上游按客户端版本放行，后台刷新要是在
+	// 第一条请求之后才回来，云端每次起手都会被门禁判 429（实测 6s 内必探）。
+	primeUAVersion(5 * time.Second)
+	log.Printf("ua: serving as %s", uaString())
+	startUAVersionRefresher() // 之后继续跟 npm 上的客户端版本
 	seedBuiltinTable()
 	tableStartRefresher() // 官方 Endpoints 表刷新（失败则沿用内置快照）
 	poolLoad()

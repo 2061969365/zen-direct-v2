@@ -1,0 +1,109 @@
+name: image-cache
+
+# 多轮对照：图片在第一轮，后续各自续聊两轮，看每轮的 cache_read / input。
+# 一个 shard 一个出口 IP。
+#   shard 1  第一轮带图（正常 user 形状）
+#   shard 2  纯文本对照
+# 判定：若带图那组从第 2 轮起 cache_read 不再增长、input 仍是整段上下文，
+# 说明图片破坏了前缀缓存，每一轮都在重算全量上下文 —— 这才是额度被烧穿的原因。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: install opencode cli
+        run: |
+          npm install -g @opencode/cli@latest 2>&1 | tail -1
+      - name: build image
+        if: matrix.shard == 1
+        run: |
+          python3 - <<'PY'
+          import zlib, struct
+
+          def chunk(t, d):
+              return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+
+          w = h = 160
+          raw = b''.join(b'\x00' + b''.join(
+              (b'\xff\xff\xff' if (x - y) % 24 < 4 else b'\xff\x00\x00') for x in range(w)
+          ) for y in range(h))
+          ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+          open('red.png', 'wb').write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b''))
+          import os; print('red.png', os.path.getsize('red.png'))
+          PY
+      - name: shard ${{ matrix.shard }}
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -u
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          W="$PWD/_c"; mkdir -p "$W"
+          IP=$(curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["query"])')
+          echo "shard=$SHARD ip=$IP"
+          set +e
+          timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free "Reply with the single word: ok" >"$W/pre.out" 2>&1
+          PRE=$?
+          set -e
+          echo "preflight exit=$PRE"
+          [ "$PRE" = "0" ] || { echo "SHARD $SHARD DIRTY"; exit 0; }
+
+          go build -trimpath -ldflags "-X main.appVersion=cache" -o "$W/zen" .
+          wait_gw() { for i in $(seq 1 40); do curl -fsS "http://127.0.0.1:18092/health" >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
+          DIRECT_DUMP_SHAPE=1 PORT=18092 "$W/zen" >"$W/gw.log" 2>&1 &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true' EXIT
+          wait_gw 18092 || { tail -n 20 "$W/gw.log"; exit 1; }
+
+          python3 - "$SHARD" <<'PY'
+          import base64, json, subprocess, sys
+
+          shard = sys.argv[1]
+          model = 'deepseek-v4.1-flash-free'
+          if shard == '1':
+              url = 'data:image/png;base64,' + base64.b64encode(open('red.png', 'rb').read()).decode()
+              first = {'role': 'user', 'content': [{'type': 'text', 'text': 'Look at this screenshot.'},
+                                                   {'type': 'image_url', 'image_url': {'url': url}}]}
+          else:
+              first = {'role': 'user', 'content': 'Look at this screenshot.'}
+
+          turns = [
+              [first],
+              [first, {'role': 'assistant', 'content': 'ok'},
+               {'role': 'user', 'content': 'What color is the square? One word.'}],
+              [first, {'role': 'assistant', 'content': 'ok'},
+               {'role': 'user', 'content': 'What color is the square? One word.'},
+               {'role': 'assistant', 'content': 'Red'},
+               {'role': 'user', 'content': 'What color are the stripes? One word.'}],
+          ]
+
+          for i, msgs in enumerate(turns):
+              json.dump({'model': model, 'stream': False, 'messages': msgs}, open('_c/req.json', 'w'))
+              out = subprocess.run(['curl', '-sS', '--max-time', '240', '-o', '_c/resp%d.json' % i, '-w', '%{http_code}',
+                                    '-X', 'POST', 'http://127.0.0.1:18092/v1/chat/completions',
+                                    '-H', 'Content-Type: application/json', '--data-binary', '@_c/req.json'],
+                                   capture_output=True, text=True)
+              code = out.stdout.strip()
+              try:
+                  d = json.load(open('_c/resp%d.json' % i))
+              except Exception:
+                  d = {}
+              u = d.get('usage') or {}
+              print('TURN %d status=%s prompt=%s cached=%s input=%s out=%s' % (
+                  i + 1, code, u.get('prompt_tokens'), (u.get('prompt_tokens_details') or {}).get('cached_tokens'),
+                  (u.get('opencode') or {}).get('tokens', {}).get('input'), u.get('completion_tokens')))
+          PY
+
+          echo "RESULT shard=$SHARD done"
+          grep -E 'shape ' "$W/gw.log" | tail -n 3 || true

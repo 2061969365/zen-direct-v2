@@ -76,6 +76,15 @@ jobs:
 
           cli C1
           echo "ZEN Z2 status=$(z 2) body=$(head -c 200 "$W/z2.json")"
+
+          # 假设：2.x 客户端走带 family 段的 v2 路由 /inference/openai/v1/...
+          OPENCODE_ZEN_BASE=https://opencode.ai/inference/openai/v1 PORT=18097 "$W/zen" >"$W/zen-fam.log" 2>&1 &
+          FPID=$!
+          for i in $(seq 1 40); do curl -fsS http://127.0.0.1:18097/health >/dev/null 2>&1 && break; sleep 0.5; done
+          Z3=$(curl -sS --max-time 120 -o "$W/z3.json" -w '%{http_code}' -X POST http://127.0.0.1:18097/v1/chat/completions -H 'Content-Type: application/json' --data-binary @"$W/req.json" || echo 000)
+          echo "ZEN Z3(family route) status=$Z3 body=$(head -c 200 "$W/z3.json")"
+          kill $FPID 2>/dev/null || true
+
           cli C2
           echo "RESULT ip=$IP z1=$(head -c 3 "$W/z1.json" 2>/dev/null) o1=$OC"
           tail -n 12 "$W/zen.log"

@@ -1387,8 +1387,16 @@ func main() {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		s := statsSnapshot()
-		fmt.Fprintf(w, `{"status":"ok","mode":"direct","version":%q,"table_models":%d,"sidecar":%s,"stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d}}`,
-			appVersion, tableModelCount(), sidecar.statusJSON(), s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
+		// run_id / repo / started_at 让面板能确认“这条隧道属于哪一次 run”，
+		// 而不是只靠 api.github.com 猜链路状态。
+		runID := strings.TrimSpace(os.Getenv("ZEN_RUN_ID"))
+		if runID == "" {
+			runID = strings.TrimSpace(os.Getenv("GITHUB_RUN_ID"))
+		}
+		repo := strings.TrimSpace(os.Getenv("GITHUB_REPOSITORY"))
+		fmt.Fprintf(w, `{"status":"ok","mode":"direct","version":%q,"table_models":%d,"run_id":%q,"repo":%q,"started_at":%q,"uptime_sec":%d,"sidecar":%s,"stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d}}`,
+			appVersion, tableModelCount(), runID, repo, processStart.UTC().Format(time.RFC3339), int(time.Since(processStart).Seconds()),
+			sidecar.statusJSON(), s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != "GET" {

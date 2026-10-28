@@ -1,5 +1,7 @@
 package main
 
+import "time"
+
 // 版本单源：VERSION 文件（续 v0.2.8 tag / beta v0.2.9 之后的老编号线）。
 // 构建时注入：
 //
@@ -7,5 +9,8 @@ package main
 //
 // 本地用 build.ps1（自动读 VERSION + 写 Windows 文件属性）。
 // 未注入时为 "dev"（go test / CI vet 走此分支）。
+
+// processStart 用于 /health 里的 started_at / uptime_sec。
+var processStart = time.Now()
 
 var appVersion = "dev"

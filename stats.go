@@ -26,6 +26,7 @@ type statsKeeper struct {
 	flakyRetry     uint64 // 502/503 退避重试
 	up5xx          uint64
 	up4xx          uint64
+	up429          uint64
 	circuitOpens   uint64
 	ttfb           []int64
 }
@@ -60,6 +61,12 @@ func statsAddUpstream(status int) {
 	}
 }
 
+func statsAddUp429() {
+	stats.mu.Lock()
+	stats.up429++
+	stats.mu.Unlock()
+}
+
 func statsAddCircuitOpen() {
 	stats.mu.Lock()
 	stats.circuitOpens++
@@ -76,8 +83,8 @@ func statsAddTTFB(ms int64) {
 }
 
 type statsSnap struct {
-	Reqs, TransportRetry, FlakyRetry uint64
-	Up5xx, Up4xx, CircuitOpens        uint64
+	Reqs, TransportRetry, FlakyRetry  uint64
+	Up5xx, Up4xx, Up429, CircuitOpens uint64
 	TTFBP50, TTFBP95                  int64
 }
 
@@ -87,7 +94,7 @@ func statsSnapshot() statsSnap {
 	s := statsSnap{
 		Reqs: stats.reqs, TransportRetry: stats.transportRetry,
 		FlakyRetry: stats.flakyRetry, Up5xx: stats.up5xx,
-		Up4xx: stats.up4xx, CircuitOpens: stats.circuitOpens,
+		Up4xx: stats.up4xx, Up429: stats.up429, CircuitOpens: stats.circuitOpens,
 	}
 	if len(stats.ttfb) > 0 {
 		cp := append([]int64{}, stats.ttfb...)
@@ -103,7 +110,7 @@ func statsReset() {
 	defer stats.mu.Unlock()
 	// 逐字段清零：整体赋值会覆盖 mutex 本体导致 unlock-of-unlocked。
 	stats.reqs, stats.transportRetry, stats.flakyRetry = 0, 0, 0
-	stats.up5xx, stats.up4xx, stats.circuitOpens = 0, 0, 0
+	stats.up5xx, stats.up4xx, stats.up429, stats.circuitOpens = 0, 0, 0, 0
 	stats.ttfb = nil
 }
 
@@ -113,7 +120,7 @@ func statsReporter(d time.Duration) {
 	defer t.Stop()
 	for range t.C {
 		s := statsSnapshot()
-		log.Printf("[STATS] window=5m reqs=%d transport_retry=%d flaky_retry=%d up5xx=%d up4xx=%d circuit_open=%d ttfb_p50=%dms p95=%dms",
-			s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
+		log.Printf("[STATS] window=5m reqs=%d transport_retry=%d flaky_retry=%d up5xx=%d up4xx=%d up429=%d circuit_open=%d ttfb_p50=%dms p95=%dms",
+			s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.Up429, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
 	}
 }

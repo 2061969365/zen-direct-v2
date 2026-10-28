@@ -990,6 +990,9 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	// 旧逻辑对 429 一律透传且不换号，等于每次续聊都把毒 session 再喂一次，
 	// 复现“聊到一半整个网关全 429”。
 	if resp.StatusCode == 429 {
+		// 429 分支会直接 return（换 session/记毒），不会走到下面的
+		// statsAddUpstream，所以必须在这里单独计数。
+		statsAddUp429()
 		bpeek, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
 		if isFreeUsageLimit(bpeek) {
@@ -1406,6 +1409,8 @@ func main() {
 		log.Printf("diagnostics off (DIRECT_DIAG=0): no [STATS]/WARN/debug lines")
 	}
 
+	startEgressResolver(context.Background())
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1417,9 +1422,9 @@ func main() {
 			runID = strings.TrimSpace(os.Getenv("GITHUB_RUN_ID"))
 		}
 		repo := strings.TrimSpace(os.Getenv("GITHUB_REPOSITORY"))
-		fmt.Fprintf(w, `{"status":"ok","mode":"direct","version":%q,"table_models":%d,"run_id":%q,"repo":%q,"started_at":%q,"uptime_sec":%d,"sidecar":%s,"stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d}}`,
-			appVersion, tableModelCount(), runID, repo, processStart.UTC().Format(time.RFC3339), int(time.Since(processStart).Seconds()),
-			sidecar.statusJSON(), s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
+		fmt.Fprintf(w, `{"status":"ok","mode":"direct","version":%q,"table_models":%d,"run_id":%q,"repo":%q,"started_at":%q,"uptime_sec":%d,"egress_ip":%q,"sidecar":%s,"stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"up429":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d}}`,
+			appVersion, tableModelCount(), runID, repo, processStart.UTC().Format(time.RFC3339), int(time.Since(processStart).Seconds()), egressIP(),
+			sidecar.statusJSON(), s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.Up429, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != "GET" {

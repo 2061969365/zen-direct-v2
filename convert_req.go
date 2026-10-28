@@ -216,20 +216,6 @@ func stripThinkingSignature(in map[string]any) {
 	}
 }
 
-// maxDataURLBytes data: URL 长度阈值，超了钳制（P1b-8，用户定的 64KB）。
-const maxDataURLBytes = 64 * 1024
-
-// clampMediaURL data: URL 超阈值钳制，防 400/413/上下文爆炸。http(s) URL 不动。
-func clampMediaURL(u string) string {
-	if len(u) <= maxDataURLBytes || !strings.HasPrefix(u, "data:") {
-		return u
-	}
-	if i := strings.Index(u, ";base64,"); i > 0 {
-		return u[:i] + ";base64,[omitted " + itoa(len(u)-i-len(";base64,")) + " bytes]"
-	}
-	return u[:maxDataURLBytes] + "...[truncated]"
-}
-
 func itoa(n int) string {
 	if n == 0 {
 		return "0"
@@ -345,7 +331,7 @@ func chatToResponsesReq(in map[string]any) map[string]any {
 						iu = map[string]any{"url": s}
 					}
 					if u := getStr(asMap(iu), "url"); u != "" {
-						parts = append(parts, map[string]any{"type": "input_image", "image_url": clampMediaURL(u)})
+						parts = append(parts, map[string]any{"type": "input_image", "image_url": u})
 					}
 				}
 			}
@@ -475,7 +461,7 @@ func responsesToChatReq(in map[string]any) map[string]any {
 							}
 						case "input_image":
 							if u := asStr(pm["image_url"]); u != "" {
-								parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": clampMediaURL(u)}})
+								parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": u}})
 							}
 						}
 					}
@@ -599,11 +585,11 @@ func messagesToChatReq(in map[string]any) map[string]any {
 						mt = "image/png"
 					}
 					parts = append(parts, map[string]any{"type": "image_url",
-						"image_url": map[string]any{"url": clampMediaURL("data:" + mt + ";base64," + asStr(src["data"]))}})
+						"image_url": map[string]any{"url": "data:" + mt + ";base64," + asStr(src["data"])}})
 				case "url":
 					if u := asStr(src["url"]); u != "" {
 						parts = append(parts, map[string]any{"type": "image_url",
-							"image_url": map[string]any{"url": clampMediaURL(u)}})
+							"image_url": map[string]any{"url": u}})
 					}
 				default:
 					// 未知 source 类型转占位，不静默丢。
@@ -770,7 +756,7 @@ func chatToMessagesReq(in map[string]any) map[string]any {
 						iu = map[string]any{"url": s}
 					}
 					if u := getStr(asMap(iu), "url"); u != "" {
-						blocks = append(blocks, map[string]any{"type": "image", "source": dataURLToImageSource(clampMediaURL(u))})
+						blocks = append(blocks, map[string]any{"type": "image", "source": dataURLToImageSource(u)})
 					}
 				}
 			}
@@ -926,7 +912,7 @@ func messagesToResponsesReq(in map[string]any) map[string]any {
 					u = "data:" + mt + ";base64," + asStr(src["data"])
 				}
 				if u != "" {
-					input = append(input, map[string]any{"type": "input_image", "image_url": clampMediaURL(u)})
+					input = append(input, map[string]any{"type": "input_image", "image_url": u})
 				}
 			case "tool_use":
 				flushPending()
@@ -1087,7 +1073,7 @@ func responsesToMessagesReq(in map[string]any) map[string]any {
 							messages = append(messages, map[string]any{
 								"role": role,
 								"content": []any{map[string]any{
-									"type": "image", "source": dataURLToImageSource(clampMediaURL(u)),
+									"type": "image", "source": dataURLToImageSource(u),
 								}},
 							})
 						}

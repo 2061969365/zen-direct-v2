@@ -75,25 +75,6 @@ func TestStripThinkingSignature(t *testing.T) {
 	}
 }
 
-func TestClampMediaURL(t *testing.T) {
-	short := "data:image/png;base64,AAAA"
-	if got := clampMediaURL(short); got != short {
-		t.Errorf("短 URL 不应动")
-	}
-	httpURL := "https://example.com/" + strings.Repeat("x", 100*1024)
-	if got := clampMediaURL(httpURL); got != httpURL {
-		t.Errorf("http URL 不应动")
-	}
-	big := "data:image/png;base64," + strings.Repeat("A", 100*1024)
-	got := clampMediaURL(big)
-	if len(got) >= len(big) || !strings.Contains(got, "[omitted ") || !strings.Contains(got, " bytes]") {
-		t.Errorf("大 data URL 未钳制: len=%d", len(got))
-	}
-	if !strings.HasPrefix(got, "data:image/png;base64,[omitted ") {
-		t.Errorf("钳制格式错: %.60s", got)
-	}
-}
-
 func TestMediaPlaceholderInConverters(t *testing.T) {
 	// messages->chat：document 块应转占位文本，不静默丢。
 	out := messagesToChatReq(mustJSON(t, `{"model":"m","messages":[
@@ -106,14 +87,14 @@ func TestMediaPlaceholderInConverters(t *testing.T) {
 	if !strings.Contains(c, "unsupported media omitted: document") {
 		t.Errorf("缺占位: %v", asMap(msgs[0])["content"])
 	}
-	// chat->responses：超大图片应被钳制。
+	// chat->responses：大图原样透传，不再截断成坏 data URL。
 	bigImg := "data:image/png;base64," + strings.Repeat("B", 100*1024)
 	out2 := chatToResponsesReq(mustJSON(t, `{"model":"m","messages":[
 		{"role":"user","content":[{"type":"image_url","image_url":{"url":"`+bigImg+`"}}]}]}`))
 	items := asArr(out2["input"])
 	u := asStr(asMap(asMap(items[0])["content"].([]any)[0])["image_url"])
-	if !strings.Contains(u, "[omitted ") {
-		t.Errorf("图片未钳制: len=%d", len(u))
+	if u != bigImg {
+		t.Errorf("图片应原样透传: len=%d", len(u))
 	}
 	// chat->messages：tool_calls 空 arguments 应 canonical 为 {}。
 	out3 := chatToMessagesReq(mustJSON(t, `{"model":"m","messages":[

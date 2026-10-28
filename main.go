@@ -637,7 +637,7 @@ func collectReasoningIDs(in map[string]any) []string {
 	}
 	return ids
 }
-func buildUpstream(entry Format, target Format, in map[string]any) map[string]any {
+func buildUpstream(entry Format, target Format, in map[string]any) (map[string]any, error) {
 	upReq := in
 	if entry == FmtChat && target == FmtResponses {
 		upReq = chatToResponsesReq(in)
@@ -663,11 +663,15 @@ func buildUpstream(entry Format, target Format, in map[string]any) map[string]an
 			normalizeReasoningEffort(upReq)
 		}
 	} else {
+		// Chat 的 tool 消息装不了图片：带图的 tool 结果抬成独立 user 消息。
+		if err := hoistChatToolImages(upReq); err != nil {
+			return nil, err
+		}
 		mergeChatStubTools(upReq)
 	}
 	// V2 全路径拒绝显式 tool_choice:none，缺省即 auto 语义。
 	// 上方已剥离客户端 none；转换函数只透传用户自带的有效选择。
-	return upReq
+	return upReq, nil
 }
 
 // writeBodyWithType 透传已读的上游错误体（保留原 Content-Type）。
@@ -857,8 +861,11 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		}
 	}
 
-	buildBody := func() []byte {
-		u := buildUpstream(entry, target, in)
+	buildBody := func() ([]byte, error) {
+		u, err := buildUpstream(entry, target, in)
+		if err != nil {
+			return nil, err
+		}
 		// 免费层门禁：messages[0] 必须是 OpenCode 官方 system 提示词。
 		// 只在 chat 形请求上注入（与 sidecar 时代的行为一致）。
 		if entry == FmtChat {
@@ -870,9 +877,16 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		// V2 实测配方：usage 随流回（oc2api 同款，不影响网关聚合/透传）。
 		u["stream_options"] = map[string]any{"include_usage": true}
 		b, _ := json.Marshal(u)
-		return b
+		if shapeOn() {
+			log.Printf("[REQ %s] shape %s", reqID, describeShape(u))
+		}
+		return b, nil
 	}
-	upBody := buildBody()
+	upBody, err := buildBody()
+	if err != nil {
+		writeErr(w, 400, "invalid_request_error", err.Error())
+		return
+	}
 	// 失败轮不进池：本轮新建的 session 若首战即败（传输错/非 2xx），
 	// 直接驱逐，免死 session 占池坑；命中轮（老 lineage）绝不驱逐。
 	// 半截流（terminal=false）不驱逐：首轮已有响应输出，lineage 有效，
@@ -1033,7 +1047,12 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 			learnBadIDs(collectReasoningIDs(in)) // 实锤毒 id 入负缓存，下轮命中路径先行剥离，免每轮交 400 税。
 			poolSes, _ = poolRotate(fp)
 			stripForeignBlobs(in, true)
-			upBody = buildBody()
+			var buildErr error
+			upBody, buildErr = buildBody()
+			if buildErr != nil {
+				writeErr(w, 400, "invalid_request_error", buildErr.Error())
+				return
+			}
 			upSes = poolSes // 502 分支重用：body 已按新 session 重建
 			resp, err = doUpstream(poolSes, upBody)
 			if err != nil {

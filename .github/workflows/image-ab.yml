@@ -1,0 +1,192 @@
+name: image-ab
+
+# 图片链路对照：官方 CLI 上传图片 vs 网关的三种形状。
+# 每个 shard 一个独立出口 IP，一 IP 只跑一种策略（一次 free-limit 429 会连坐出口）。
+#
+#   shard 1  官方 CLI --file 附图       正对照：上游到底收不收图
+#   shard 2  网关(新) 图在 user 消息    基线：正常多模态形状
+#   shard 3  网关(新) 图在 tool 消息    验证抬升：tool 只留文本 + 独立 user 图片
+#   shard 4  网关(旧) 图在 tool 消息    现状证据：不抬升会怎样
+#   shard 5  网关(新) >64KB 大图        验证不再被截断成 [omitted ...]
+#
+# 判定：shard2 200 且答对才算基线成立；shard3 与 shard2 同状态、同量级 token
+# 即抬升有效；shard1 不 200 说明当天图片不可用，整轮作废。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: install opencode cli
+        run: |
+          npm install -g @opencode/cli@latest 2>&1 | tail -1
+          opencode --version
+
+      - name: build test images
+        run: |
+          python3 - <<'PY'
+          import zlib, struct, random, os
+
+          def chunk(t, d):
+              return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+
+          def png(path, w, h, pixel):
+              raw = b''.join(b'\x00' + b''.join(pixel(x, y) for x in range(w)) for y in range(h))
+              ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+              with open(path, 'wb') as f:
+                  f.write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b''))
+
+          def red(x, y):
+              if (x - y) % 24 < 4:
+                  return b'\xff\xff\xff'
+              return b'\xff\x00\x00'
+
+          png('red.png', 96, 96, red)
+          random.seed(7)
+          png('big.png', 512, 512, lambda x, y: bytes([random.randrange(256) for _ in range(3)]))
+          print('red.png', os.path.getsize('red.png'), 'big.png', os.path.getsize('big.png'))
+          PY
+
+      - name: build old and new gateways
+        run: |
+          set -e
+          mkdir -p _ab
+          go build -trimpath -ldflags "-X main.appVersion=ab-new" -o _ab/zen-new .
+          git fetch --depth=1 origin main
+          git worktree add ../old origin/main
+          (cd ../old && go build -trimpath -ldflags "-X main.appVersion=ab-old" -o "$GITHUB_WORKSPACE/_ab/zen-old" .)
+          ls -l _ab
+
+      - name: shard ${{ matrix.shard }}
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -u
+          export OPENCODE_DISABLE_AUTOUPDATE=1
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          W="$PWD/_ab"
+          IP=$(curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["query"])')
+          echo "shard=$SHARD ip=$IP"
+
+          set +e
+          timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free \
+            "Reply with the single word: ok" >"$W/pre.out" 2>"$W/pre.err"
+          PRE=$?
+          set -e
+          echo "preflight exit=$PRE"
+          if [ "$PRE" != "0" ]; then
+            echo "SHARD $SHARD IP=$IP DIRTY preflight failed"
+            tail -n 5 "$W/pre.err" || true
+            exit 0
+          fi
+
+          if [ "$SHARD" = "1" ]; then
+            set +e
+            timeout 300 opencode run -m opencode/deepseek-v4.1-flash-free --file "$PWD/red.png" \
+              "What color is the square in the attached image? Answer with one word." \
+              >"$W/official.out" 2>"$W/official.err"
+            C1=$?
+            set -e
+            echo "OFFICIAL exit=$C1"
+            echo "OFFICIAL out: $(tr '\n' ' ' <"$W/official.out" | head -c 300)"
+            echo "OFFICIAL err: $(tr '\n' ' ' <"$W/official.err" | head -c 300)"
+            echo "RESULT shard=1 official_exit=$C1"
+            exit 0
+          fi
+
+          case "$SHARD" in
+            2) BIN="$W/zen-new"; SHAPE=user; IMG=red.png ;;
+            3) BIN="$W/zen-new"; SHAPE=tool; IMG=red.png ;;
+            4) BIN="$W/zen-old"; SHAPE=tool; IMG=red.png ;;
+            5) BIN="$W/zen-new"; SHAPE=user; IMG=big.png ;;
+          esac
+
+          python3 - "$SHAPE" "$IMG" <<'PY'
+          import base64, json, sys
+          shape, img = sys.argv[1], sys.argv[2]
+          data = base64.b64encode(open(img, 'rb').read()).decode()
+          url = 'data:image/png;base64,' + data
+          ask = 'What color is the square in the image? Answer with one word.'
+          if shape == 'user':
+              msgs = [
+                  {'role': 'user', 'content': 'Please look at the image.'},
+                  {'role': 'user', 'content': [{'type': 'text', 'text': ask},
+                                               {'type': 'image_url', 'image_url': {'url': url}}]},
+              ]
+          else:
+              msgs = [
+                  {'role': 'user', 'content': 'Please open the screenshot.'},
+                  {'role': 'assistant', 'content': None, 'tool_calls': [
+                      {'id': 'call_1', 'type': 'function',
+                       'function': {'name': 'Read', 'arguments': '{"path":"red.png"}'}}]},
+                  {'role': 'tool', 'tool_call_id': 'call_1', 'content': [
+                      {'type': 'text', 'text': 'screenshot loaded'},
+                      {'type': 'image_url', 'image_url': {'url': url}}]},
+                  {'role': 'user', 'content': ask},
+              ]
+          body = {'model': 'deepseek-v4.1-flash-free', 'stream': False, 'messages': msgs}
+          json.dump(body, open('_ab/req.json', 'w'))
+          print('image bytes', len(url))
+          PY
+
+          wait_gw() {
+            for i in $(seq 1 40); do
+              curl -fsS "http://127.0.0.1:$1/health" >/dev/null 2>&1 && return 0
+              sleep 0.5
+            done
+            return 1
+          }
+
+          DIRECT_DUMP_SHAPE=1 PORT=18091 "$BIN" >"$W/gw.log" 2>&1 &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true' EXIT
+          if ! wait_gw 18091; then
+            echo "SHARD $SHARD gateway not ready"; tail -n 20 "$W/gw.log"; exit 1
+          fi
+
+          CODE=$(curl -sS --max-time 300 -o "$W/img.json" -w '%{http_code}' \
+            -X POST http://127.0.0.1:18091/v1/chat/completions \
+            -H 'Content-Type: application/json' --data-binary @"$W/req.json" || echo 000)
+          echo "IMAGE status=$CODE bytes=$(wc -c <"$W/img.json")"
+          head -c 300 "$W/img.json"; echo
+          python3 - "$W/img.json" <<'PY'
+          import json, sys
+          try:
+              d = json.load(open(sys.argv[1]))
+          except Exception as e:
+              print('parse error', e); raise SystemExit(0)
+          u = d.get('usage') or {}
+          c = (d.get('choices') or [{}])[0].get('message', {}).get('content', '')
+          print('USAGE', json.dumps(u, ensure_ascii=False))
+          print('ANSWER', (c or '')[:200].replace('\n', ' '))
+          PY
+
+          echo "SHAPE-LOG:"; grep -o 'shape .*' "$W/gw.log" | tail -n 2 || true
+
+          # 追发纯文本：判断这次图片请求有没有把出口 IP 连坐。
+          python3 - <<'PY'
+          import json
+          json.dump({'model': 'deepseek-v4.1-flash-free', 'stream': False,
+                     'messages': [{'role': 'user', 'content': 'Reply with the single word: ok'}]},
+                    open('_ab/req2.json', 'w'))
+          PY
+          CODE2=$(curl -sS --max-time 180 -o "$W/after.json" -w '%{http_code}' \
+            -X POST http://127.0.0.1:18091/v1/chat/completions \
+            -H 'Content-Type: application/json' --data-binary @"$W/req2.json" || echo 000)
+          echo "AFTER status=$CODE2 body=$(head -c 160 "$W/after.json")"
+
+          echo "RESULT shard=$SHARD shape=$SHAPE img=$IMG status=$CODE after=$CODE2"
+          grep -E 'free-usage 429|upstream 429' "$W/gw.log" | tail -n 3 || true

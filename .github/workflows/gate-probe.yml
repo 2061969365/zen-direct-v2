@@ -1,0 +1,81 @@
+name: gate-probe
+
+# 单 IP 顺序探针：确认 429 是"出口额度"还是"我们的请求形状"。
+#   C0 官方 CLI        （基线：IP 干净）
+#   Z1 我们的网关       （观察）
+#   O1 opencode2api     （同 IP 对照实现）
+#   C1 官方 CLI 再来一次 （若仍 200 → 不是 IP 被连坐）
+#   Z2 我们再来一次
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: install opencode cli
+        run: |
+          npm install -g @opencode/cli@latest 2>&1 | tail -1
+          opencode --version
+      - name: probe
+        run: |
+          set -u
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export OPENCODE_DISABLE_AUTOUPDATE=1
+          W="$PWD/_p"; mkdir -p "$W"
+          IP=$(curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["query"])')
+          echo "IP=$IP"
+
+          cli() {
+            set +e
+            timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free "Reply with the single word: ok" >"$W/cli.out" 2>&1
+            local rc=$?
+            set -e
+            echo "CLI $1 exit=$rc out=$(tail -1 "$W/cli.out" | head -c 80)"
+          }
+
+          cli C0
+
+          go build -trimpath -o "$W/zen" .
+          cat > "$W/req.json" <<'JSON'
+          {"model":"deepseek-v4.1-flash-free","stream":false,
+           "messages":[{"role":"user","content":"Reply with the single word: ok"}],
+           "tools":[{"type":"function","function":{"name":"Read","description":"Read a file from disk","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]}
+          JSON
+          wait_gw() { for i in $(seq 1 40); do curl -fsS "http://127.0.0.1:18095/health" >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
+          PORT=18095 "$W/zen" >"$W/zen.log" 2>&1 &
+          ZPID=$!
+          trap 'kill $ZPID 2>/dev/null || true' EXIT
+          wait_gw 18095 || { tail -n 20 "$W/zen.log"; exit 1; }
+          z() {
+            curl -sS --max-time 120 -o "$W/z$1.json" -w '%{http_code}' \
+              -X POST http://127.0.0.1:18095/v1/chat/completions \
+              -H 'Content-Type: application/json' --data-binary @"$W/req.json" || echo 000
+          }
+          echo "ZEN Z1 status=$(z 1) body=$(head -c 200 "$W/z1.json")"
+
+          # opencode2api v1.4.5
+          git clone --depth 1 --branch v1.4.5 https://github.com/jasonxu114514/opencode2api "$W/o2a" 2>&1 | tail -1
+          (cd "$W/o2a" && go build -trimpath -o "$W/o2a-gateway" ./cmd/opencode2api)
+          cat > "$W/o2a/config.json" <<'JSON'
+          {"server":{"host":"127.0.0.1","port":18096},"tiers":{"zen":{"anonymous":true}},
+           "models":{"allow":["deepseek-v4.1-flash-free"]}}
+          JSON
+          "$W/o2a-gateway" -config "$W/o2a/config.json" >"$W/o2a.log" 2>&1 &
+          OPID=$!
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:18096/healthz >/dev/null 2>&1 && break; sleep 1; done
+          OC=$(curl -sS --max-time 120 -o "$W/o1.json" -w '%{http_code}' -X POST http://127.0.0.1:18096/v1/chat/completions -H 'Content-Type: application/json' --data-binary @"$W/req.json" || echo 000)
+          echo "O2A O1 status=$OC body=$(head -c 200 "$W/o1.json")"
+          kill $OPID 2>/dev/null || true
+
+          cli C1
+          echo "ZEN Z2 status=$(z 2) body=$(head -c 200 "$W/z2.json")"
+          cli C2
+          echo "RESULT ip=$IP z1=$(head -c 3 "$W/z1.json" 2>/dev/null) o1=$OC"
+          tail -n 12 "$W/zen.log"

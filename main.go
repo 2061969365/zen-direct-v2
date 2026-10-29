@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -637,6 +638,135 @@ func collectReasoningIDs(in map[string]any) []string {
 	}
 	return ids
 }
+
+var v2ChatKeyOrder = []string{"model", "messages", "tools", "stream", "stream_options", "max_completion_tokens"}
+
+func marshalV2ChatBody(payload map[string]any) ([]byte, error) {
+	var buffer bytes.Buffer
+	buffer.WriteByte('{')
+	written := make(map[string]bool, len(payload))
+	first := true
+	write := func(key string) error {
+		value, ok := payload[key]
+		if !ok {
+			return nil
+		}
+		keyJSON, err := json.Marshal(key)
+		if err != nil {
+			return err
+		}
+		var valueJSON []byte
+		if key == "messages" {
+			if msgs, ok := value.([]any); ok {
+				valueJSON, err = marshalOrderedMessages(msgs)
+			} else {
+				valueJSON, err = json.Marshal(value)
+			}
+		} else {
+			valueJSON, err = json.Marshal(value)
+		}
+		if err != nil {
+			return err
+		}
+		if !first {
+			buffer.WriteByte(',')
+		}
+		first = false
+		buffer.Write(keyJSON)
+		buffer.WriteByte(':')
+		buffer.Write(valueJSON)
+		written[key] = true
+		return nil
+	}
+	for _, key := range v2ChatKeyOrder {
+		if err := write(key); err != nil {
+			return nil, err
+		}
+	}
+	rest := make([]string, 0, len(payload))
+	for key := range payload {
+		if !written[key] {
+			rest = append(rest, key)
+		}
+	}
+	sort.Strings(rest)
+	for _, key := range rest {
+		if err := write(key); err != nil {
+			return nil, err
+		}
+	}
+	buffer.WriteByte('}')
+	return buffer.Bytes(), nil
+}
+
+func marshalOrderedMessages(msgs []any) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteByte('[')
+	for i, raw := range msgs {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		m, ok := raw.(map[string]any)
+		if !ok {
+			b, err := json.Marshal(raw)
+			if err != nil {
+				return nil, err
+			}
+			buf.Write(b)
+			continue
+		}
+		buf.WriteByte('{')
+		msgFirst := true
+		writeField := func(k string) error {
+			v, exists := m[k]
+			if !exists {
+				return nil
+			}
+			kj, err := json.Marshal(k)
+			if err != nil {
+				return err
+			}
+			vj, err := json.Marshal(v)
+			if err != nil {
+				return err
+			}
+			if !msgFirst {
+				buf.WriteByte(',')
+			}
+			msgFirst = false
+			buf.Write(kj)
+			buf.WriteByte(':')
+			buf.Write(vj)
+			return nil
+		}
+		order := []string{"role", "content", "tool_calls", "tool_call_id", "name"}
+		written := make(map[string]bool)
+		for _, k := range order {
+			if _, exists := m[k]; exists {
+				if err := writeField(k); err != nil {
+					return nil, err
+				}
+				written[k] = true
+			}
+		}
+		var rest []string
+		for k := range m {
+			if !written[k] {
+				rest = append(rest, k)
+			}
+		}
+		sort.Strings(rest)
+		for _, k := range rest {
+			if err := writeField(k); err != nil {
+				return nil, err
+			}
+		}
+		buf.WriteByte('}')
+	}
+	buf.WriteByte(']')
+	return buf.Bytes(), nil
+}
+
 func buildUpstream(entry Format, target Format, in map[string]any) (map[string]any, error) {
 	upReq := in
 	if entry == FmtChat && target == FmtResponses {
@@ -804,6 +934,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		writeErr(w, 413, "invalid_request_error", "request body too large")
 		return
 	}
+	_ = os.WriteFile("F:/worker/zen-direct-v2/last_incoming_req.json", raw, 0644)
 	var in map[string]any
 	if err := json.Unmarshal(raw, &in); err != nil {
 		writeErr(w, 400, "invalid_request_error", "invalid json: "+err.Error())
@@ -881,7 +1012,15 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		u["stream"] = true
 		// V2 实测配方：usage 随流回（oc2api 同款，不影响网关聚合/透传）。
 		u["stream_options"] = map[string]any{"include_usage": true}
-		b, _ := json.Marshal(u)
+		var b []byte
+		if target == FmtChat {
+			b, err = marshalV2ChatBody(u)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			b, _ = json.Marshal(u)
+		}
 		if shapeOn() {
 			log.Printf("[REQ %s] shape %s", reqID, describeShape(u))
 		}
@@ -1019,6 +1158,8 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 			}
 			log.Printf("[REQ %s] free-usage 429 ses=%s turns=%d, poisoned+rotate, cooldown %s (total=%d)",
 				reqID, oldSes, turns, cd, freeLimitCount.Load())
+			_ = os.WriteFile("F:/worker/zen-direct-v2/last_429_upBody.json", upBody, 0644)
+			_ = os.WriteFile("F:/worker/zen-direct-v2/last_429_resp.json", bpeek, 0644)
 			writeBodyWithType(w, resp, 429, bpeek)
 			return
 		}
@@ -1253,6 +1394,12 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int
 			}
 			if strings.HasPrefix(t, "data:") && strings.Contains(t, "[DONE]") {
 				sawDone = true
+				sawTerminal = true
+			}
+			if strings.Contains(t, `"finish_reason":"stop"`) ||
+				strings.Contains(t, `"finish_reason":"tool_calls"`) ||
+				strings.Contains(t, `"finish_reason":"length"`) {
+				sawTerminal = true
 			}
 		}
 		if len(tail) > 256 {
@@ -1330,7 +1477,7 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int
 		}
 		return
 	}
-	if !sawTerminal {
+	if !sawTerminal && !sawDone {
 		// 半截尾部吞掉不转发（下游严格 parse 见半截 data: 必炸）；
 		// 发 failed+DONE 走可重试终态，本轮内容由重试无损拿回。
 		if len(pending) > 0 {

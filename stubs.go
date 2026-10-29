@@ -2,6 +2,46 @@
 // 对照 oc2api v2.6.0（抓 2.0.29 官方 tool/plugin/{shell,read}.ts）。
 package main
 
+import (
+	_ "embed"
+	"encoding/json"
+	"log"
+	"sync"
+)
+
+//go:embed tools/opencode_tools_2_2.json
+var officialTools22JSON []byte
+
+type officialTool struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+var (
+	officialToolsOnce sync.Once
+	officialToolsList []officialTool
+	officialToolsMap  map[string]officialTool
+)
+
+func initOfficialTools() {
+	officialToolsOnce.Do(func() {
+		officialToolsMap = make(map[string]officialTool)
+		if err := json.Unmarshal(officialTools22JSON, &officialToolsList); err != nil {
+			log.Printf("failed to unmarshal official tools: %v", err)
+			return
+		}
+		for _, t := range officialToolsList {
+			officialToolsMap[t.Name] = t
+		}
+	})
+}
+
+func getOfficialTools() []officialTool {
+	initOfficialTools()
+	return officialToolsList
+}
+
 // V2 门禁桩：仅 shell/read，且描述前缀与参数 schema 须与官方一致，否则 403。
 // 空 schema/假描述不再放行。
 var stubToolNames = []string{"shell", "read"}

@@ -1,20 +1,31 @@
 name: binary-ab
 
-# 同一个出口 IP，同一轮里依次：
-#   C0  官方 opencode CLI                        期望 200（证明 IP/额度干净）
-#   O1  opencode2api v1.4.5 二进制（匿名免费层）   他们的实现今天还过不过
-#   Z1  zen-direct v2（原生 uTLS 传输）           我们的实现今天还过不过
-#
-# 顺序固定：C0 先证明 IP 干净；O1 在 Z1 之前，避免我们的 429 把出口连坐，
-# 让 O1 的结论失真。O1 自己若 429 也会连坐，所以 Z1 的结果只作参考。
+# 多 IP、多轮长对话对照验证：
+# 每个 shard 是一个独立 GitHub Actions Runner（独立公网出口 IP）。
+# 同一个出口 IP 依次执行：
+#   C0  官方 opencode CLI 2.2.0                    长对话请求，期望 200（证明 IP/额度干净）
+#   O1  opencode2api v1.4.5 二进制                 长对话多轮请求
+#   Z1  zen-direct v2 修复版本（原生 uTLS + 12 工具） 长对话多轮请求
+#   Z2  zen-direct v2 同会话第二轮追加追问           验证会话延续与更长上下文
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '**.go'
+      - 'tools/**'
+      - '.github/workflows/binary-ab.yml'
 
 jobs:
   ab:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -24,23 +35,81 @@ jobs:
         run: |
           npm install -g @opencode/cli@latest 2>&1 | tail -1
           opencode --version
-      - name: same-ip ab
+      - name: same-ip multi-round long-conversation ab
         run: |
           set -u
           export PATH="$HOME/.npm-global/bin:$PATH"
           export OPENCODE_DISABLE_AUTOUPDATE=1
           W="$PWD/_bab"; mkdir -p "$W"
           IP=$(curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["query"])')
-          echo "IP=$IP"
+          echo "=== Shard ${{ matrix.shard }} on IP=$IP ==="
 
+          LONG_PROMPT="Explain the key considerations for designing a high-concurrency LRU cache in Go, specifically handling lock contention, eviction callbacks without deadlocks, and memory overhead of map pointers. Please provide a detailed response with code structure."
+
+          cat > "$W/req_turn1.json" <<'JSON'
+          {
+            "model": "deepseek-v4.1-flash-free",
+            "stream": false,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain the key considerations for designing a high-concurrency LRU cache in Go, specifically handling lock contention, eviction callbacks without deadlocks, and memory overhead of map pointers. Please provide a detailed response with code structure."
+              },
+              {
+                "role": "assistant",
+                "content": "Designing a high-concurrency LRU cache in Go involves several key considerations:\n\n1. **Lock Contention & Sharding**: Using a single sync.RWMutex can become a bottleneck under write-heavy workloads (updating MRU order requires a write lock). Sharding the key space across multiple cache buckets reduces contention.\n\n2. **Deadlock-Free Eviction Callbacks**: Invoking an OnEvicted callback while holding the bucket lock risks deadlocks if the callback calls back into the cache. The recommended pattern is collecting evicted entries under lock, releasing the lock, and invoking callbacks asynchronously or outside the critical section.\n\n3. **Memory Overhead**: Map entries in Go incur pointer and bucket overhead. Storing values inline or using compact node indexes minimizes pointer indirection."
+              },
+              {
+                "role": "user",
+                "content": "Now show me the exact Go code for the Evict and Add methods implementing the lock-releasing callback pattern you described."
+              }
+            ]
+          }
+          JSON
+
+          cat > "$W/req_turn2.json" <<'JSON'
+          {
+            "model": "deepseek-v4.1-flash-free",
+            "stream": false,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain the key considerations for designing a high-concurrency LRU cache in Go, specifically handling lock contention, eviction callbacks without deadlocks, and memory overhead of map pointers."
+              },
+              {
+                "role": "assistant",
+                "content": "Summary of points: sharded buckets, deferred callbacks outside critical sections, compact struct allocations."
+              },
+              {
+                "role": "user",
+                "content": "Now show me the exact Go code for the Evict and Add methods implementing the lock-releasing callback pattern you described."
+              },
+              {
+                "role": "assistant",
+                "content": "Here is the implementation of Evict and Add with lock peeling to ensure OnEvicted callbacks are never invoked under lock."
+              },
+              {
+                "role": "user",
+                "content": "How would you write comprehensive unit tests with go test -race to verify no race conditions occur when Evict and Add are called concurrently with high goroutine counts?"
+              }
+            ]
+          }
+          JSON
+
+          # ---------- C0: 官方 CLI (长对话请求) ----------
           set +e
           timeout 180 opencode run -m opencode/deepseek-v4.1-flash-free \
-            "Reply with the single word: ok" >"$W/c0.out" 2>"$W/c0.err"
+            "$LONG_PROMPT" >"$W/c0.out" 2>"$W/c0.err"
           C0=$?
           set -e
-          echo "C0 exit=$C0 out=$(tail -1 "$W/c0.out")"
-          if [ "$C0" != "0" ]; then echo "IP=$IP DIRTY"; exit 0; fi
+          echo "C0 exit=$C0 out=$(tail -n 3 "$W/c0.out" | head -c 240)"
+          if [ "$C0" != "0" ]; then
+            echo "IP=$IP DIRTY (CLI returned error):"
+            cat "$W/c0.err" || true
+            exit 0
+          fi
           echo "IP=$IP CLEAN"
+          sleep 3
 
           # ---------- O1: opencode2api v1.4.5 二进制 ----------
           git clone --depth 1 --branch v1.4.5 https://github.com/jasonxu114514/opencode2api "$W/o2a" 2>&1 | tail -1
@@ -70,11 +139,6 @@ jobs:
           }
           JSON
 
-          cat > "$W/req.json" <<'JSON'
-          {"model":"deepseek-v4.1-flash-free","stream":false,
-           "messages":[{"role":"user","content":"Reply with the single word: ok"}]}
-          JSON
-
           "$W/o2a-gateway" -config "$W/o2a-config.json" >"$W/o2a.log" 2>&1 &
           O2A_PID=$!
           READY=0
@@ -87,13 +151,13 @@ jobs:
           O1=$(curl -sS --max-time 150 -o "$W/o1.json" -w '%{http_code}' \
             -X POST http://127.0.0.1:18090/v1/chat/completions \
             -H 'Content-Type: application/json' -H 'Authorization: Bearer k' \
-            --data-binary @"$W/req.json" || echo 000)
+            --data-binary @"$W/req_turn1.json" || echo 000)
           echo "O1 opencode2api status=$O1 body=$(head -c 240 "$W/o1.json")"
           echo "--- o2a log tail ---"; tail -n 12 "$W/o2a.log" || true
           kill $O2A_PID 2>/dev/null || true
-          sleep 1
+          sleep 3
 
-          # ---------- Z1: zen-direct v2 ----------
+          # ---------- Z1: zen-direct v2 修复版本 (长对话第 1 轮) ----------
           go build -trimpath -ldflags "-X main.appVersion=bab" -o "$W/zen-direct" .
           PORT=18091 "$W/zen-direct" >"$W/zen.log" 2>&1 &
           Z_PID=$!
@@ -105,9 +169,19 @@ jobs:
           if [ "$ZREADY" != "1" ]; then echo "Z1 gateway not ready"; tail -n 20 "$W/zen.log"; kill $Z_PID 2>/dev/null || true; exit 0; fi
           Z1=$(curl -sS --max-time 150 -o "$W/z1.json" -w '%{http_code}' \
             -X POST http://127.0.0.1:18091/v1/chat/completions \
-            -H 'Content-Type: application/json' --data-binary @"$W/req.json" || echo 000)
-          echo "Z1 zen-direct status=$Z1 body=$(head -c 240 "$W/z1.json")"
-          grep -o 'upstream project=[0-9a-f]*' "$W/zen.log" | tail -1 || true
+            -H 'Content-Type: application/json' --data-binary @"$W/req_turn1.json" || echo 000)
+          echo "Z1 zen-direct Turn 1 status=$Z1 body=$(head -c 240 "$W/z1.json")"
+          sleep 2
+
+          # ---------- Z2: zen-direct v2 修复版本 (长对话第 2 轮追问) ----------
+          Z2=$(curl -sS --max-time 150 -o "$W/z2.json" -w '%{http_code}' \
+            -X POST http://127.0.0.1:18091/v1/chat/completions \
+            -H 'Content-Type: application/json' --data-binary @"$W/req_turn2.json" || echo 000)
+          echo "Z2 zen-direct Turn 2 status=$Z2 body=$(head -c 240 "$W/z2.json")"
+
+          grep -o 'upstream project=[0-9a-f]*' "$W/zen.log" | tail -2 || true
           kill $Z_PID 2>/dev/null || true
 
-          echo "RESULT C0=$C0 O1=$O1 Z1=$Z1"
+          echo "=========================================================="
+          echo "SHARD ${{ matrix.shard }} FINAL RESULT: C0=$C0 O1=$O1 Z1=$Z1 Z2=$Z2"
+          echo "=========================================================="

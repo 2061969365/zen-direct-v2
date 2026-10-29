@@ -18,8 +18,8 @@ func TestMergeChatStubTools(t *testing.T) {
 	in := map[string]any{"tools": []any{mk("mytool")}}
 	mergeChatStubTools(in)
 	items, _ := in["tools"].([]any)
-	if len(items) != len(stubToolNames)+1 {
-		t.Fatalf("应为桩数+1=%d，得 %d", len(stubToolNames)+1, len(items))
+	if len(items) != len(getOfficialTools())+1 {
+		t.Fatalf("应为桩数+1=%d，得 %d", len(getOfficialTools())+1, len(items))
 	}
 	first, _ := items[0].(map[string]any)
 	fn, _ := first["function"].(map[string]any)

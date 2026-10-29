@@ -668,6 +668,11 @@ func buildUpstream(entry Format, target Format, in map[string]any) (map[string]a
 			return nil, err
 		}
 		mergeChatStubTools(upReq)
+		if _, ok := upReq["max_completion_tokens"]; !ok {
+			if _, ok := upReq["max_tokens"]; !ok {
+				upReq["max_completion_tokens"] = 32000
+			}
+		}
 	}
 	// V2 全路径拒绝显式 tool_choice:none，缺省即 auto 语义。
 	// 上方已剥离客户端 none；转换函数只透传用户自带的有效选择。

@@ -115,6 +115,13 @@ func setZenHeaders(h http.Header, apiKey, project string) {
 	setDefault(h, "X-Opencode-Session-Id", ses)
 	setDefault(h, "X-Session-Affinity", ses)
 	setDefault(h, "X-Session-Id", ses)
+	if h.Get("traceparent") == "" {
+		traceID := randHex(16)
+		spanID := randHex(8)
+		parentSpanID := randHex(8)
+		h.Set("traceparent", fmt.Sprintf("00-%s-%s-01", traceID, spanID))
+		h.Set("b3", fmt.Sprintf("%s-%s-1-%s", traceID, spanID, parentSpanID))
+	}
 
 	// project id 不能走 setDefault：它会把客户端原样值放过去，而 prj_* 这类
 	// 形状会被 v2 门禁直接 403。

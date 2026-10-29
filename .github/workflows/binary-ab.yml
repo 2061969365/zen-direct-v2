@@ -1,12 +1,13 @@
 name: binary-ab
 
-# 多 IP、多轮长对话对照验证：
+# 多 IP、工具调用与 429 复现对照验证：
 # 每个 shard 是一个独立 GitHub Actions Runner（独立公网出口 IP）。
 # 同一个出口 IP 依次执行：
-#   C0  官方 opencode CLI 2.2.0                    长对话请求，期望 200（证明 IP/额度干净）
-#   O1  opencode2api v1.4.5 二进制                 长对话多轮请求
-#   Z1  zen-direct v2 修复版本（原生 uTLS + 12 工具） 长对话多轮请求 (Turn 1)
-#   Z2  zen-direct v2 修复版本（原生 uTLS + 12 工具） 长对话追问请求 (Turn 2)
+#   C0          官方 opencode CLI 2.2.0               基线（证明 IP 干净）
+#   Z_clean     zen-direct 纯对话请求                  无客户端工具基线
+#   Z_mimic     zen-direct 模仿复现 429 请求           带客户端 read/shell 工具（触发 zd_ 别名改写）
+#   Z_tool_hist zen-direct 真实工具调用多轮历史        包含 assistant tool_calls 与 role=tool 返回
+#   O_mimic     opencode2api 相同带工具请求对照
 
 on:
   workflow_dispatch:
@@ -25,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -35,7 +36,7 @@ jobs:
         run: |
           npm install -g @opencode/cli@latest 2>&1 | tail -1
           opencode --version
-      - name: same-ip multi-round long-conversation ab
+      - name: same-ip tool mimic and 429 repro ab
         run: |
           set -u
           export PATH="$HOME/.npm-global/bin:$PATH"
@@ -44,77 +45,156 @@ jobs:
           IP=$(curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["query"])')
           echo "=== Shard ${{ matrix.shard }} on IP=$IP ==="
 
-          LONG_PROMPT="Do not execute any tools, shell commands, or file reads. Directly write a comprehensive conceptual essay explaining high-concurrency LRU cache architecture in Go, covering sync.RWMutex sharding, lock-peeling for eviction callbacks, and TTL background expiration."
+          # 1. 干净基线请求（无客户端工具）
+          cat > "$W/req_clean.json" <<'JSON'
+          {
+            "model": "deepseek-v4.1-flash-free",
+            "stream": false,
+            "messages": [
+              {"role": "user", "content": "Reply with the single word: ok"}
+            ]
+          }
+          JSON
 
-          cat > "$W/req_turn1.json" <<'JSON'
+          # 2. 模仿本地网关 429 的请求：客户端传入自定义 read 和 shell 工具定义
+          cat > "$W/req_mimic.json" <<'JSON'
+          {
+            "model": "deepseek-v4.1-flash-free",
+            "stream": false,
+            "max_completion_tokens": 40000,
+            "messages": [
+              {"role": "user", "content": "Reply with the single word: ok"}
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read",
+                  "description": "Read a file from disk",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "shell",
+                  "description": "Run a shell command",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                  }
+                }
+              }
+            ]
+          }
+          JSON
+
+          # 3. 真实工具调用历史请求（第 2 轮带着 tool_calls 和 role=tool 的回传）
+          cat > "$W/req_tool_hist.json" <<'JSON'
           {
             "model": "deepseek-v4.1-flash-free",
             "stream": false,
             "messages": [
               {
                 "role": "user",
-                "content": "Explain the key considerations for designing a high-concurrency LRU cache in Go, specifically handling lock contention, eviction callbacks without deadlocks, and memory overhead of map pointers. Please provide a detailed response with code structure."
+                "content": "Check what is inside main.go"
               },
               {
                 "role": "assistant",
-                "content": "Designing a high-concurrency LRU cache in Go involves several key considerations:\n\n1. **Lock Contention & Sharding**: Using a single sync.RWMutex can become a bottleneck under write-heavy workloads (updating MRU order requires a write lock). Sharding the key space across multiple cache buckets reduces contention.\n\n2. **Deadlock-Free Eviction Callbacks**: Invoking an OnEvicted callback while holding the bucket lock risks deadlocks if the callback calls back into the cache. The recommended pattern is collecting evicted entries under lock, releasing the lock, and invoking callbacks asynchronously or outside the critical section.\n\n3. **Memory Overhead**: Map entries in Go incur pointer and bucket overhead. Storing values inline or using compact node indexes minimizes pointer indirection."
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "call_abc123",
+                    "type": "function",
+                    "function": {
+                      "name": "read",
+                      "arguments": "{\"path\":\"main.go\"}"
+                    }
+                  }
+                ]
               },
               {
-                "role": "user",
-                "content": "Now show me the exact Go code for the Evict and Add methods implementing the lock-releasing callback pattern you described."
+                "role": "tool",
+                "tool_call_id": "call_abc123",
+                "name": "read",
+                "content": "package main\n\nfunc main() {}\n"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read",
+                  "description": "Read a file from disk",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                  }
+                }
               }
             ]
           }
           JSON
 
-          cat > "$W/req_turn2.json" <<'JSON'
-          {
-            "model": "deepseek-v4.1-flash-free",
-            "stream": false,
-            "messages": [
-              {
-                "role": "user",
-                "content": "Explain the key considerations for designing a high-concurrency LRU cache in Go, specifically handling lock contention, eviction callbacks without deadlocks, and memory overhead of map pointers."
-              },
-              {
-                "role": "assistant",
-                "content": "Summary of points: sharded buckets, deferred callbacks outside critical sections, compact struct allocations."
-              },
-              {
-                "role": "user",
-                "content": "Now show me the exact Go code for the Evict and Add methods implementing the lock-releasing callback pattern you described."
-              },
-              {
-                "role": "assistant",
-                "content": "Here is the implementation of Evict and Add with lock peeling to ensure OnEvicted callbacks are never invoked under lock."
-              },
-              {
-                "role": "user",
-                "content": "How would you write comprehensive unit tests with go test -race to verify no race conditions occur when Evict and Add are called concurrently with high goroutine counts?"
-              }
-            ]
-          }
-          JSON
-
-          # ---------- C0: 官方 CLI (在干净隔离空目录下执行长文本请求) ----------
+          # ---------- C0: 官方 CLI 基线 ----------
           set +e
-          (cd "$W" && timeout 120 opencode run -m opencode/deepseek-v4.1-flash-free \
-            "$LONG_PROMPT" >"$W/c0.out" 2>"$W/c0.err")
+          (cd "$W" && timeout 60 opencode run -m opencode/deepseek-v4.1-flash-free "Reply with the single word: ok" >"$W/c0.out" 2>"$W/c0.err")
           C0=$?
           set -e
-          echo "C0 exit=$C0 out_len=$(wc -c < "$W/c0.out" || echo 0) out_sample=$(tail -n 2 "$W/c0.out" | head -c 200)"
-          if [ "$C0" != "0" ] && grep -qi "free usage limit" "$W/c0.err"; then
+          echo "C0 exit=$C0 out=$(tail -n 2 "$W/c0.out" | head -c 120)"
+          if [ "$C0" != "0" ]; then
             echo "IP=$IP DIRTY (CLI got rate limited):"
             cat "$W/c0.err" || true
             exit 0
           fi
-          echo "IP=$IP CLEAN (C0 passed or active)"
+          echo "IP=$IP CLEAN"
           sleep 3
 
-          # ---------- O1: opencode2api v1.4.5 二进制 ----------
+          # ---------- 启动 zen-direct v2 ----------
+          go build -trimpath -ldflags "-X main.appVersion=bab" -o "$W/zen-direct" .
+          PORT=18091 "$W/zen-direct" >"$W/zen.log" 2>&1 &
+          Z_PID=$!
+          ZREADY=0
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:18091/health >/dev/null 2>&1; then ZREADY=1; break; fi
+            sleep 0.5
+          done
+          if [ "$ZREADY" != "1" ]; then echo "Z gateway not ready"; tail -n 20 "$W/zen.log"; kill $Z_PID 2>/dev/null || true; exit 0; fi
+
+          # 测试 1: Z_clean (纯对话)
+          Z_CLEAN=$(curl -sS --max-time 150 -o "$W/z_clean.json" -w '%{http_code}' \
+            -X POST http://127.0.0.1:18091/v1/chat/completions \
+            -H 'Content-Type: application/json' --data-binary @"$W/req_clean.json" || echo 000)
+          echo "Z_clean (无工具纯文本) status=$Z_CLEAN body=$(head -c 200 "$W/z_clean.json")"
+          sleep 3
+
+          # 测试 2: Z_mimic (带客户端 read/shell 工具定义，触发 zd_ 别名)
+          Z_MIMIC=$(curl -sS --max-time 150 -o "$W/z_mimic.json" -w '%{http_code}' \
+            -X POST http://127.0.0.1:18091/v1/chat/completions \
+            -H 'Content-Type: application/json' --data-binary @"$W/req_mimic.json" || echo 000)
+          echo "Z_mimic (带客户端工具定义) status=$Z_MIMIC body=$(head -c 200 "$W/z_mimic.json")"
+          sleep 3
+
+          # 测试 3: Z_tool_hist (真实多轮带 tool_calls 与 role=tool 历史)
+          Z_TOOL_HIST=$(curl -sS --max-time 150 -o "$W/z_tool_hist.json" -w '%{http_code}' \
+            -X POST http://127.0.0.1:18091/v1/chat/completions \
+            -H 'Content-Type: application/json' --data-binary @"$W/req_tool_hist.json" || echo 000)
+          echo "Z_tool_hist (真实工具调用历史) status=$Z_TOOL_HIST body=$(head -c 200 "$W/z_tool_hist.json")"
+
+          echo "--- zen.log 详细记录 ---"
+          grep -E "\[REQ|alias|free-usage|upstream project" "$W/zen.log" | tail -15 || true
+          kill $Z_PID 2>/dev/null || true
+          sleep 3
+
+          # ---------- 启动 opencode2api 对照 ----------
           git clone --depth 1 --branch v1.4.5 https://github.com/jasonxu114514/opencode2api "$W/o2a" 2>&1 | tail -1
           (cd "$W/o2a" && go build -trimpath -o "$W/o2a-gateway" ./cmd/opencode2api)
-          ls -l "$W/o2a-gateway" | awk '{print "o2a binary:", $5, "bytes"}'
 
           cat > "$W/o2a-config.json" <<'JSON'
           {
@@ -146,42 +226,18 @@ jobs:
             if curl -fsS http://127.0.0.1:18090/healthz >/dev/null 2>&1; then READY=1; break; fi
             sleep 0.5
           done
-          echo "O1 healthz ready=$READY pid_alive=$(kill -0 $O2A_PID 2>/dev/null && echo yes || echo no)"
-          if [ "$READY" != "1" ]; then echo "--- o2a log ---"; tail -n 40 "$W/o2a.log"; kill $O2A_PID 2>/dev/null || true; exit 0; fi
-          O1=$(curl -sS --max-time 150 -o "$W/o1.json" -w '%{http_code}' \
-            -X POST http://127.0.0.1:18090/v1/chat/completions \
-            -H 'Content-Type: application/json' -H 'Authorization: Bearer k' \
-            --data-binary @"$W/req_turn1.json" || echo 000)
-          echo "O1 opencode2api status=$O1 body=$(head -c 240 "$W/o1.json")"
-          echo "--- o2a log tail ---"; tail -n 12 "$W/o2a.log" || true
+          if [ "$READY" = "1" ]; then
+            O_MIMIC=$(curl -sS --max-time 150 -o "$W/o_mimic.json" -w '%{http_code}' \
+              -X POST http://127.0.0.1:18090/v1/chat/completions \
+              -H 'Content-Type: application/json' -H 'Authorization: Bearer k' \
+              --data-binary @"$W/req_mimic.json" || echo 000)
+            echo "O_mimic opencode2api status=$O_MIMIC body=$(head -c 200 "$W/o_mimic.json")"
+          else
+            echo "O2A not ready"
+            O_MIMIC=000
+          fi
           kill $O2A_PID 2>/dev/null || true
-          sleep 3
-
-          # ---------- Z1: zen-direct v2 修复版本 (长对话第 1 轮) ----------
-          go build -trimpath -ldflags "-X main.appVersion=bab" -o "$W/zen-direct" .
-          PORT=18091 "$W/zen-direct" >"$W/zen.log" 2>&1 &
-          Z_PID=$!
-          ZREADY=0
-          for i in $(seq 1 40); do
-            if curl -fsS http://127.0.0.1:18091/health >/dev/null 2>&1; then ZREADY=1; break; fi
-            sleep 0.5
-          done
-          if [ "$ZREADY" != "1" ]; then echo "Z1 gateway not ready"; tail -n 20 "$W/zen.log"; kill $Z_PID 2>/dev/null || true; exit 0; fi
-          Z1=$(curl -sS --max-time 150 -o "$W/z1.json" -w '%{http_code}' \
-            -X POST http://127.0.0.1:18091/v1/chat/completions \
-            -H 'Content-Type: application/json' --data-binary @"$W/req_turn1.json" || echo 000)
-          echo "Z1 zen-direct Turn 1 status=$Z1 body=$(head -c 240 "$W/z1.json")"
-          sleep 2
-
-          # ---------- Z2: zen-direct v2 修复版本 (长对话第 2 轮追问) ----------
-          Z2=$(curl -sS --max-time 150 -o "$W/z2.json" -w '%{http_code}' \
-            -X POST http://127.0.0.1:18091/v1/chat/completions \
-            -H 'Content-Type: application/json' --data-binary @"$W/req_turn2.json" || echo 000)
-          echo "Z2 zen-direct Turn 2 status=$Z2 body=$(head -c 240 "$W/z2.json")"
-
-          grep -o 'upstream project=[0-9a-f]*' "$W/zen.log" | tail -2 || true
-          kill $Z_PID 2>/dev/null || true
 
           echo "=========================================================="
-          echo "SHARD ${{ matrix.shard }} FINAL RESULT: C0=$C0 O1=$O1 Z1=$Z1 Z2=$Z2"
+          echo "SHARD ${{ matrix.shard }} REPORT: C0=$C0 Z_clean=$Z_CLEAN Z_mimic=$Z_MIMIC Z_tool_hist=$Z_TOOL_HIST O_mimic=$O_MIMIC"
           echo "=========================================================="

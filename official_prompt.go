@@ -6,24 +6,19 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
-// officialSystemPrompt 是 OpenCode 官方 CLI 的系统提示词（2.2.0 正文）。
-//
-// 上游免费层要求 messages[0] 就是它（否则同样 429）。
-//
-//go:embed tools/official_system_prompt.txt
-var officialSystemPrompt string
+//go:embed tools/opencode_prompt_v2.txt
+var opencodePromptV2 string
 
-// officialPromptHead 用于判重：只要首条 system 内容以官方提示词开头，
-// 就认为已经注入过。
-const officialPromptHead = 60
+var officialSystemPrompt = opencodePromptV2
 
-// officialSkills 是 CLI 在环境块之后追加的内置 skill 列表。
-const officialSkills = `Skills provide specialized instructions and workflows for specific tasks.
+const opencodePromptMarker = "You are opencode, an interactive CLI tool"
+
+const opencodeSkills = `Skills provide specialized instructions and workflows for specific tasks.
 Use the skill tool to load a skill when a task matches its description.
-The user may also invoke a skill directly. When that happens, its instructions appear in the conversation as a <skill_content> block, the same shape the skill tool returns. A skill that is already present this way does not need to be invoked again.
 <available_skills>
   <skill>
     <name>customize-opencode</name>
@@ -32,75 +27,121 @@ The user may also invoke a skill directly. When that happens, its instructions a
   </skill>
 </available_skills>`
 
-var officialWorkDir string
+var (
+	opencodeEnvOnce sync.Once
+	opencodeWorkDir string
+)
 
-func officialEnvironment(model string) string {
-	if officialWorkDir == "" {
-		dir := ""
+func opencodeEnvironment(model string) string {
+	opencodeEnvOnce.Do(func() {
+		directory := ""
 		if current, err := os.Getwd(); err == nil {
-			dir = filepath.Clean(strings.TrimSpace(current))
+			directory = filepath.Clean(strings.TrimSpace(current))
 		}
-		if dir == "" || dir == "." {
-			dir = "/workspace"
+		if directory == "" || directory == "." {
+			directory = "/workspace"
 		}
-		officialWorkDir = dir
+		opencodeWorkDir = directory
+	})
+	apiModel := strings.TrimSpace(strings.TrimPrefix(model, "opencode/"))
+	if apiModel == "" {
+		apiModel = "unknown"
 	}
 	platform := runtime.GOOS
 	if platform == "windows" {
 		platform = "win32"
 	}
 	return strings.Join([]string{
-		"Today's date: " + time.Now().UTC().Format("Mon Jan 02 2006"),
-		"",
+		"You are powered by the model named " + apiModel + ". The exact model ID is opencode/" + apiModel,
 		"Here is some useful information about the environment you are running in:",
 		"<env>",
-		"  Working directory: " + officialWorkDir,
-		"  Workspace root folder: " + officialWorkDir,
+		"  Working directory: " + opencodeWorkDir,
+		"  Workspace root folder: " + opencodeWorkDir,
 		"  Is directory a git repo: yes",
 		"  Platform: " + platform,
+		"  Today's date: " + time.Now().UTC().Format("Mon Jan 02 2006"),
 		"</env>",
 	}, "\n")
 }
 
-// officialPromptFor 拼出与官方 CLI 2.2.0 同形的完整系统提示词：正文 + skills + 环境块。
-func officialPromptFor(model string) string {
-	base := strings.TrimSpace(officialSystemPrompt)
-	if base == "" {
-		return ""
-	}
-	return base + "\n\n" + officialSkills + "\n\n" + officialEnvironment(model)
+func opencodeSystemPrompt(model string) string {
+	return opencodePromptV2 + opencodeEnvironment(model) + "\n" + opencodeSkills
 }
 
-// injectOfficialSystemPrompt 在 chat 形请求体前面插入官方 system 提示词。
-// 返回是否真的插入（已存在或结构不认识时返回 false）。
 func injectOfficialSystemPrompt(payload map[string]any) bool {
 	if payload == nil {
 		return false
 	}
-	prompt := officialPromptFor(asStr(payload["model"]))
-	if prompt == "" {
-		return false
-	}
-	msgs, ok := payload["messages"].([]any)
+	model, _ := payload["model"].(string)
+	prompt := opencodeSystemPrompt(model)
+	return injectChatPrompt(payload, prompt)
+}
+
+func injectChatPrompt(payload map[string]any, prompt string) bool {
+	messages, ok := payload["messages"].([]any)
 	if !ok {
 		return false
 	}
-	head := prompt
-	if len(head) > officialPromptHead {
-		head = head[:officialPromptHead]
-	}
-	if len(msgs) > 0 {
-		if first, ok := msgs[0].(map[string]any); ok {
-			role, _ := first["role"].(string)
-			content, _ := first["content"].(string)
-			if role == "system" && (strings.HasPrefix(content, head) ||
-				strings.HasPrefix(content, "You are an AI agent running in OpenCode") ||
-				strings.HasPrefix(content, "You are opencode, an interactive CLI tool")) {
-				return false
+	kept := make([]any, 0, len(messages)+1)
+	var instructions []string
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			kept = append(kept, raw)
+			continue
+		}
+		role, _ := message["role"].(string)
+		if role != "system" && role != "developer" {
+			kept = append(kept, raw)
+			continue
+		}
+		content := message["content"]
+		if carriesOpenCodePrompt(content) {
+			return false
+		}
+		for _, part := range textFragments(content) {
+			if part = strings.TrimSpace(part); part != "" {
+				instructions = append(instructions, part)
 			}
 		}
 	}
-	msg := map[string]any{"role": "system", "content": prompt}
-	payload["messages"] = append([]any{msg}, msgs...)
+	system := prompt
+	if joined := strings.Join(instructions, "\n"); joined != "" {
+		system += "\n\n" + joined
+	}
+	payload["messages"] = append([]any{map[string]any{"role": "system", "content": system}}, kept...)
 	return true
+}
+
+func textFragments(value any) []string {
+	switch typed := value.(type) {
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return nil
+		}
+		return []string{typed}
+	case []any:
+		var parts []string
+		for _, item := range typed {
+			parts = append(parts, textFragments(item)...)
+		}
+		return parts
+	case map[string]any:
+		if text, ok := typed["text"].(string); ok {
+			return textFragments(text)
+		}
+		if content, ok := typed["content"]; ok {
+			return textFragments(content)
+		}
+	}
+	return nil
+}
+
+func carriesOpenCodePrompt(value any) bool {
+	for _, part := range textFragments(value) {
+		if strings.Contains(part, opencodePromptMarker) {
+			return true
+		}
+	}
+	return false
 }

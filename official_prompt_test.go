@@ -22,7 +22,8 @@ func TestOfficialPromptInjected(t *testing.T) {
 	if first["role"] != "system" {
 		t.Errorf("首条应为 system，得到 %v", first["role"])
 	}
-	if !strings.HasPrefix(first["content"].(string), "You are an AI agent running in OpenCode") {
+	if !strings.HasPrefix(first["content"].(string), "You are opencode, an interactive CLI tool") &&
+		!strings.HasPrefix(first["content"].(string), "You are an AI agent running in OpenCode") {
 		t.Errorf("注入内容不像官方提示词：%.80q", first["content"])
 	}
 }

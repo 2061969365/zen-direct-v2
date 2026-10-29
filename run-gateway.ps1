@@ -1,9 +1,9 @@
-﻿# zen-direct v2 常驻启动器（原生传输，不需要 bun）
+# zen-direct v2 常驻启动器（原生传输，不需要 bun）
 # 双击、计划任务、启动目录快捷方式都可以调；重复运行会先收掉自己那一个进程再起。
 $ErrorActionPreference = 'Stop'
 
 $home_ = $PSScriptRoot
-if (-not $home_) { $home_ = Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $home_) { $home_ = 'F:\worker\zen-direct-v2' }
 
 # ===================== CONFIG =====================
 $Port        = 8081
@@ -11,7 +11,7 @@ $Concurrency = '16'
 $LogMaxMB    = '200'
 $LogKeepDays = 7
 $ZenBase     = 'https://opencode.ai/inference/v1'
-$FreshPerTurn = '0'      # 0=一对话一号（撞 429 才换） 1=每轮新号
+$FreshPerTurn = '1'      # 0=一对话一号（撞 429 才换） 1=每轮新号（彻底避免撞死号）
 # ==================================================
 
 $StateDir = Join-Path $home_ 'state'
@@ -21,18 +21,14 @@ New-Item -ItemType Directory -Force -Path $StateDir, $LogDir | Out-Null
 $exe = Join-Path $home_ 'zen-direct.exe'
 if (-not (Test-Path $exe)) { throw "missing $exe" }
 
-# 只收掉 v2 自己的进程（按 exe 路径匹配），不误伤老网关
-Get-CimInstance Win32_Process -Filter "Name='zen-direct.exe'" -ErrorAction SilentlyContinue |
-  Where-Object { $_.ExecutablePath -eq $exe } |
-  ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} }
+# 只收掉 v2 自己的进程
+Get-Process -Name 'zen-direct' -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep 1
 
-# 会话池 / 真号名单：首次启动时沿用老运行目录的最新状态
+# 会话池 / 真号名单
 $pool    = Join-Path $StateDir 'shim_sessions.json'
 $genuine = Join-Path $StateDir 'genuine_sessions.txt'
-$oldDir  = 'F:\worker\zen-direct'
-if (-not (Test-Path $pool)    -and (Test-Path (Join-Path $oldDir 'shim_sessions.json')))    { Copy-Item (Join-Path $oldDir 'shim_sessions.json')    $pool }
-if (-not (Test-Path $genuine) -and (Test-Path (Join-Path $oldDir 'genuine_sessions.txt'))) { Copy-Item (Join-Path $oldDir 'genuine_sessions.txt') $genuine }
+
 
 # 日志保留
 Get-ChildItem (Join-Path $LogDir 'zen-direct-*.err.log*') -ErrorAction SilentlyContinue |

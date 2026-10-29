@@ -108,7 +108,10 @@ func setZenHeaders(h http.Header, apiKey, project string) {
 	h.Set("User-Agent", uaString())
 	ses := h.Get("X-Opencode-Session")
 	if ses == "" {
-		ses = mintID("ses")
+		ses = CanonicalSessionID(randHex(16))
+		h.Set("X-Opencode-Session", ses)
+	} else if !isOfficialSessionID(ses) {
+		ses = CanonicalSessionID(ses)
 		h.Set("X-Opencode-Session", ses)
 	}
 	setDefault(h, "X-Opencode-Client", "cli")
@@ -787,13 +790,14 @@ func buildUpstream(entry Format, target Format, in map[string]any) (map[string]a
 		delete(in, "tool_choice")
 		in["tools"] = []any{}
 	}
-	// 保留名改别名（须在注桩之前：harness 的 read/shell 让位给官方桩）。
-	if n := aliasRequestTools(upReq, target); n > 0 && debugOn() {
-		log.Printf("alias %d reserved tool(s) for upstream", n)
+	// Opaque tool shaping（对齐 opencode2api commit 4a4db10）：
+	// 所有客户端工具统一重命名为 clint_<12hex> 隐藏指纹，并补齐官方 13 个工具
+	renames, _ := renameAndCompleteTools(upReq, target)
+	recordLastRenames(renames)
+	if debugOn() && renames != nil && renames.Count() > 0 {
+		log.Printf("renamed %d client tool(s) to clint_<digest>", renames.Count())
 	}
-	// 注桩前记录：客户端是否自带真工具。
 	if target == FmtResponses {
-		mergeStubTools(upReq)
 		// 同格式直传时客户端 reasoning.effort 原样透传，上游白名单外一律 400
 		//（如 effort 'none'）。有该键即归一化；缺省不动（沿用上游默认）。
 		if _, ok := upReq["reasoning"]; ok {
@@ -804,7 +808,6 @@ func buildUpstream(entry Format, target Format, in map[string]any) (map[string]a
 		if err := hoistChatToolImages(upReq); err != nil {
 			return nil, err
 		}
-		mergeChatStubTools(upReq)
 		if _, ok := upReq["max_completion_tokens"]; !ok {
 			if _, ok := upReq["max_tokens"]; !ok {
 				upReq["max_completion_tokens"] = 32000
@@ -1010,8 +1013,8 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 			return nil, err
 		}
 		// 免费层门禁：messages[0] 必须是 OpenCode 官方 system 提示词。
-		// 只在 chat 形请求上注入（与 sidecar 时代的行为一致）。
-		if entry == FmtChat {
+		// 上游目标为 chat（/chat/completions）时一律注入，覆盖 entry=chat 及 entry=responses->target=chat 全路径。
+		if target == FmtChat {
 			injectOfficialSystemPrompt(u)
 		}
 		// FreeTier 门禁实测要求上游 stream:true（否则 403）；

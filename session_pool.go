@@ -543,7 +543,7 @@ func poolBorrowEx(fp string) (string, bool) {
 	} else if s := acpMintFunc(); s != "" {
 		ses, gen = s, true
 	} else {
-		ses = mintID("ses")
+		ses = CanonicalSessionID(fmt.Sprintf("%s:%d:%d", fp, time.Now().UnixNano(), rotateSeq.Add(1)))
 	}
 	poolMu.Lock()
 	if e, ok := poolMap[fp]; ok {
@@ -601,7 +601,7 @@ func poolNextSes(fp string) (string, bool) {
 	} else if s := acpMintFunc(); s != "" {
 		ses, gen = s, true
 	} else {
-		ses = mintID("ses")
+		ses = CanonicalSessionID(fmt.Sprintf("%s:%d:%d", fp, time.Now().UnixNano(), rotateSeq.Add(1)))
 	}
 	poolMu.Lock()
 	if old, ok := poolMap[fp]; ok {
@@ -671,7 +671,7 @@ func poolRotate(fp string) (string, bool) {
 	} else if s := acpMintFunc(); s != "" {
 		ses, gen = s, true
 	} else {
-		ses = mintID("ses")
+		ses = CanonicalSessionID(fmt.Sprintf("%s:%d:%d", fp, time.Now().UnixNano(), rotateSeq.Add(1)))
 	}
 	poolMu.Lock()
 	delete(poolMap, fp)

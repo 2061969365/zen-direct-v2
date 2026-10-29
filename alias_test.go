@@ -16,7 +16,7 @@ func TestAliasRoundTrip(t *testing.T) {
 			t.Fatalf("zd_%s 应还原，得 %q", n, got)
 		}
 	}
-	for _, n := range []string{"mytool", "subagent", "todo_write", "web_fetch", "skill", ""} {
+	for _, n := range []string{"mytool", "todo_write", "custom_fetch", ""} {
 		if got := aliasFor(n); got != n {
 			t.Fatalf("非保留名 %q 不应改名，得 %q", n, got)
 		}
@@ -120,10 +120,11 @@ func TestAliasEndToEnd(t *testing.T) {
 	for _, raw := range asArr(up["tools"]) {
 		names[asStr(asMap(raw)["name"])] = true
 	}
-	if !names["zd_edit"] || names["edit"] {
+	editWire := ClientToolWireName("edit", nil)
+	if !names[editWire] || !names["edit"] {
 		t.Fatalf("上游应见别名：%v", names)
 	}
-	if !strings.Contains(out, `"name":"edit"`) || strings.Contains(out, "zd_edit") {
+	if !strings.Contains(out, `"name":"edit"`) || strings.Contains(out, editWire) {
 		t.Fatalf("下游应还原原名：%.300s", out)
 	}
 }

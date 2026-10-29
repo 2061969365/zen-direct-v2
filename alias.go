@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"strings"
+	"sync"
 )
 
 // alias.go: 上游保留工具名映射（V2 FreeTier 门禁）。
@@ -13,15 +15,19 @@ import (
 // 未知名的工具与历史一律不动。
 
 // aliasReserved 上游保留名（全小写精确匹配；子串不算，"basher" 照过）。
-var aliasReserved = []string{"bash", "edit", "read", "write", "glob", "grep", "shell"}
+var aliasReserved = []string{
+	"bash", "edit", "read", "write", "glob", "grep", "shell",
+	"question", "skill", "subagent", "webfetch", "websearch", "execute",
+}
 
 // aliasPrefix 别名前缀。客户端字面量叫 zd_<保留名> 的工具会被误映射，
 // 概率极低，接受（相应单测锁定该行为）。
 const aliasPrefix = "zd_"
 
 func isAliasReserved(name string) bool {
+	lower := strings.ToLower(name)
 	for _, n := range aliasReserved {
-		if n == name {
+		if n == lower {
 			return true
 		}
 	}
@@ -30,6 +36,10 @@ func isAliasReserved(name string) bool {
 
 // aliasFor 进上游名：保留名 → 别名，其余原样。
 func aliasFor(name string) string {
+	lower := strings.ToLower(name)
+	if lower == "subagent_fork" {
+		return "zd_fork"
+	}
 	if isAliasReserved(name) {
 		return aliasPrefix + name
 	}
@@ -38,6 +48,9 @@ func aliasFor(name string) string {
 
 // unaliasToolName 回客户端名：别名 → 原名，其余原样。
 func unaliasToolName(name string) string {
+	if name == "zd_fork" {
+		return "subagent_fork"
+	}
 	if len(name) > len(aliasPrefix) && name[:len(aliasPrefix)] == aliasPrefix {
 		if orig := name[len(aliasPrefix):]; isAliasReserved(orig) {
 			return orig
@@ -46,17 +59,43 @@ func unaliasToolName(name string) string {
 	return name
 }
 
+var (
+	lastRenamesMu sync.RWMutex
+	lastRenames   *ToolRenames
+)
+
+func recordLastRenames(r *ToolRenames) {
+	lastRenamesMu.Lock()
+	lastRenames = r
+	lastRenamesMu.Unlock()
+}
+
+func restoreLastRenames(line []byte) []byte {
+	lastRenamesMu.RLock()
+	r := lastRenames
+	lastRenamesMu.RUnlock()
+	if r != nil {
+		line = RenameResponseTool(line, r)
+	}
+	return line
+}
+
 // restoreAliasNames 把上游体里的别名还原（同格式透传路径用：pipeSSE 按行、
 // 非流 outBytes 整包）。只认 `"name":"zd_x"` 两种空白形态；JSON 字符串内的
 // 转义形态（\"name\":\"zd_x\"）天然碰不到，安全。
 func restoreAliasNames(line []byte) []byte {
+	line = restoreLastRenames(line)
 	if !bytes.Contains(line, []byte("zd_")) {
 		return line
 	}
+	line = bytes.ReplaceAll(line, []byte(`"name":"zd_fork"`), []byte(`"name":"subagent_fork"`))
+	line = bytes.ReplaceAll(line, []byte(`"name": "zd_fork"`), []byte(`"name": "subagent_fork"`))
 	for _, n := range aliasReserved {
-		a := aliasPrefix + n
-		line = bytes.ReplaceAll(line, []byte(`"name":"`+a+`"`), []byte(`"name":"`+n+`"`))
-		line = bytes.ReplaceAll(line, []byte(`"name": "`+a+`"`), []byte(`"name": "`+n+`"`))
+		for _, a := range []string{aliasPrefix + n, aliasPrefix + strings.Title(n)} {
+			orig := a[len(aliasPrefix):]
+			line = bytes.ReplaceAll(line, []byte(`"name":"`+a+`"`), []byte(`"name":"`+orig+`"`))
+			line = bytes.ReplaceAll(line, []byte(`"name": "`+a+`"`), []byte(`"name": "`+orig+`"`))
+		}
 	}
 	return line
 }

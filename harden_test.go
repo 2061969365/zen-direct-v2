@@ -175,10 +175,6 @@ func TestStubNeverCall(t *testing.T) {
 	if d := stubToolItem("shell")["description"]; !strings.Contains(d.(string), "do not call") {
 		t.Fatalf("桩 description 应禁调：%v", d)
 	}
-	fn, _ := chatStubToolItem("read")["function"].(map[string]any)
-	if d := fn["description"]; !strings.Contains(d.(string), "do not call") {
-		t.Fatalf("chat 桩 description 应禁调：%v", d)
-	}
 }
 
 // 超限回 413（maxReqBody 可覆盖小值测）。

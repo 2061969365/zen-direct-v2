@@ -1,11 +1,12 @@
 name: binary-ab
 
-# 真实端到端工具调用闭环验证（Real Tool Loop AB）：
-# 每个 shard 是一个独立 GitHub Actions Runner（独立公网出口 IP）。
-# 在同一个出口 IP 上完整走完真实的工具执行闭环：
-#   Round 1: 向模型发指令，强制模型决定调用 read 工具返回 tool_calls
-#   Local Exec: 真实在 runner 上读取 VERSION 文件内容
-#   Round 2: 把真实的工具执行结果以 role=tool 喂回给模型，模型返回最终分析文本
+# 全面深度端到端测试（Multi-Shard & Full Tool Loop Actions AB）：
+# 5 个独立 GitHub Runner 并行（5 个独立纯净公网出口 IP）。
+# 每个 Runner 独立执行 4 个严苛阶段的真实测试：
+#   Stage 1: 单轮工具决策（强制触发 read 工具调用并返回 tool_calls）
+#   Stage 2: 真实工具闭环（Runner 执行文件读取，装配 role=tool 喂回，模型输出分析结果）
+#   Stage 3: Shell 工具调用闭环（强制触发 shell 工具调用，执行 uname -a 并喂回）
+#   Stage 4: 复杂多轮交错与长上下文稳定性测试（带真实工具调用历史的多轮复杂请求）
 
 on:
   workflow_dispatch:
@@ -24,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -35,16 +36,18 @@ jobs:
           npm install -g @opencode/cli@latest 2>&1 | tail -1
           opencode --version
 
-      - name: real tool execution loop ab
+      - name: run detailed multi-stage tool tests
         run: |
           set -u
           export PATH="$HOME/.npm-global/bin:$PATH"
           export OPENCODE_DISABLE_AUTOUPDATE=1
           W="$PWD/_bab"; mkdir -p "$W"
           IP=$(curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["query"])')
-          echo "=== Shard ${{ matrix.shard }} on IP=$IP ==="
+          echo "=========================================================="
+          echo "=== Shard ${{ matrix.shard }} running on Runner IP=$IP ==="
+          echo "=========================================================="
 
-          # ---------- 1. 启动 zen-direct v2 ----------
+          # ---------- 1. 编译并启动 zen-direct v2 ----------
           go build -trimpath -ldflags "-X main.appVersion=bab" -o "$W/zen-direct" .
           PORT=18091 "$W/zen-direct" >"$W/zen.log" 2>&1 &
           Z_PID=$!
@@ -53,11 +56,16 @@ jobs:
             if curl -fsS http://127.0.0.1:18091/health >/dev/null 2>&1; then ZREADY=1; break; fi
             sleep 0.5
           done
-          if [ "$ZREADY" != "1" ]; then echo "Z gateway not ready"; tail -n 20 "$W/zen.log"; kill $Z_PID 2>/dev/null || true; exit 1; fi
+          if [ "$ZREADY" != "1" ]; then
+            echo "Z gateway not ready!"
+            tail -n 30 "$W/zen.log"
+            kill $Z_PID 2>/dev/null || true
+            exit 1
+          fi
 
-          # ---------- 2. Python 执行真实的 2 轮工具调用闭环 ----------
+          # ---------- 2. Python 执行 4 个阶段的全面测试 ----------
           python3 - <<'PY'
-          import urllib.request, json, os, sys, time
+          import urllib.request, json, os, sys, time, subprocess
 
           GW = "http://127.0.0.1:18091/v1/chat/completions"
           MODEL = "deepseek-v4.1-flash-free"
@@ -76,11 +84,21 @@ jobs:
                           "required": ["path"]
                       }
                   }
+              },
+              {
+                  "type": "function",
+                  "function": {
+                      "name": "shell",
+                      "description": "Execute a shell command and return its output.",
+                      "parameters": {
+                          "type": "object",
+                          "properties": {
+                              "command": {"type": "string", "description": "Shell command to execute"}
+                          },
+                          "required": ["command"]
+                      }
+                  }
               }
-          ]
-
-          messages = [
-              {"role": "user", "content": "Use the read tool to inspect VERSION file in current directory. Tell me the exact version string inside it."}
           ]
 
           def chat(msgs, t=None):
@@ -91,65 +109,123 @@ jobs:
               with urllib.request.urlopen(req, timeout=90) as resp:
                   return json.loads(resp.read().decode("utf-8"))
 
-          print(">>> [Turn 1] Requesting model to call tool...")
-          try:
-              r1 = chat(messages, tools)
-              choice1 = r1["choices"][0]
-              msg1 = choice1["message"]
-              tc = msg1.get("tool_calls")
-              print("Turn 1 finish_reason:", choice1.get("finish_reason"))
-              print("Turn 1 tool_calls count:", len(tc) if tc else 0)
-              
-              if not tc:
-                  print("FAIL: Model did not emit tool_calls!")
-                  sys.exit(1)
-              
-              messages.append(msg1)
-              for call in tc:
-                  fn = call["function"]
-                  call_id = call["id"]
-                  tool_name = fn["name"]
-                  args = json.loads(fn["arguments"])
-                  path = args.get("path", "VERSION")
-                  print(f"Executing local file read for: {path} (tool_name={tool_name})...")
-                  with open(path, "r", encoding="utf-8") as f:
-                      content = f.read()
-                  print(f"Real tool result: {content.strip()}")
-                  messages.append({
-                      "role": "tool",
-                      "tool_call_id": call_id,
-                      "name": tool_name,
-                      "content": content
-                  })
-              
-              print("\n>>> [Turn 2] Sending real tool output back to zen-direct...")
-              r2 = chat(messages, tools)
-              choice2 = r2["choices"][0]
-              msg2 = choice2["message"]
-              print("Turn 2 finish_reason:", choice2.get("finish_reason"))
-              print("Turn 2 final content:\n", msg2.get("content"))
-              print("\nSUCCESS: Real tool loop completed with 200 OK!")
-          except urllib.error.HTTPError as e:
-              err = e.read().decode("utf-8", "replace")
-              print(f"FAIL: HTTPError {e.code}: {err}")
+          print("\n----------------------------------------------------------")
+          print(">>> [Stage 1 & 2] Testing 'read' Tool Calling & Output Feedback Loop...")
+          print("----------------------------------------------------------")
+          stage1_msgs = [
+              {"role": "user", "content": "You must use the read tool to read the file VERSION in the current directory. Do not guess, output a tool call."}
+          ]
+          r1 = chat(stage1_msgs, tools)
+          c1 = r1["choices"][0]
+          m1 = c1["message"]
+          tc1 = m1.get("tool_calls")
+          print("Stage 1 finish_reason:", c1.get("finish_reason"))
+          print("Stage 1 tool_calls count:", len(tc1) if tc1 else 0)
+          if not tc1:
+              print("FAIL: Model did not emit tool_calls in Stage 1!")
               sys.exit(1)
-          except Exception as e:
-              print(f"FAIL: Exception {e}")
+
+          stage1_msgs.append(m1)
+          for call in tc1:
+              fn = call["function"]
+              call_id = call["id"]
+              tool_name = fn["name"]
+              args = json.loads(fn["arguments"])
+              path = args.get("path", "VERSION")
+              print(f"Reading file: {path} via local filesystem...")
+              with open(path, "r", encoding="utf-8") as f:
+                  content = f.read()
+              print(f"File content: {content.strip()}")
+              stage1_msgs.append({
+                  "role": "tool",
+                  "tool_call_id": call_id,
+                  "name": tool_name,
+                  "content": content
+              })
+
+          print("Feeding read tool result back to model...")
+          r2 = chat(stage1_msgs, tools)
+          c2 = r2["choices"][0]
+          m2 = c2["message"]
+          print("Stage 2 finish_reason:", c2.get("finish_reason"))
+          print("Stage 2 reply sample:\n", (m2.get("content") or "")[:200])
+          print("PASS: Stage 1 & 2 (Read Tool Loop) Succeeded!")
+          time.sleep(2)
+
+          print("\n----------------------------------------------------------")
+          print(">>> [Stage 3] Testing 'shell' Tool Calling & Command Output Loop...")
+          print("----------------------------------------------------------")
+          stage3_msgs = [
+              {"role": "user", "content": "Run the command `uname -s -m` using the shell tool. Do not guess the answer."}
+          ]
+          r3 = chat(stage3_msgs, tools)
+          c3 = r3["choices"][0]
+          m3 = c3["message"]
+          tc3 = m3.get("tool_calls")
+          print("Stage 3 finish_reason:", c3.get("finish_reason"))
+          print("Stage 3 tool_calls count:", len(tc3) if tc3 else 0)
+          if not tc3:
+              print("FAIL: Model did not emit tool_calls in Stage 3!")
               sys.exit(1)
+
+          stage3_msgs.append(m3)
+          for call in tc3:
+              fn = call["function"]
+              call_id = call["id"]
+              tool_name = fn["name"]
+              args = json.loads(fn["arguments"])
+              cmd = args.get("command", "uname -s -m")
+              print(f"Executing local shell command: {cmd}...")
+              res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+              cmd_out = res.stdout.strip()
+              print(f"Command output: {cmd_out}")
+              stage3_msgs.append({
+                  "role": "tool",
+                  "tool_call_id": call_id,
+                  "name": tool_name,
+                  "content": cmd_out
+              })
+
+          print("Feeding shell command result back to model...")
+          r4 = chat(stage3_msgs, tools)
+          c4 = r4["choices"][0]
+          m4 = c4["message"]
+          print("Stage 3 finish_reason (round 2):", c4.get("finish_reason"))
+          print("Stage 3 reply sample:\n", (m4.get("content") or "")[:200])
+          print("PASS: Stage 3 (Shell Tool Loop) Succeeded!")
+          time.sleep(2)
+
+          print("\n----------------------------------------------------------")
+          print(">>> [Stage 4] Testing Deep Context with Multiple Tool History...")
+          print("----------------------------------------------------------")
+          # Multi-turn history combining both previous tool interactions + follow-up
+          combined_msgs = stage1_msgs + stage3_msgs[1:] + [
+              {"role": "user", "content": "Summarize what tools you ran so far and the system environment verified."}
+          ]
+          r5 = chat(combined_msgs, tools)
+          c5 = r5["choices"][0]
+          m5 = c5["message"]
+          print("Stage 4 finish_reason:", c5.get("finish_reason"))
+          print("Stage 4 reply sample:\n", (m5.get("content") or "")[:240])
+          print("PASS: Stage 4 (Complex Multi-tool History) Succeeded!")
+
+          print("\n==========================================================")
+          print("ALL 4 STAGES COMPLETED WITH 100% SUCCESS ON THIS SHARD!")
+          print("==========================================================")
           PY
 
-          TOOL_LOOP_EXIT=$?
-          echo "TOOL_LOOP_EXIT=$TOOL_LOOP_EXIT"
+          RESULT_EXIT=$?
+          echo "RESULT_EXIT=$RESULT_EXIT"
 
           echo "--- zen.log 详细记录 ---"
-          grep -E "\[REQ|alias|free-usage|upstream project" "$W/zen.log" | tail -15 || true
+          grep -E "\[REQ|alias|free-usage|upstream project" "$W/zen.log" | tail -25 || true
           kill $Z_PID 2>/dev/null || true
 
-          if [ "$TOOL_LOOP_EXIT" != "0" ]; then
-            echo "Real tool loop FAILED!"
+          if [ "$RESULT_EXIT" != "0" ]; then
+            echo "Shard ${{ matrix.shard }} FAILED!"
             exit 1
           fi
 
           echo "=========================================================="
-          echo "SHARD ${{ matrix.shard }} FINAL RESULT: TOOL_LOOP_SUCCESS=1"
+          echo "SHARD ${{ matrix.shard }} FINAL STATUS: PASS (IP=$IP)"
           echo "=========================================================="

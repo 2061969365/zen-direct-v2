@@ -161,8 +161,13 @@ jobs:
         include:
           - os: ubuntu-latest
             out: zen-direct-linux-amd64
+            goarch: amd64
+          - os: ubuntu-latest
+            out: zen-direct-linux-arm64
+            goarch: arm64
           - os: windows-latest
             out: zen-direct.exe
+            goarch: amd64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -172,5 +177,6 @@ jobs:
       - run: go build -trimpath -ldflags '-s -w' -o ${{ matrix.out }} .
         env:
           CGO_ENABLED: '0'
+          GOARCH: ${{ matrix.goarch }}
       # 注：正式 Release 二进制走本地交叉编译 + `gh release create` 发附件；
       # Actions artifact 配额已满，不再经 artifact 中转。

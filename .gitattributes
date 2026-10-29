@@ -1,4 +1,8 @@
 entrypoint.sh text eol=lf
 Dockerfile text eol=lf
+*.sh text eol=lf
 *.ps1 text eol=crlf
 *.bat text eol=crlf
+# 嵌入二进制/逐字节比对的上游资源：必须保持 LF
+tools/*.txt text eol=lf
+tools/*.json text eol=lf

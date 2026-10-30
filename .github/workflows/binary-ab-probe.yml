@@ -1,0 +1,115 @@
+name: binary-ab-probe
+
+# 决定性对照：同一台 runner、同一个出口 IP、同一个生产探针 payload，
+# 分别用「当前 main 源码现编」和「模板里那个预编译 v0.9.5」各打一次。
+#   - 两者都 429 → 与二进制无关，是上游对该 IP/额度的判定
+#   - 现编 200 / 预编译 429 → 模板二进制落后，需要重编模板
+on:
+  workflow_dispatch:
+
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: egress IP
+        run: curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; j=json.load(sys.stdin); print("IP=",j["query"],j["city"])'
+      - name: fetch prebuilt template binary
+        run: |
+          set -euo pipefail
+          mkdir -p _b
+          # 模板里的二进制在网关仓库，公开可读
+          curl -fsSL -o _b/zen-prebuilt \
+            "https://raw.githubusercontent.com/xia35480/zen/main/bin/zen-direct"
+          chmod +x _b/zen-prebuilt
+          sha256sum _b/zen-prebuilt
+          ls -l _b/zen-prebuilt
+      - name: build current source
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags "-s -w -X main.appVersion=0.9.5" -o _b/zen-fresh .
+          sha256sum _b/zen-fresh
+      - name: probe both binaries with production payload
+        run: |
+          set -u
+          W="$PWD/_b"
+          cat > "$W/probe.py" <<'PY'
+          import json, sys, time, urllib.request, urllib.error
+
+          MODEL = "deepseek-v4.1-flash-free"
+          PORT = int(sys.argv[1])
+          TAG = sys.argv[2]
+
+          # 与生产 run-gateway.sh 完全一致的起手探针
+          payload = {
+              "model": MODEL,
+              "messages": [
+                  {"role": "system", "content": "You are opencode, a coding agent. Answer concisely."},
+                  {"role": "user", "content": "用一句话说明你能做什么。"},
+                  {"role": "assistant", "content": "我可以帮你读写代码、运行命令、排查问题。"},
+                  {"role": "user", "content": "好，只回复：ok"},
+              ],
+              "max_tokens": 128,
+              "stream": True,
+          }
+          data = json.dumps(payload).encode()
+          req = urllib.request.Request("http://127.0.0.1:%d/v1/chat/completions" % PORT,
+                                       data=data, method="POST")
+          req.add_header("Content-Type", "application/json")
+          req.add_header("Authorization", "Bearer public")
+          req.add_header("User-Agent", "zen-probe")
+          t0 = time.time()
+          try:
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  raw = r.read(200)
+                  print("%s -> %s %.1fs %r" % (TAG, r.status, time.time()-t0, raw[:140]))
+          except urllib.error.HTTPError as e:
+              raw = e.read(300)
+              print("%s -> %s %.1fs %r" % (TAG, e.code, time.time()-t0, raw[:140]))
+          except Exception as e:
+              print("%s -> ERR %s" % (TAG, e))
+          PY
+
+          run_one() {
+            local bin="$1" port="$2" tag="$3"
+            PORT="$port" \
+              LOG_FILE="$W/gw-$tag.log" \
+              SHIM_SESSION_FILE="$W/shim-$tag.json" \
+              DIRECT_DIAG=1 \
+              DIRECT_DEBUG=0 \
+              DIRECT_CONCURRENCY=16 \
+              DIRECT_FREELIMIT_COOLDOWN=0 \
+              DIRECT_FRESH_PER_TURN=0 \
+              ZEN_TLS=bun \
+              DIRECT_SIDECAR=off \
+              "$bin" >"$W/stdio-$tag.log" 2>&1 &
+            local pid=$!
+            local i
+            for i in $(seq 1 60); do
+              curl -sf -m 2 "http://127.0.0.1:$port/health" >/dev/null 2>&1 && break
+              sleep 0.5
+            done
+            echo "--- $tag health: $(curl -s -m 5 http://127.0.0.1:$port/health | head -c 200)"
+            grep -m1 'session policy' "$W/gw-$tag.log" 2>/dev/null || true
+            python3 "$W/probe.py" "$port" "$tag"
+            echo "--- $tag gateway 429 lines ---"
+            grep -E '\[REQ|free-usage' "$W/gw-$tag.log" 2>/dev/null \
+              | sed -E 's/ debug upBody.*//' | tail -6 || true
+            kill "$pid" 2>/dev/null || true
+            sleep 3
+          }
+
+          run_one "$W/zen-fresh"    18091 "FRESH"
+          sleep 2
+          run_one "$W/zen-prebuilt" 18092 "PREBUILT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: binary-ab-probe
+          path: |
+            _b/gw-*.log
+            _b/stdio-*.log

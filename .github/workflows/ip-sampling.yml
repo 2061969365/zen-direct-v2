@@ -1,0 +1,68 @@
+name: ip-sampling
+
+# 一次起 6 台 runner，每台打印自己的出口 IP 并打一发生产探针（生产二进制 + 生产 payload）。
+# 目的：判断 429 是「稳定的、与 IP 段绑定」还是「随机、看运气」。
+#   - 6 台全 200 → 生产那批 429 是时间窗问题 / 特定 IP
+#   - 混合 200/429 → 纯 IP 运气，需要代理或多次重试
+#   - 6 台全 429 → 该 runner 池整体被限
+on:
+  workflow_dispatch:
+
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: 2061969365/zen-gateway-runner
+          ref: main
+          path: gw
+
+      - name: prep
+        run: |
+          set -euo pipefail
+          chmod +x gw/bin/zen-direct
+          sha256sum gw/bin/zen-direct | cut -d' ' -f1
+          curl -s -m 15 http://ip-api.com/json \
+            | python3 -c 'import json,sys;j=json.load(sys.stdin);print("IP=",j["query"],j["countryCode"],j.get("isp",""))'
+
+      - name: probe
+        run: |
+          set -uo pipefail
+          W="$PWD/_s"; mkdir -p "$W"
+          PORT=18081 LOG_FILE="$W/gw.log" SHIM_SESSION_FILE="$W/shim.json" \
+            DIRECT_DIAG=1 DIRECT_DEBUG=0 DIRECT_CONCURRENCY=16 \
+            DIRECT_FREELIMIT_COOLDOWN=0 DIRECT_FRESH_PER_TURN=0 \
+            ZEN_TLS=bun DIRECT_SIDECAR=off \
+            gw/bin/zen-direct >"$W/stdio.log" 2>&1 &
+          GW=$!
+          for i in $(seq 1 60); do curl -sf -m 2 http://127.0.0.1:18081/health >/dev/null 2>&1 && break; sleep 0.5; done
+          echo "egress=$(curl -s -m 8 http://127.0.0.1:18081/ip)"
+          cat > "$W/p.py" <<'PY'
+          import json,sys,time,urllib.request,urllib.error
+          p={"model":"deepseek-v4.1-flash-free","messages":[
+             {"role":"system","content":"You are opencode, a coding agent. Answer concisely."},
+             {"role":"user","content":"用一句话说明你能做什么。"},
+             {"role":"assistant","content":"我可以帮你读写代码、运行命令、排查问题。"},
+             {"role":"user","content":"好，只回复：ok"}],"max_tokens":128,"stream":True}
+          r=urllib.request.Request("http://127.0.0.1:18081/v1/chat/completions",
+              data=json.dumps(p).encode(),method="POST")
+          r.add_header("Content-Type","application/json");r.add_header("Authorization","Bearer public")
+          r.add_header("User-Agent","zen-probe")
+          t0=time.time()
+          try:
+            with urllib.request.urlopen(r,timeout=90) as resp:
+              print("RESULT %s %.1fs"%(resp.status,time.time()-t0))
+          except urllib.error.HTTPError as e:
+            print("RESULT %s %s"%(e.code,e.read(160)[:120]))
+          except Exception as e:
+            print("RESULT ERR",e)
+          PY
+          python3 "$W/p.py"
+          grep -E 'free-usage' "$W/gw.log" | tail -2 || true
+          kill "$GW" 2>/dev/null || true

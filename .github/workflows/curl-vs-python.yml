@@ -1,0 +1,127 @@
+name: curl-vs-python
+
+# 唯一还没排除的变量：客户端。
+#   - 我所有 200 的测试都用 python urllib（HTTP/1.1，自带 header 集合）
+#   - 生产 run-gateway.sh 用 curl（--dump-header，header 集合不同）
+# 在同一台 runner、同一个网关进程上交替打，隔离出客户端差异：
+#   X1 curl   （= run-gateway.sh 的 probe_once 原样）
+#   X2 python （= 我之前的测试原样）
+#   X3 curl   （重复，确认不是顺序效应）
+#   X4 python （重复）
+on:
+  workflow_dispatch:
+
+jobs:
+  cmp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: 2061969365/zen-gateway-runner
+          ref: main
+          path: gw
+
+      - name: prep
+        run: |
+          set -euo pipefail
+          chmod +x gw/bin/zen-direct
+          sha256sum gw/bin/zen-direct | cut -d' ' -f1
+          curl -s -m 15 http://ip-api.com/json \
+            | python3 -c 'import json,sys;j=json.load(sys.stdin);print("IP=",j["query"],j.get("isp",""))'
+
+      - name: start gateway
+        run: |
+          set -euo pipefail
+          W="$PWD/_x"; mkdir -p "$W"
+          PORT=18081 LOG_FILE="$W/gw.log" SHIM_SESSION_FILE="$W/shim.json" \
+            DIRECT_DIAG=1 DIRECT_DEBUG=0 DIRECT_CONCURRENCY=16 \
+            DIRECT_FREELIMIT_COOLDOWN=0 DIRECT_FRESH_PER_TURN=0 \
+            ZEN_TLS=bun DIRECT_SIDECAR=off \
+            gw/bin/zen-direct >"$W/stdio.log" 2>&1 &
+          echo $! > "$W/gw.pid"
+          for i in $(seq 1 60); do
+            curl -sf -m 2 http://127.0.0.1:18081/health >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          curl -s -m 5 http://127.0.0.1:18081/health | head -c 160; echo
+          grep -m1 'session policy' "$W/gw.log" || true
+
+      - name: X1 curl (exactly like probe_once)
+        run: |
+          set -uo pipefail
+          W="$PWD/_x"
+          cat > "$W/payload.json" <<'JSON'
+          {"model":"deepseek-v4.1-flash-free","messages":[{"role":"system","content":"You are opencode, a coding agent. Answer concisely."},{"role":"user","content":"用一句话说明你能做什么。"},{"role":"assistant","content":"我可以帮你读写代码、运行命令、排查问题。"},{"role":"user","content":"好，只回复：ok"}],"max_tokens":128,"stream":true}
+          JSON
+          body="$(cat "$W/payload.json")"
+          code="$(curl -sS -o "$W/x1.json" -w '%{http_code}' --max-time 90 \
+            -H 'Content-Type: application/json' \
+            -H 'Authorization: Bearer public' \
+            -H 'User-Agent: zen-probe' \
+            --data-binary "$body" \
+            --dump-header "$W/x1.hdr" \
+            http://127.0.0.1:18081/v1/chat/completions 2>"$W/x1.err" || echo 000)"
+          echo "X1(curl)   -> $code"
+          echo "--- headers out ---"; grep -iE '^(HTTP/|content-type|user-agent)' "$W/x1.hdr" | head -5 || true
+          echo "--- body head ---"; head -c 200 "$W/x1.json"
+          echo
+          echo "--- curl verbose request headers ---"
+          curl -sS -o /dev/null --max-time 90 -v \
+            -H 'Content-Type: application/json' \
+            -H 'Authorization: Bearer public' \
+            -H 'User-Agent: zen-probe' \
+            --data-binary "$body" \
+            http://127.0.0.1:18081/v1/chat/completions 2>&1 | grep -E '^> ' | head -12
+
+      - name: X2 python
+        run: |
+          set -uo pipefail
+          W="$PWD/_x"
+          cat > "$W/p.py" <<'PY'
+          import json,time,urllib.request,urllib.error
+          p={"model":"deepseek-v4.1-flash-free","messages":[
+             {"role":"system","content":"You are opencode, a coding agent. Answer concisely."},
+             {"role":"user","content":"用一句话说明你能做什么。"},
+             {"role":"assistant","content":"我可以帮你读写代码、运行命令、排查问题。"},
+             {"role":"user","content":"好，只回复：ok"}],"max_tokens":128,"stream":True}
+          r=urllib.request.Request("http://127.0.0.1:18081/v1/chat/completions",
+              data=json.dumps(p).encode(),method="POST")
+          r.add_header("Content-Type","application/json")
+          r.add_header("Authorization","Bearer public")
+          r.add_header("User-Agent","zen-probe")
+          t0=time.time()
+          try:
+            with urllib.request.urlopen(r,timeout=90) as resp:
+              print("X2(python) ->",resp.status,"%.1fs"%(time.time()-t0))
+              print("   req headers:",dict(r.header_items()))
+          except urllib.error.HTTPError as e:
+            print("X2(python) ->",e.code,e.read(160)[:120])
+          except Exception as e:
+            print("X2(python) -> ERR",e)
+          PY
+          python3 "$W/p.py"
+
+      - name: X3/X4 repeat both
+        run: |
+          set -uo pipefail
+          W="$PWD/_x"
+          body="$(cat "$W/payload.json")"
+          code="$(curl -sS -o "$W/x3.json" -w '%{http_code}' --max-time 90 \
+            -H 'Content-Type: application/json' \
+            -H 'Authorization: Bearer public' \
+            -H 'User-Agent: zen-probe' \
+            --data-binary "$body" \
+            http://127.0.0.1:18081/v1/chat/completions 2>/dev/null || echo 000)"
+          echo "X3(curl)   -> $code"
+          python3 "$W/p.py" 2>/dev/null | sed 's/X2/X4/'
+
+          echo "=== gateway 429 lines ==="
+          grep -E 'free-usage|\[REQ' "$W/gw.log" | sed -E 's/ debug upBody.*//' | tail -14 || true
+          kill "$(cat "$W/gw.pid")" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: curl-vs-python
+          path: _x/

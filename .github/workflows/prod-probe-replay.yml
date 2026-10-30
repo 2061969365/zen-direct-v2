@@ -16,15 +16,19 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          repository: xia35480/zen
+          ref: main
+          path: prod
 
       - name: show what we are testing
         run: |
           set -euo pipefail
-          chmod +x bin/zen-direct
-          echo "TEMPLATE_VERSION: $(cat TEMPLATE_VERSION 2>/dev/null || echo '-')"
-          echo "sha256: $(sha256sum bin/zen-direct | cut -d' ' -f1)"
+          chmod +x prod/bin/zen-direct
+          echo "TEMPLATE_VERSION: $(cat prod/TEMPLATE_VERSION 2>/dev/null || echo '-')"
+          echo "sha256: $(sha256sum prod/bin/zen-direct | cut -d' ' -f1)"
           echo "--- 起手段是不是新脚本 ---"
-          grep -n 'boot probe (local)' scripts/run-gateway.sh || echo "(old script)"
+          grep -n 'boot probe (local)' prod/scripts/run-gateway.sh || echo "(old script)"
 
       - name: egress IP
         run: curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; j=json.load(sys.stdin); print("IP=",j["query"],j["city"])'
@@ -43,7 +47,7 @@ jobs:
             DIRECT_FRESH_PER_TURN=0 \
             ZEN_TLS=bun \
             DIRECT_SIDECAR=off \
-            bin/zen-direct >"$W/stdio.log" 2>&1 &
+            prod/bin/zen-direct >"$W/stdio.log" 2>&1 &
           GW=$!
           for i in $(seq 1 60); do
             curl -sf -m 2 http://127.0.0.1:18081/health >/dev/null 2>&1 && break

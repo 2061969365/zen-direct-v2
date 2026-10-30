@@ -1,0 +1,130 @@
+name: tunnel-isolation
+
+# 在同一个 runner、同一个出口 IP 上，只切换一个变量：cloudflared 隧道开 / 关。
+#   A 无隧道 → 打探针
+#   B 起 cloudflared 隧道（不传 token，临时隧道）→ 打同一个探针
+#   C 杀掉隧道 → 再打一次
+# 若 A=200 且 B=429，就证明是隧道进程把出口搞坏了（而不是 IP 本身/请求形状）。
+on:
+  workflow_dispatch:
+
+jobs:
+  isolate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: 2061969365/zen-gateway-runner
+          ref: main
+          path: gw
+
+      - name: prep
+        run: |
+          set -euo pipefail
+          chmod +x gw/bin/zen-direct
+          curl -fsSL --retry 3 -o gw/bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x gw/bin/cloudflared
+          echo "TEMPLATE_VERSION: $(cat gw/TEMPLATE_VERSION)"
+          sha256sum gw/bin/zen-direct
+          curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys;j=json.load(sys.stdin);print("IP0=",j["query"])'
+
+      - name: A probe without tunnel
+        run: |
+          set -uo pipefail
+          W="$PWD/_i"; mkdir -p "$W"
+          PORT=18081 LOG_FILE="$W/a.log" SHIM_SESSION_FILE="$W/a.json" \
+            DIRECT_DIAG=1 DIRECT_DEBUG=0 DIRECT_CONCURRENCY=16 \
+            DIRECT_FREELIMIT_COOLDOWN=0 DIRECT_FRESH_PER_TURN=0 \
+            ZEN_TLS=bun DIRECT_SIDECAR=off \
+            gw/bin/zen-direct >"$W/a.err" 2>&1 &
+          echo $! > "$W/gw.pid"
+          for i in $(seq 1 60); do curl -sf -m 2 http://127.0.0.1:18081/health >/dev/null 2>&1 && break; sleep 0.5; done
+          echo "--- A: egress=$(curl -s -m 8 http://127.0.0.1:18081/ip)"
+          python3 - <<'PY'
+          import json,time,urllib.request,urllib.error
+          p={"model":"deepseek-v4.1-flash-free","messages":[
+             {"role":"system","content":"You are opencode, a coding agent. Answer concisely."},
+             {"role":"user","content":"用一句话说明你能做什么。"},
+             {"role":"assistant","content":"我可以帮你读写代码、运行命令、排查问题。"},
+             {"role":"user","content":"好，只回复：ok"}],"max_tokens":128,"stream":True}
+          r=urllib.request.Request("http://127.0.0.1:18081/v1/chat/completions",
+              data=json.dumps(p).encode(),method="POST")
+          r.add_header("Content-Type","application/json");r.add_header("Authorization","Bearer public")
+          r.add_header("User-Agent","zen-probe")
+          t0=time.time()
+          try:
+            with urllib.request.urlopen(r,timeout=90) as resp: print("A(no tunnel)  ->",resp.status,"%.1fs"%(time.time()-t0),resp.read(100)[:80])
+          except urllib.error.HTTPError as e: print("A(no tunnel)  ->",e.code,e.read(200)[:160])
+          except Exception as e: print("A(no tunnel)  -> ERR",e)
+          PY
+
+      - name: B probe with cloudflared running
+        run: |
+          set -uo pipefail
+          W="$PWD/_i"
+          gw/bin/cloudflared tunnel --url http://127.0.0.1:18081 --no-autoupdate >"$W/cf.log" 2>&1 &
+          echo $! > "$W/cf.pid"
+          for i in $(seq 1 60); do grep -qoE 'https://[a-z0-9-]+\.trycloudflare\.com' "$W/cf.log" && break; sleep 2; done
+          URL="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$W/cf.log" | head -1)"
+          echo "tunnel url=$URL"
+          python3 - "$URL" <<'PY'
+          import json,sys,time,urllib.request,urllib.error
+          url=sys.argv[1] or "http://127.0.0.1:18081"
+          for tag,base in (("B(local,cf up)","http://127.0.0.1:18081"),("B(tunnel)","http://127.0.0.1:18081")):
+            pass
+          p={"model":"deepseek-v4.1-flash-free","messages":[
+             {"role":"system","content":"You are opencode, a coding agent. Answer concisely."},
+             {"role":"user","content":"用一句话说明你能做什么。"},
+             {"role":"assistant","content":"我可以帮你读写代码、运行命令、排查问题。"},
+             {"role":"user","content":"好，只回复：ok"}],"max_tokens":128,"stream":True}
+          def go(tag,u):
+            r=urllib.request.Request(u,data=json.dumps(p).encode(),method="POST")
+            r.add_header("Content-Type","application/json");r.add_header("Authorization","Bearer public")
+            r.add_header("User-Agent","zen-probe")
+            t0=time.time()
+            try:
+              with urllib.request.urlopen(r,timeout=90) as resp: print(tag,"->",resp.status,"%.1fs"%(time.time()-t0),resp.read(100)[:80])
+            except urllib.error.HTTPError as e: print(tag,"->",e.code,e.read(200)[:160])
+            except Exception as e: print(tag,"-> ERR",type(e).__name__,e)
+          go("B1(local,cf up) ","http://127.0.0.1:18081/v1/chat/completions")
+          time.sleep(2)
+          go("B2(via tunnel)  ","%s/v1/chat/completions" % url)
+          PY
+          echo "--- B: egress=$(curl -s -m 8 http://127.0.0.1:18081/ip)"
+
+      - name: C probe after killing tunnel
+        run: |
+          set -uo pipefail
+          W="$PWD/_i"
+          kill "$(cat "$W/cf.pid")" 2>/dev/null || true
+          sleep 5
+          python3 - <<'PY'
+          import json,time,urllib.request,urllib.error
+          p={"model":"deepseek-v4.1-flash-free","messages":[
+             {"role":"system","content":"You are opencode, a coding agent. Answer concisely."},
+             {"role":"user","content":"用一句话说明你能做什么。"},
+             {"role":"assistant","content":"我可以帮你读写代码、运行命令、排查问题。"},
+             {"role":"user","content":"好，只回复：ok"}],"max_tokens":128,"stream":True}
+          r=urllib.request.Request("http://127.0.0.1:18081/v1/chat/completions",
+              data=json.dumps(p).encode(),method="POST")
+          r.add_header("Content-Type","application/json");r.add_header("Authorization","Bearer public")
+          r.add_header("User-Agent","zen-probe")
+          t0=time.time()
+          try:
+            with urllib.request.urlopen(r,timeout=90) as resp: print("C(tunnel off) ->",resp.status,"%.1fs"%(time.time()-t0),resp.read(100)[:80])
+          except urllib.error.HTTPError as e: print("C(tunnel off) ->",e.code,e.read(200)[:160])
+          except Exception as e: print("C(tunnel off) -> ERR",e)
+          PY
+          echo "=== gateway 429 lines ==="
+          grep -E 'free-usage|\[REQ' "$W/a.log" | sed -E 's/ debug upBody.*//' | tail -12 || true
+          echo "=== cloudflared tail ==="
+          tail -15 "$W/cf.log" 2>/dev/null || true
+          kill "$(cat "$W/gw.pid")" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tunnel-isolation
+          path: _i/

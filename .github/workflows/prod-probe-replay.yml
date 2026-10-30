@@ -1,0 +1,97 @@
+name: prod-probe-replay
+
+# 把 CI 里已经证明「能拿到 200」的那套探测，原样放到生产仓库里跑。
+# 不启动隧道、不连 Cloudflare，只验证：换一台 runner（新出口 IP）之后，
+# 同一份 bin/zen-direct + 同一个 payload 到底还 429 不 429。
+#
+# 判定：
+#   P1 200 → 这个 IP 可用，生产起不来是「那批 IP 恰好被限」或隧道侧问题
+#   P1 429 → 与 IP 有关；再看 gw.log 里 ses 是否为空来判断是不是形状问题
+on:
+  workflow_dispatch:
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: show what we are testing
+        run: |
+          set -euo pipefail
+          chmod +x bin/zen-direct
+          echo "TEMPLATE_VERSION: $(cat TEMPLATE_VERSION 2>/dev/null || echo '-')"
+          echo "sha256: $(sha256sum bin/zen-direct | cut -d' ' -f1)"
+          echo "--- 起手段是不是新脚本 ---"
+          grep -n 'boot probe (local)' scripts/run-gateway.sh || echo "(old script)"
+
+      - name: egress IP
+        run: curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; j=json.load(sys.stdin); print("IP=",j["query"],j["city"])'
+
+      - name: run gateway and replay production probe
+        run: |
+          set -uo pipefail
+          W="$PWD/_r"; mkdir -p "$W"
+          PORT=18081 \
+            LOG_FILE="$W/gw.log" \
+            SHIM_SESSION_FILE="$W/shim.json" \
+            DIRECT_DIAG=1 \
+            DIRECT_DEBUG=0 \
+            DIRECT_CONCURRENCY=16 \
+            DIRECT_FREELIMIT_COOLDOWN=0 \
+            DIRECT_FRESH_PER_TURN=0 \
+            ZEN_TLS=bun \
+            DIRECT_SIDECAR=off \
+            bin/zen-direct >"$W/stdio.log" 2>&1 &
+          GW=$!
+          for i in $(seq 1 60); do
+            curl -sf -m 2 http://127.0.0.1:18081/health >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          echo "health: $(curl -s -m 5 http://127.0.0.1:18081/health | head -c 220)"
+          grep -m1 'session policy' "$W/gw.log" || true
+
+          cat > "$W/p.py" <<'PY'
+          import json, sys, time, urllib.request, urllib.error
+          PORT = int(sys.argv[1]); TAG = sys.argv[2]
+          payload = {
+              "model": "deepseek-v4.1-flash-free",
+              "messages": [
+                  {"role": "system", "content": "You are opencode, a coding agent. Answer concisely."},
+                  {"role": "user", "content": "用一句话说明你能做什么。"},
+                  {"role": "assistant", "content": "我可以帮你读写代码、运行命令、排查问题。"},
+                  {"role": "user", "content": "好，只回复：ok"},
+              ],
+              "max_tokens": 128,
+              "stream": True,
+          }
+          req = urllib.request.Request("http://127.0.0.1:%d/v1/chat/completions" % PORT,
+                                       data=json.dumps(payload).encode(), method="POST")
+          req.add_header("Content-Type", "application/json")
+          req.add_header("Authorization", "Bearer public")
+          req.add_header("User-Agent", "zen-probe")
+          t0 = time.time()
+          try:
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  print("%s -> %s %.1fs %r" % (TAG, r.status, time.time()-t0, r.read(150)))
+          except urllib.error.HTTPError as e:
+              print("%s -> %s %.1fs %r" % (TAG, e.code, time.time()-t0, e.read(250)))
+          except Exception as e:
+              print("%s -> ERR %s" % (TAG, e))
+          PY
+
+          for n in 1 2 3; do
+            python3 "$W/p.py" 18081 "P$n"
+            sleep 3
+          done
+
+          echo "=== gateway 429 / session 行 ==="
+          grep -E '\[REQ|free-usage' "$W/gw.log" | sed -E 's/ debug upBody.*//' | tail -12 || true
+          kill "$GW" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prod-probe-replay
+          path: _r/

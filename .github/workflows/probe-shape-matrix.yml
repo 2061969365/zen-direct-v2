@@ -1,0 +1,114 @@
+name: probe-shape-matrix
+
+# 同一台 runner、同一个出口 IP、同一个网关进程，按 6 种请求形状顺序打一遍，
+# 隔离出「到底是哪个字段让起手探针 429」：
+#   S1 单轮 system+user,        stream=false   （gate-probe 已证明 200，作基线）
+#   S2 单轮 system+user,        stream=true
+#   S3 四段历史 system+u+a+u,   stream=false
+#   S4 四段历史 + max_tokens,   stream=true    （= 生产 run-gateway.sh 现在的探针）
+#   S5 四段历史 + max_tokens,   stream=false
+#   S6 单轮 + max_tokens,       stream=true
+# 每次用不同的首条 user 内容，确保落到不同 fp，互不干扰。
+on:
+  workflow_dispatch:
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: egress IP
+        run: curl -s -m 15 http://ip-api.com/json | python3 -c 'import json,sys; j=json.load(sys.stdin); print("IP=",j["query"],j["city"])'
+      - name: build and run gateway
+        run: |
+          set -u
+          W="$PWD/_m"; mkdir -p "$W"
+          go build -trimpath -o "$W/zen" .
+          PORT=18081 \
+            LOG_FILE="$W/gw.log" \
+            SHIM_SESSION_FILE="$W/shim.json" \
+            DIRECT_DIAG=1 \
+            DIRECT_DEBUG=0 \
+            DIRECT_CONCURRENCY=16 \
+            DIRECT_FREELIMIT_COOLDOWN=0 \
+            DIRECT_FRESH_PER_TURN=0 \
+            ZEN_TLS=bun \
+            DIRECT_SIDECAR=off \
+            "$W/zen" >"$W/gw.err" 2>&1 &
+          echo $! > "$W/pid"
+          for i in $(seq 1 60); do
+            curl -sf -m 2 http://127.0.0.1:18081/health >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          curl -s -m 5 http://127.0.0.1:18081/health; echo
+          echo "--- session policy ---"
+          grep -m1 'session policy' "$W/gw.log" || true
+      - name: probe 6 shapes on one IP
+        run: |
+          set -u
+          W="$PWD/_m"
+          cat > "$W/shapes.py" <<'PY'
+          import json, time, urllib.request, urllib.error
+
+          MODEL = "deepseek-v4.1-flash-free"
+          URL = "http://127.0.0.1:18081/v1/chat/completions"
+          SYS = "You are opencode, a coding agent. Answer concisely."
+
+          def sys_u(tag):
+              return [{"role": "system", "content": SYS},
+                      {"role": "user", "content": "shape probe %s" % tag}]
+
+          def sys_hist(tag):
+              return [{"role": "system", "content": SYS},
+                      {"role": "user", "content": "shape probe %s: 用一句话说明你能做什么。" % tag},
+                      {"role": "assistant", "content": "我可以帮你读写代码、运行命令、排查问题。"},
+                      {"role": "user", "content": "好，只回复：ok"}]
+
+          SHAPES = [
+              ("S1 single stream=false", sys_u,  False, False),
+              ("S2 single stream=true",  sys_u,  True,  False),
+              ("S3 hist   stream=false", sys_hist, False, False),
+              ("S4 hist   stream=true+mt", sys_hist, True, True),
+              ("S5 hist   stream=false+mt", sys_hist, False, True),
+              ("S6 single stream=true+mt", sys_u,  True,  True),
+          ]
+
+          for tag, mk, stream, mt in SHAPES:
+              body = {"model": MODEL, "messages": mk(tag.replace(" ", "")), "stream": stream}
+              if mt:
+                  body["max_tokens"] = 128
+              data = json.dumps(body).encode()
+              req = urllib.request.Request(URL, data=data, method="POST")
+              req.add_header("Content-Type", "application/json")
+              req.add_header("Authorization", "Bearer public")
+              req.add_header("User-Agent", "zen-probe")
+              t0 = time.time()
+              try:
+                  with urllib.request.urlopen(req, timeout=120) as r:
+                      raw = r.read(400)
+                      print("%-28s -> %s %.1fs %r" % (tag, r.status, time.time()-t0, raw[:160]))
+              except urllib.error.HTTPError as e:
+                  raw = e.read(300)
+                  print("%-28s -> %s %.1fs %r" % (tag, e.code, time.time()-t0, raw[:160]))
+              except Exception as e:
+                  print("%-28s -> ERR %s" % (tag, e))
+              time.sleep(2)
+          PY
+          python3 "$W/shapes.py"
+      - name: gateway log tail
+        if: always()
+        run: |
+          W="$PWD/_m"
+          echo "--- REQ / 429 lines ---"
+          grep -E '\[REQ|free-usage|session policy' "$W/gw.log" 2>/dev/null \
+            | sed -E 's/ debug upBody.*//' | tail -30 || true
+          kill "$(cat "$W/pid" 2>/dev/null)" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-shape-matrix
+          path: _m

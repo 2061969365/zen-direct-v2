@@ -181,6 +181,80 @@ const additionalPropertiesKey = "additionalProperties"
 // channelModeOn 报告是否启用了工具通道模式。
 func channelModeOn() bool { return os.Getenv("ZEN_TOOL_CHANNEL") != "" }
 
+// wrapChannelArgs 把真实工具调用的参数包装成通道形态：
+// {"path":"a.txt"} -> {"path":"a.txt","_tool":"read","_args":{"path":"a.txt"}}
+// 保留顶层参数是为了兼容通道描述里"参数可放顶层"的约定，_args 则是权威来源。
+func wrapChannelArgs(realTool, arguments string) string {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(arguments), &m); err != nil {
+		return arguments
+	}
+	wrapped := map[string]any{
+		channelSelector: realTool,
+		channelArgs:     m,
+	}
+	for k, v := range m {
+		wrapped[k] = v
+	}
+	b, err := json.Marshal(wrapped)
+	if err != nil {
+		return arguments
+	}
+	return string(b)
+}
+
+// rewriteChannelHistory 把历史消息里真实工具名映射回通道名，并把参数重新包装。
+// 上游要求历史 tool_calls.name 与 tools 定义里的官方通道名一致，否则 429。
+func rewriteChannelHistory(payload map[string]any, protocol Format) {
+	for _, rawChoice := range asArr(payload["choices"]) {
+		_ = rawChoice
+	}
+	messages := asArr(payload["messages"])
+	for _, rawMessage := range messages {
+		message, ok := rawMessage.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, rawCall := range asArr(message["tool_calls"]) {
+			call, ok := rawCall.(map[string]any)
+			if !ok {
+				continue
+			}
+			fn, ok := call["function"].(map[string]any)
+			if !ok {
+				continue
+			}
+			name := asStr(fn["name"])
+			if name == "" {
+				continue
+			}
+			channel := channelForTool(name)
+			fn["name"] = channel
+			if args := asStr(fn["arguments"]); args != "" {
+				fn["arguments"] = wrapChannelArgs(name, args)
+			}
+		}
+	}
+	// responses 扁平形态
+	for _, rawItem := range asArr(payload["input"]) {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := asStr(item["name"])
+		if name == "" {
+			continue
+		}
+		if channelForTool(name) == "" {
+			continue
+		}
+		item["name"] = channelForTool(name)
+		if args := asStr(item["arguments"]); args != "" {
+			item["arguments"] = wrapChannelArgs(name, args)
+		}
+	}
+}
+
 // restoreChannelCalls 把响应里的通道工具调用还原成真实客户端工具调用：
 // 从 arguments 的 _tool 取真实工具名，把 _args 展开为顶层参数。
 // 支持 chat（choices[].message/delta.tool_calls）与 responses（output[]）。

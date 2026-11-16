@@ -814,6 +814,9 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	// 区分真实工具。出站只出现官方工具名，专为"只放行官方名"的上游设计。
 	if os.Getenv("ZEN_TOOL_CHANNEL") != "" && len(ranked) > 0 && !allOfficialToolNames(ranked, protocol) {
 		payload["tools"] = buildChannelTools(protocol, items)
+		// 历史消息里的工具调用名也要改回通道名，并重新包装参数，
+		// 否则上游看到历史 tool_calls.name 为客户端原名会 429。
+		rewriteChannelHistory(payload, protocol)
 		return renames, true
 	}
 

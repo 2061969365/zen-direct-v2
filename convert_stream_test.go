@@ -2,6 +2,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"net/http/httptest"
 	"strings"
@@ -324,3 +325,98 @@ func TestP2bNonStreamToolFallbackIDs(t *testing.T) {
 		t.Errorf("messages->responses 空 id 未 fallback: %s", canon(out6))
 	}
 }
+
+// 多个并行工具调用时，每个 item 的 added / delta / done 必须报同一个
+// output_index，否则客户端按 index 关联会串到别的工具上。
+//
+// 2026-11-16 实测回归：done 事件曾硬编码 output_index:0，两个工具调用时
+// added 分别是 1/2，done 全是 0，客户端无法把结果对应回工具。
+func TestChatToResponsesMultiToolOutputIndex(t *testing.T) {
+	up := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"pwsh\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n"
+	rec := httptest.NewRecorder()
+	streamChatToResponses(rec, strings.NewReader(up), "mimo-v2.5-free")
+
+	// 每个 call_id 收集它在 added / arguments.delta / arguments.done /
+	// output_item.done 里出现过的 output_index，必须唯一。
+	seen := map[string]map[int]bool{}
+	collect := func(callID string, index int) {
+		if callID == "" {
+			return
+		}
+		if seen[callID] == nil {
+			seen[callID] = map[int]bool{}
+		}
+		seen[callID][index] = true
+	}
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err != nil {
+			continue
+		}
+		index := int(toFloat(ev["output_index"]))
+		if item, ok := ev["item"].(map[string]any); ok {
+			collect(asStr(item["call_id"]), index)
+		}
+		// function_call_arguments.* 只带 item_id（"fc_<call_id>"）。
+		if id := asStr(ev["item_id"]); strings.HasPrefix(id, "fc_") {
+			collect(strings.TrimPrefix(id, "fc_"), index)
+		}
+	}
+	for _, callID := range []string{"call_a", "call_b"} {
+		indices := seen[callID]
+		if len(indices) == 0 {
+			t.Errorf("%s 没有任何带 index 的事件", callID)
+			continue
+		}
+		if len(indices) != 1 {
+			t.Errorf("%s 的 output_index 不唯一：%v（客户端会串到别的工具）", callID, indices)
+		}
+	}
+	// 两个工具必须占不同位置。
+	if len(seen["call_a"]) == 1 && len(seen["call_b"]) == 1 {
+		var a, b int
+		for v := range seen["call_a"] {
+			a = v
+		}
+		for v := range seen["call_b"] {
+			b = v
+		}
+		if a == b {
+			t.Errorf("两个工具占了同一个 output_index=%d", a)
+		}
+	}
+}
+
+// reasoning 的 output_index 必须稳定：它不能随工具数量变化。
+func TestChatToResponsesReasoningIndexStable(t *testing.T) {
+	up := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"a\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"b\"}}]}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n"
+	rec := httptest.NewRecorder()
+	streamChatToResponses(rec, strings.NewReader(up), "mimo-v2.5-free")
+	indices := map[int]bool{}
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err != nil {
+			continue
+		}
+		if asStr(ev["type"]) != "response.reasoning_summary_text.delta" {
+			continue
+		}
+		indices[int(toFloat(ev["output_index"]))] = true
+	}
+	if len(indices) != 1 {
+		t.Errorf("reasoning 的 output_index 不唯一：%v（工具到达前后应保持一致）", indices)
+	}
+}
+
+

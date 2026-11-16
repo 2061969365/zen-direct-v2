@@ -418,6 +418,10 @@ type crtTool struct {
 	name   string
 	args   strings.Builder
 	added  bool
+	// outputIndex 是这个 item 在 response.output 里的固定位置。added / delta /
+	// done 三个事件必须报同一个值，否则客户端按 output_index 关联时会串到别的
+	// 工具上——多工具并行调用时尤其明显（此前 done 事件硬编码 0）。
+	outputIndex int
 }
 
 func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
@@ -531,15 +535,20 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 					"item_id": "msg_0", "output_index": 0, "delta": t})
 			}
 			if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
+				// reasoning 占 output 的固定位置 1（message 在 0，工具从 2 起）。
+				// 不能用 len(order)+1：工具是逐个到达的，那会让同一段思考的
+				// delta 在不同时刻报不同的 index。
 				sink.emit(map[string]any{"type": "response.reasoning_summary_text.delta",
-					"item_id": "rs_0", "output_index": len(order) + 1, "delta": rc})
+					"item_id": "rs_0", "output_index": 1, "delta": rc})
 			}
 			for _, tc := range asArr(delta["tool_calls"]) {
 				tm := asMap(tc)
 				idx := int(toFloat(tm["index"]))
 				t, ok := tools[idx]
 				if !ok {
-					t = &crtTool{}
+					// 新工具：占下一个 output 位置（message=0，reasoning=1，
+					// 工具从 2 起），之后 added/delta/done 都用它。
+					t = &crtTool{outputIndex: len(order) + 2}
 					tools[idx] = t
 					order = append(order, idx)
 				}
@@ -555,7 +564,7 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 					if !t.added && t.callID != "" && t.name != "" {
 						t.added = true
 						sink.emit(map[string]any{"type": "response.output_item.added",
-							"output_index": len(order), "item": map[string]any{
+							"output_index": t.outputIndex, "item": map[string]any{
 								"type": "function_call", "id": "fc_" + t.callID,
 								"call_id": t.callID, "name": t.name, "arguments": "",
 							}})
@@ -563,7 +572,7 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 					if t.added {
 						if a := asStr(fn["arguments"]); a != "" {
 							sink.emit(map[string]any{"type": "response.function_call_arguments.delta",
-								"item_id": "fc_" + t.callID, "output_index": len(order), "delta": a})
+								"item_id": "fc_" + t.callID, "output_index": t.outputIndex, "delta": a})
 						}
 					}
 				}
@@ -574,9 +583,9 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 					t := tools[idx]
 					if t.added {
 						sink.emit(map[string]any{"type": "response.function_call_arguments.done",
-							"item_id": "fc_" + t.callID, "output_index": 0, "arguments": t.args.String()})
+							"item_id": "fc_" + t.callID, "output_index": t.outputIndex, "arguments": t.args.String()})
 						sink.emit(map[string]any{"type": "response.output_item.done",
-							"output_index": 0, "item": map[string]any{
+							"output_index": t.outputIndex, "item": map[string]any{
 								"type": "function_call", "id": "fc_" + t.callID,
 								"call_id": t.callID, "name": t.name, "arguments": t.args.String()}})
 					}

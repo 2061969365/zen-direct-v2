@@ -166,3 +166,70 @@ func TestEnsureMessagesDefaults(t *testing.T) {
 		t.Errorf("disabled 不应加 budget")
 	}
 }
+
+// responses 入口把一轮回复拆成 reasoning item + function_call item，转成 chat
+// 时必须合并到同一条 assistant 消息。
+//
+// 2026-11-16 实测回归：两者曾各生成一条 assistant，出现连续两条 assistant 消息。
+// OpenAI 语义里一轮回复只有一条，上游可能 400 或忽略后者。
+func TestResponsesToChatMergesReasoningWithToolCalls(t *testing.T) {
+	in := map[string]any{
+		"model": "m",
+		"input": []any{
+			map[string]any{"role": "user", "content": "do it"},
+			map[string]any{"type": "reasoning", "id": "rs_1",
+				"summary": []any{map[string]any{"type": "summary_text", "text": "let me think"}}},
+			map[string]any{"type": "function_call", "call_id": "c1", "name": "read",
+				"arguments": `{"path":"a.txt"}`},
+			map[string]any{"type": "function_call_output", "call_id": "c1", "output": "body"},
+			map[string]any{"role": "user", "content": "summarize"},
+		},
+		"tools": []any{map[string]any{"type": "function", "name": "read",
+			"description": "Read a file.", "parameters": map[string]any{"type": "object"}}},
+	}
+	up, _, err := buildUpstream(FmtResponses, FmtChat, in)
+	if err != nil {
+		t.Fatalf("buildUpstream: %v", err)
+	}
+	msgs := asArr(up["messages"])
+	// 不允许出现连续两条 assistant 消息。
+	for i := 1; i < len(msgs); i++ {
+		if asStr(asMap(msgs[i])["role"]) == "assistant" && asStr(asMap(msgs[i-1])["role"]) == "assistant" {
+			t.Errorf("第 %d、%d 条都是 assistant 消息，应合并", i-1, i)
+		}
+	}
+	// reasoning 必须与 tool_calls 在同一条上。
+	merged := false
+	for _, m := range msgs {
+		mm := asMap(m)
+		if asStr(mm["reasoning_content"]) == "let me think" && len(asArr(mm["tool_calls"])) == 1 {
+			merged = true
+		}
+	}
+	if !merged {
+		t.Errorf("reasoning 未与 tool_calls 合并到同一条 assistant 消息")
+	}
+}
+
+// reasoning 紧跟在 assistant 文本消息之后时，也应并进那一条而不是另起。
+func TestResponsesToChatReasoningAfterAssistantText(t *testing.T) {
+	in := map[string]any{
+		"model": "m",
+		"input": []any{
+			map[string]any{"role": "user", "content": "hi"},
+			map[string]any{"role": "assistant", "content": "hello"},
+			map[string]any{"type": "reasoning",
+				"summary": []any{map[string]any{"type": "summary_text", "text": "thinking"}}},
+		},
+	}
+	up, _, err := buildUpstream(FmtResponses, FmtChat, in)
+	if err != nil {
+		t.Fatalf("buildUpstream: %v", err)
+	}
+	msgs := asArr(up["messages"])
+	for i := 1; i < len(msgs); i++ {
+		if asStr(asMap(msgs[i])["role"]) == "assistant" && asStr(asMap(msgs[i-1])["role"]) == "assistant" {
+			t.Errorf("第 %d、%d 条都是 assistant 消息，应合并", i-1, i)
+		}
+	}
+}

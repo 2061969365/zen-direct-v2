@@ -408,13 +408,29 @@ func responsesToChatReq(in map[string]any) map[string]any {
 					id = getStr(item, "id")
 				}
 				args := canonicalArguments(asStr(item["arguments"]))
-				messages = append(messages, map[string]any{
+				call := map[string]any{
 					"role": "assistant", "content": nil,
 					"tool_calls": []any{map[string]any{
 						"id": id, "type": "function",
 						"function": map[string]any{"name": getStr(item, "name"), "arguments": args},
 					}},
-				})
+				}
+				// 上一条若是纯 reasoning 的 assistant 消息，把工具调用并进去。
+				//
+				// 上游 responses 把一轮回复拆成 reasoning item + function_call
+				// item，逐条转成独立消息就会出现两条连续 assistant，上游可能
+				// 400 或忽略后者。OpenAI 语义里一轮只有一条 assistant 消息。
+				if n := len(messages); n > 0 {
+					if last, ok := messages[n-1].(map[string]any); ok &&
+						asStr(last["role"]) == "assistant" &&
+						len(asArr(last["tool_calls"])) == 0 &&
+						last["content"] == nil &&
+						asStr(last["reasoning_content"]) != "" {
+						last["tool_calls"] = call["tool_calls"]
+						continue
+					}
+				}
+				messages = append(messages, call)
 			case "function_call_output":
 				var output any = ""
 				if s, ok := item["output"].(string); ok {
@@ -432,11 +448,28 @@ func responsesToChatReq(in map[string]any) map[string]any {
 						sb.WriteString(asStr(asMap(s)["text"]))
 					}
 				}
-				if sb.Len() > 0 {
-					messages = append(messages, map[string]any{
-						"role": "assistant", "content": nil, "reasoning_content": sb.String(),
-					})
+				if sb.Len() == 0 {
+					break
 				}
+				// 并入紧邻的 assistant 消息，而不是另起一条。
+				//
+				// OpenAI 语义里一轮 assistant 回复只有一条消息，reasoning 与
+				// tool_calls 属于同一条。上游 responses 会把它们拆成两个 item
+				//（reasoning item + function_call item），逐条转成独立 assistant
+				// 消息就会出现两条连续的 assistant，上游可能 400 或忽略后者。
+				if n := len(messages); n > 0 {
+					if last, ok := messages[n-1].(map[string]any); ok && asStr(last["role"]) == "assistant" {
+						if existing := asStr(last["reasoning_content"]); existing != "" {
+							last["reasoning_content"] = existing + sb.String()
+						} else {
+							last["reasoning_content"] = sb.String()
+						}
+						break
+					}
+				}
+				messages = append(messages, map[string]any{
+					"role": "assistant", "content": nil, "reasoning_content": sb.String(),
+				})
 			default:
 				role := asStr(item["role"])
 				if role == "" {

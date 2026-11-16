@@ -253,3 +253,72 @@ func TestRewriteChannelToolChoiceFlat(t *testing.T) {
 		t.Fatalf("扁平 tool_choice 未映射: %v", tc["name"])
 	}
 }
+
+// TestClassifyToolByName 未登记新工具按语义归类，不再全部落 execute。
+func TestClassifyToolByName(t *testing.T) {
+	cases := map[string]string{
+		"search_docs":       "websearch",
+		"web_search_v2":     "websearch",
+		"http_fetch":        "webfetch",
+		"run_command":       "shell",
+		"bash_exec":         "shell",
+		"file_create":       "write",
+		"doc_update":        "edit",
+		"cache_purge":       "execute",
+		"spawn_worker":      "subagent",
+		"send_notification": "subagent",
+		"ask_clarification": "question",
+		"load_skill":        "skill",
+		"list_files":        "glob",
+		"read_config":       "read",
+		"render_image":      "read",
+		"mystery_tool":      "execute",
+	}
+	for name, want := range cases {
+		if got := classifyToolByName(name); got != want {
+			t.Errorf("classify(%q)=%q want %q", name, got, want)
+		}
+	}
+	// 已登记的映射不受分类器影响
+	for client, want := range toolChannelMap {
+		if got := channelForTool(client); got != want {
+			t.Errorf("已登记 %q 应直查映射: got %q want %q", client, got, want)
+		}
+	}
+}
+
+// TestChannelToolEnum _tool 字段必须带 enum（成员全集），给模型硬约束。
+func TestChannelToolEnum(t *testing.T) {
+	in := []any{
+		chatTool("web_search", "Search the web."),
+		chatTool("anysearch_search", "Batch search."),
+	}
+	tools := buildChannelTools(FmtChat, in)
+	var found bool
+	for _, raw := range tools {
+		fn := asMap(asMap(raw)["function"])
+		props := asMap(asMap(fn["parameters"])["properties"])
+		sel := asMap(props[channelSelector])
+		if enum, ok := sel["enum"].([]any); ok && len(enum) == 2 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("_tool 缺 enum 或成员数不对")
+	}
+}
+
+// TestChannelDescriptionCap 成员描述超长时被截断，通道描述有界。
+func TestChannelDescriptionCap(t *testing.T) {
+	long := strings.Repeat("x", 5000)
+	in := []any{chatTool("mystery_tool", long)}
+	tools := buildChannelTools(FmtChat, in)
+	fn := asMap(asMap(tools[0])["function"])
+	desc := asStr(fn["description"])
+	if len(desc) > 4096 {
+		t.Fatalf("描述未截断: %d", len(desc))
+	}
+	if !strings.Contains(desc, "…") {
+		t.Fatal("截断缺省略号")
+	}
+}

@@ -102,12 +102,12 @@ func TestApplyChannelArgsEchoedChannelPrefersDeclaredTool(t *testing.T) {
 func TestApplyChannelArgsMalformedArguments(t *testing.T) {
 	declared := func(string) bool { return false }
 	cases := []struct{ args, wantName, wantArgs string }{
-		{"not json", "shell", "not json"},        // 非法 JSON：原样
-		{"", "shell", ""},                        // 空串：原样
-		{"42", "shell", "42"},                    // 纯数字：原样
-		{"[1,2]", "shell", "[1,2]"},              // JSON 数组：原样
-		{"null", "pwsh", "null"},                 // null 可解析为 nil map：无选择器，走通道默认，参数原样
-		{"\"str\"", "shell", "\"str\""},          // JSON 字符串：原样
+		{"not json", "shell", "not json"}, // 非法 JSON：原样
+		{"", "shell", ""},                 // 空串：原样
+		{"42", "shell", "42"},             // 纯数字：原样
+		{"[1,2]", "shell", "[1,2]"},       // JSON 数组：原样
+		{"null", "pwsh", "null"},          // null 可解析为 nil map：无选择器，走通道默认，参数原样
+		{"\"str\"", "shell", "\"str\""},   // JSON 字符串：原样
 	}
 	for _, c := range cases {
 		name, args := applyChannelArgs("shell", c.args, declared)
@@ -247,8 +247,9 @@ func TestChannelDescriptionHostileMemberDescription(t *testing.T) {
 	if back["description"] != desc {
 		t.Fatal("描述 JSON 往返不一致")
 	}
-	if !strings.Contains(desc, strings.Repeat("x", 1024)) {
-		t.Fatal("超长描述被截断")
+	// 2026-11-17 起：成员描述有意截断到 channelMemberDescCap，保持通道描述有界。
+	if len(desc) > 4096 {
+		t.Fatalf("通道描述异常膨胀: %d", len(desc))
 	}
 }
 

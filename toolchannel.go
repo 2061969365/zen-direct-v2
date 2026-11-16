@@ -67,12 +67,60 @@ var toolChannelMap = map[string]string{
 }
 
 // channelForTool 返回客户端工具对应的官方通道名。
+// 未登记的新工具不再全部落入 execute，而是按名字语义归类；
+// 归不出的才进 execute 兜底。
 func channelForTool(client string) string {
 	if ch, ok := toolChannelMap[client]; ok {
 		return ch
 	}
-	// 未知工具统一走 execute 通道，保证任何工具都能发出去。
-	return "execute"
+	return classifyToolByName(client)
+}
+
+// classifyToolByName 关键词语义分类：让未来新增的、未登记进
+// toolChannelMap 的工具自动落到语义最接近的通道，保持 _tool 选择器
+// 的区分度。顺序即优先级（先具体后宽泛）。
+func classifyToolByName(name string) string {
+	n := strings.ToLower(name)
+	match := func(keys ...string) bool {
+		for _, k := range keys {
+			if strings.Contains(n, k) {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case match("skill"):
+		return "skill"
+	case match("question", "ask"):
+		return "question"
+	case match("search", "query"):
+		return "websearch"
+	case match("fetch", "url", "http", "web"):
+		return "webfetch"
+	case match("agent", "teammate", "spawn", "send", "notify", "message", "task", "todo", "goal", "wait", "interrupt"):
+		return "subagent"
+	case match("shell", "command", "exec", "bash", "pwsh", "run"):
+		return "shell"
+	case match("schedule", "cron"):
+		return "shell"
+	case match("grep"):
+		return "grep"
+	case match("glob", "find", "list"):
+		return "glob"
+	case match("image"):
+		return "read"
+	case match("read", "load"):
+		return "read"
+	case match("edit", "patch", "update", "replace"):
+		return "edit"
+	case match("write", "create", "save"):
+		return "write"
+	case match("delete", "remove", "purge", "kill", "stop"):
+		return "execute"
+	default:
+		return "execute"
+	}
 }
 
 // channelDefaultTool 是模型没填 _tool 时的兜底还原目标：每个通道选一个
@@ -120,7 +168,7 @@ func buildChannelTools(protocol Format, items []any) []any {
 	for _, ch := range order {
 		tool := renderOfficialTool(protocol, ch)
 		desc := channelDescription(ch, groups[ch], protocol)
-		params := channelParameters(protocol, tool)
+		params := channelParameters(protocol, tool, groups[ch])
 		if fn, ok := tool["function"].(map[string]any); ok {
 			fn["description"] = desc
 			fn["parameters"] = params
@@ -132,6 +180,10 @@ func buildChannelTools(protocol Format, items []any) []any {
 	}
 	return out
 }
+
+// channelMemberDescCap 限制单个成员描述在通道描述里的长度：
+// 通道成员多了之后描述会膨胀，撑大 token 也稀释模型注意力。
+const channelMemberDescCap = 300
 
 // channelDescription 生成通道描述：保留官方描述前缀，列出承载的真实工具。
 func channelDescription(channel string, members []map[string]any, protocol Format) string {
@@ -160,6 +212,10 @@ func channelDescription(channel string, members []map[string]any, protocol Forma
 		if cleaned, replaced := sanitizeToolDescription(name, desc); replaced {
 			desc = cleaned
 		}
+		// 截断超长成员描述，保持通道描述有界。
+		if len(desc) > channelMemberDescCap {
+			desc = desc[:channelMemberDescCap] + "…"
+		}
 		b.WriteString("- ")
 		b.WriteString(name)
 		if desc != "" {
@@ -172,7 +228,8 @@ func channelDescription(channel string, members []map[string]any, protocol Forma
 }
 
 // channelParameters 在官方通道参数里注入 _tool 与 _args。
-func channelParameters(protocol Format, tool map[string]any) map[string]any {
+// _tool 带 enum（该通道承载的客户端工具全集），给模型硬约束提升选择准确率。
+func channelParameters(protocol Format, tool map[string]any, members []map[string]any) map[string]any {
 	params := map[string]any{"type": "object", "properties": map[string]any{}}
 	if fn, ok := tool["function"].(map[string]any); ok {
 		if p, ok := fn["parameters"].(map[string]any); ok {
@@ -185,10 +242,20 @@ func channelParameters(protocol Format, tool map[string]any) map[string]any {
 	if props == nil {
 		props = map[string]any{}
 	}
-	props[channelSelector] = map[string]any{
+	selector := map[string]any{
 		"type":        "string",
 		"description": "The actual function to dispatch to.",
 	}
+	if len(members) > 0 {
+		enum := make([]any, 0, len(members))
+		for _, m := range members {
+			if n := entryToolName(m, protocol); n != "" {
+				enum = append(enum, n)
+			}
+		}
+		selector["enum"] = enum
+	}
+	props[channelSelector] = selector
 	props[channelArgs] = map[string]any{
 		"type":                  "object",
 		"description":           "Arguments object for the actual function.",

@@ -36,3 +36,7 @@ last_*_resp.json
 last_*_body.json
 last_*Body.json
 last_*UpBody.json
+
+incoming/
+last_incoming_req.json
+last_429_*.json

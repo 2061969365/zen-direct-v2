@@ -1358,7 +1358,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		// 先还原 wire 工具名，再交给同格式透传或跨格式转换；转换函数因此
 		// 始终看到客户端声明的名字，Chat 分片名也在这里被完整重组。
 		var streamReader io.Reader = ir
-		if !reqRenames.Empty() {
+		if !reqRenames.Empty() || channelModeOn() {
 			streamReader = NewRenameStreamReader(ir, target, reqRenames)
 		}
 		// 同格式 responses 直传；跨格式走转换（DONE 语义由各转换函数保证）。
@@ -1411,6 +1411,15 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	w.Header().Set("Content-Type", "application/json")
 	outBytes, _ := json.Marshal(out)
 	outBytes = restoreAliasNames(outBytes, reqRenames)
+	// 通道模式：把 _tool 选择器还原成真实工具名并展开 _args。
+	if channelModeOn() {
+		var chanPayload map[string]any
+		if json.Unmarshal(outBytes, &chanPayload) == nil && restoreChannelCalls(chanPayload) {
+			if encoded, err := json.Marshal(chanPayload); err == nil {
+				outBytes = encoded
+			}
+		}
+	}
 	log.Printf("[REQ %s] non-stream done ttfbMs=%d ms=%d outBytes=%d",
 		reqID, ttfbMs, time.Since(reqStart).Milliseconds(), len(outBytes))
 	_, _ = w.Write(outBytes)

@@ -15,12 +15,12 @@ import (
 // rewriter (a name may span several chunks); other protocols use the stateless
 // exact rewrite. An empty rename set returns the reader unchanged.
 func NewRenameStreamReader(reader io.Reader, protocol Format, renames *ToolRenames) io.Reader {
-	if renames.Empty() {
+	if renames.Empty() && !channelModeOn() {
 		return reader
 	}
 	return &renameStreamReader{
 		buffer:  bufio.NewReaderSize(reader, 64<<10),
-		renamer: &streamToolRenamer{protocol: protocol, renames: renames, tools: map[string]*streamToolRenameState{}},
+		renamer: newStreamToolRenamer(protocol, renames),
 	}
 }
 
@@ -100,13 +100,35 @@ type streamToolRenameState struct {
 	pendingArguments strings.Builder
 	callIndex        any
 	choiceIndex      any
+	emitted          bool
 }
 
 type streamToolRenamer struct {
-	protocol Format
-	renames  *ToolRenames
-	tools    map[string]*streamToolRenameState
-	order    []string
+	protocol  Format
+	renames   *ToolRenames
+	tools     map[string]*streamToolRenameState
+	order     []string
+	channelOn bool
+	// channelArgs/channelNames 累积每个 tool call 的完整 arguments/name（跨 chunk）。
+	channelArgs  map[string]*strings.Builder
+	channelNames map[string]string
+}
+
+// newStreamToolRenamer 构造流式改名器；channelOn 时启用通道选择器还原。
+func newStreamToolRenamer(protocol Format, renames *ToolRenames) *streamToolRenamer {
+	return &streamToolRenamer{
+		protocol:     protocol,
+		renames:      renames,
+		tools:        map[string]*streamToolRenameState{},
+		channelOn:    channelModeOn(),
+		channelArgs:  map[string]*strings.Builder{},
+		channelNames: map[string]string{},
+	}
+}
+
+func (renamer *streamToolRenamer) channelName(key, fragment string) {
+	prev := renamer.channelNames[key]
+	renamer.channelNames[key] = mergeToolName(prev, fragment)
 }
 
 func (renamer *streamToolRenamer) rewriteFrame(raw string) []byte {
@@ -156,6 +178,23 @@ func (renamer *streamToolRenamer) rewriteChatFrame(raw string) []byte {
 				state.callIndex = firstAny(call["index"], callIndex)
 				state.choiceIndex = choiceIndex
 				seen[key] = true
+				// 通道模式：吞掉所有 tool_call 分片，等 finish 帧发完整调用。
+				if renamer.channelOn {
+					if name, ok := function["name"].(string); ok && name != "" {
+						renamer.channelName(key, name)
+					}
+					if frag, ok := function["arguments"].(string); ok && frag != "" {
+						sb := renamer.channelArgs[key]
+						if sb == nil {
+							sb = &strings.Builder{}
+							renamer.channelArgs[key] = sb
+						}
+						sb.WriteString(frag)
+					}
+					delete(message, "tool_calls")
+					changed = true
+					continue
+				}
 				if name, ok := function["name"].(string); ok && name != "" {
 					if renamer.applyNameFragment(state, function, name) {
 						changed = true
@@ -187,7 +226,44 @@ func (renamer *streamToolRenamer) rewriteChatFrame(raw string) []byte {
 			}
 		}
 		if finished {
-			if calls := renamer.pendingCalls(choiceIndex, seen); len(calls) > 0 {
+			// 通道模式：finish 帧发一条完整的、已还原的 tool_call。
+			if renamer.channelOn {
+				var calls []any
+				for _, key := range renamer.order {
+					state := renamer.tools[key]
+					if state == nil || state.emitted || fmt.Sprint(state.choiceIndex) != fmt.Sprint(choiceIndex) {
+						continue
+					}
+					channel := renamer.channelNames[key]
+					if channel == "" {
+						continue
+					}
+					args := ""
+					if sb := renamer.channelArgs[key]; sb != nil {
+						args = sb.String()
+					}
+					real, expanded := applyChannelArgs(channel, args)
+					calls = append(calls, map[string]any{
+						"index": state.callIndex,
+						"id":    "call_" + key,
+						"type":  "function",
+						"function": map[string]any{
+							"name":      real,
+							"arguments": expanded,
+						},
+					})
+					state.emitted = true
+				}
+				if len(calls) > 0 {
+					delta, ok := choice["delta"].(map[string]any)
+					if !ok {
+						delta = map[string]any{}
+						choice["delta"] = delta
+					}
+					delta["tool_calls"] = calls
+					changed = true
+				}
+			} else if calls := renamer.pendingCalls(choiceIndex, seen); len(calls) > 0 {
 				delta, ok := choice["delta"].(map[string]any)
 				if !ok {
 					delta = map[string]any{}

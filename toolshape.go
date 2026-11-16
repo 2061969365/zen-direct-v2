@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"os"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -809,6 +810,13 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 		}
 		ranked = append(ranked, entry)
 	}
+	// 通道模式：把客户端工具按语义归到 12 个官方桩名，靠参数里的 _tool 选择器
+	// 区分真实工具。出站只出现官方工具名，专为"只放行官方名"的上游设计。
+	if os.Getenv("ZEN_TOOL_CHANNEL") != "" && len(ranked) > 0 && !allOfficialToolNames(ranked, protocol) {
+		payload["tools"] = buildChannelTools(protocol, items)
+		return renames, true
+	}
+
 	official := officialToolset(protocol)
 	// 客户端已经自带官方工具集（官方 CLI / 官方 SDK 就是这种形态）时，
 	// 整份原样透传：不改名、不追加、不脱敏描述。

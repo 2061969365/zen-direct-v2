@@ -56,7 +56,7 @@ func TestChannelDescriptionListsMembers(t *testing.T) {
 
 func TestApplyChannelArgs(t *testing.T) {
 	args := `{"path":"a.txt","_tool":"read_image","_args":{"path":"pic.png","offset":2}}`
-	name, expanded := applyChannelArgs("read", args)
+	name, expanded := applyChannelArgs("read", args, func(string) bool { return false })
 	if name != "read_image" {
 		t.Fatalf("真实工具名错误: %q", name)
 	}
@@ -77,7 +77,7 @@ func TestApplyChannelArgs(t *testing.T) {
 
 func TestApplyChannelArgsNoSelector(t *testing.T) {
 	args := `{"path":"a.txt"}`
-	name, expanded := applyChannelArgs("read", args)
+	name, expanded := applyChannelArgs("read", args, func(string) bool { return false })
 	if name != "read" || expanded != args {
 		t.Fatalf("无选择器时应原样返回: %q %q", name, expanded)
 	}
@@ -87,7 +87,7 @@ func TestRestoreChannelCalls(t *testing.T) {
 	payload := mustJSON(t, `{"choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
 		{"id":"c1","type":"function","function":{"name":"websearch","arguments":"{\"query\":\"x\",\"_tool\":\"web_search\",\"_args\":{\"q\":\"y\"}}"}}
 	]}}]}`)
-	if !restoreChannelCalls(payload) {
+	if !restoreChannelCalls(payload, nil) {
 		t.Fatal("应当发生还原")
 	}
 	choice := asArr(payload["choices"])[0].(map[string]any)
@@ -152,7 +152,8 @@ func TestStripChannelSelector(t *testing.T) {
 func TestApplyChannelArgsAllChannels(t *testing.T) {
 	for client, channel := range toolChannelMap {
 		got, expanded := applyChannelArgs(channel,
-			`{"`+channelSelector+`":"`+client+`","`+channelArgs+`":{"k":"v"}}`)
+			`{"`+channelSelector+`":"`+client+`","`+channelArgs+`":{"k":"v"}}`,
+			func(string) bool { return true })
 		if got != client {
 			t.Errorf("通道 %s 的 %s 还原失败: got %q", channel, client, got)
 		}
@@ -166,12 +167,79 @@ func TestApplyChannelArgsAllChannels(t *testing.T) {
 		}
 	}
 	for channel, def := range channelDefaultTool {
-		got, _ := applyChannelArgs(channel, `{"command":"ls"}`)
+		got, _ := applyChannelArgs(channel, `{"command":"ls"}`, func(string) bool { return false })
 		if got != def {
 			t.Errorf("通道 %s 缺选择器时应兜底到 %s: got %q", channel, def, got)
 		}
 	}
-	if got, _ := applyChannelArgs("notachannel", `{"a":1}`); got != "notachannel" {
+	if got, _ := applyChannelArgs("notachannel", `{"a":1}`, func(string) bool { return false }); got != "notachannel" {
 		t.Errorf("未知通道名应原样保留: %q", got)
+	}
+}
+
+// TestRewriteChannelToolChoice 通道模式 tool_choice 必须映射回通道名。
+func TestRewriteChannelToolChoice(t *testing.T) {
+	// 字符串形态
+	p := mustJSON(t, `{"tool_choice":"web_search"}`)
+	rewriteChannelToolChoice(p, FmtChat)
+	if p["tool_choice"] != "websearch" {
+		t.Fatalf("字符串 tool_choice 未映射: %v", p["tool_choice"])
+	}
+	// 对象形态
+	p2 := mustJSON(t, `{"tool_choice":{"type":"function","function":{"name":"pwsh"}}}`)
+	rewriteChannelToolChoice(p2, FmtChat)
+	fn := asMap(asMap(p2["tool_choice"])["function"])
+	if asStr(fn["name"]) != "shell" {
+		t.Fatalf("对象 tool_choice 未映射: %v", fn["name"])
+	}
+	// 官方名不动
+	p3 := mustJSON(t, `{"tool_choice":{"type":"function","function":{"name":"read"}}}`)
+	rewriteChannelToolChoice(p3, FmtChat)
+	fn3 := asMap(asMap(p3["tool_choice"])["function"])
+	if asStr(fn3["name"]) != "read" {
+		t.Fatalf("官方名不应改写: %v", fn3["name"])
+	}
+	// auto 不动
+	p4 := mustJSON(t, `{"tool_choice":"auto"}`)
+	rewriteChannelToolChoice(p4, FmtChat)
+	if p4["tool_choice"] != "auto" {
+		t.Fatalf("auto 不应改写: %v", p4["tool_choice"])
+	}
+}
+
+// TestApplyChannelArgsSelectorVariants _tool 填官方名/通道名时的兜底。
+func TestApplyChannelArgsSelectorVariants(t *testing.T) {
+	// _tool=shell（官方名，客户端没有叫 shell 的工具）-> pwsh
+	name, _ := applyChannelArgs("shell", `{"_tool":"shell","_args":{"command":"ls"}}`, func(string) bool { return false })
+	if name != "pwsh" {
+		t.Fatalf("_tool=shell 应兜底 pwsh: %q", name)
+	}
+	// _tool=websearch（通道名）-> web_search
+	name2, _ := applyChannelArgs("websearch", `{"_tool":"websearch","_args":{"query":"x"}}`, func(string) bool { return false })
+	if name2 != "web_search" {
+		t.Fatalf("_tool=websearch 应兜底 web_search: %q", name2)
+	}
+	// _tool 是真客户端名 -> 原样
+	name3, _ := applyChannelArgs("read", `{"_tool":"read","_args":{"path":"x"}}`, func(string) bool { return false })
+	if name3 != "read" {
+		t.Fatalf("_tool=客户端名应原样: %q", name3)
+	}
+}
+
+// TestResponsesStreamChannelRestore responses 流 completed 帧的通道还原。
+func TestResponsesStreamChannelRestore(t *testing.T) {
+	t.Setenv("ZEN_TOOL_CHANNEL", "1")
+	ren := newStreamToolRenamer(FmtResponses, NewToolRenames())
+	frame := `{"type":"response.completed","response":{"output":[
+		{"type":"function_call","name":"websearch","arguments":"{\"query\":\"x\",\"_tool\":\"web_search\",\"_args\":{\"q\":\"y\"}}"}
+	]}}`
+	out := ren.rewriteFrame(frame)
+	var payload map[string]any
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatal(err)
+	}
+	item := asArr(asMap(payload["response"])["output"])[0]
+	if asStr(item.(map[string]any)["name"]) != "web_search" {
+		t.Fatalf("responses 流还原失败: %s", out)
 	}
 }

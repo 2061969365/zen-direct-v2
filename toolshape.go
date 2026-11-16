@@ -245,6 +245,7 @@ type ToolRenames struct {
 	official map[string]string
 	byCase   map[string]string
 	byShape  map[string]string
+	declared map[string]bool
 }
 
 func NewToolRenames() *ToolRenames {
@@ -266,6 +267,30 @@ func (r *ToolRenames) Count() int {
 		return 0
 	}
 	return len(r.toWire)
+}
+
+// SetDeclared 记录本次请求声明的客户端工具名（通道模式用）。
+func (r *ToolRenames) SetDeclared(names []string) {
+	if r == nil {
+		return
+	}
+	if r.declared == nil {
+		r.declared = map[string]bool{}
+	}
+	for _, n := range names {
+		if n != "" {
+			r.declared[n] = true
+		}
+	}
+}
+
+// Declared 报告 name 是否是本次请求声明的客户端工具。nil 安全：未记录时返回
+// false（此时兜底映射按"模型回显通道名"处理）。
+func (r *ToolRenames) Declared(name string) bool {
+	if r == nil || r.declared == nil {
+		return false
+	}
+	return r.declared[name]
 }
 
 func (r *ToolRenames) Wire(client string) (string, bool) {
@@ -814,9 +839,18 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	// 区分真实工具。出站只出现官方工具名，专为"只放行官方名"的上游设计。
 	if os.Getenv("ZEN_TOOL_CHANNEL") != "" && len(ranked) > 0 && !allOfficialToolNames(ranked, protocol) {
 		payload["tools"] = buildChannelTools(protocol, items)
+		// 记录本次声明的客户端工具名：响应还原时区分"模型回显通道名"
+		// （需兜底映射）与"客户端真名"（如 subagent，不能误映射）。
+		declaredClients := make([]string, 0, len(ranked))
+		for _, entry := range ranked {
+			declaredClients = append(declaredClients, entryToolName(entry, protocol))
+		}
+		renames.SetDeclared(declaredClients)
 		// 历史消息里的工具调用名也要改回通道名，并重新包装参数，
 		// 否则上游看到历史 tool_calls.name 为客户端原名会 429。
 		rewriteChannelHistory(payload, protocol)
+		// tool_choice 指向的是客户端名：不改写的话上游看到未声明工具直接报错。
+		rewriteChannelToolChoice(payload, protocol)
 		return renames, true
 	}
 

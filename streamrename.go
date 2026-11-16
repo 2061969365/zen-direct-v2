@@ -133,6 +133,19 @@ func (renamer *streamToolRenamer) channelName(key, fragment string) {
 
 func (renamer *streamToolRenamer) rewriteFrame(raw string) []byte {
 	if renamer.protocol != FmtChat {
+		// 通道模式：responses 流的 function_call 参数跨帧分段，无法逐帧还原；
+		// response.completed 帧携带完整 output[]，在这里一次性还原。
+		if renamer.channelOn && strings.Contains(raw, `"response.completed"`) {
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(raw), &payload); err == nil {
+				if resp, ok := payload["response"].(map[string]any); ok && restoreChannelCalls(resp, renamer.renames) {
+					payload["response"] = resp
+					if enc, err := json.Marshal(payload); err == nil {
+						return enc
+					}
+				}
+			}
+		}
 		return RenameResponseTool([]byte(raw), renamer.renames)
 	}
 	if !strings.Contains(raw, `"tool_calls"`) && !strings.Contains(raw, `"finish_reason"`) {
@@ -242,7 +255,7 @@ func (renamer *streamToolRenamer) rewriteChatFrame(raw string) []byte {
 					if sb := renamer.channelArgs[key]; sb != nil {
 						args = sb.String()
 					}
-					real, expanded := applyChannelArgs(channel, args)
+					real, expanded := applyChannelArgs(channel, args, renamer.renames.Declared)
 					calls = append(calls, map[string]any{
 						"index": state.callIndex,
 						"id":    "call_" + key,

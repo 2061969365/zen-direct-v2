@@ -1418,7 +1418,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	// 通道模式：把 _tool 选择器还原成真实工具名并展开 _args。
 	if channelModeOn() {
 		var chanPayload map[string]any
-		if json.Unmarshal(outBytes, &chanPayload) == nil && restoreChannelCalls(chanPayload) {
+		if json.Unmarshal(outBytes, &chanPayload) == nil && restoreChannelCalls(chanPayload, reqRenames) {
 			if encoded, err := json.Marshal(chanPayload); err == nil {
 				outBytes = encoded
 			}

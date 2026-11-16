@@ -263,6 +263,41 @@ func rewriteChannelHistory(payload map[string]any, protocol Format) {
 	}
 }
 
+// rewriteChannelToolChoice 把 tool_choice 里的客户端工具名映射回通道名。
+// 字符串形态（"web_search"）与对象形态（{function:{name:...}}）都处理；
+// 非 function 值（auto/required/none）不动。legacy function_call 同步改写。
+func rewriteChannelToolChoice(payload map[string]any, protocol Format) {
+	mapName := func(name string) string {
+		// 只映射已知客户端工具名；auto/required/none 等控制值原样通过。
+		if ch, ok := toolChannelMap[name]; ok && ch != name {
+			return ch
+		}
+		if _, isClient := toolChannelMap[name]; isClient {
+			return name
+		}
+		return name
+	}
+	if tc, ok := payload["tool_choice"].(string); ok {
+		payload["tool_choice"] = mapName(tc)
+		return
+	}
+	if tc, ok := payload["tool_choice"].(map[string]any); ok {
+		if fn, ok := tc["function"].(map[string]any); ok {
+			if n := asStr(fn["name"]); n != "" {
+				fn["name"] = mapName(n)
+			}
+		}
+		return
+	}
+	if fc, ok := payload["function_call"].(map[string]any); ok {
+		if n := asStr(fc["name"]); n != "" {
+			fc["name"] = mapName(n)
+		}
+	} else if fc, ok := payload["function_call"].(string); ok {
+		payload["function_call"] = mapName(fc)
+	}
+}
+
 // stripChannelSelector 从 arguments 里移除 _tool/_args，只保留真实参数。
 // 历史调用里若被客户端自己带上这两个字段（例如把上一轮响应原样回放），
 // 也要清掉，否则同样触发指纹门禁。
@@ -302,7 +337,7 @@ func stripChannelSelector(arguments string) string {
 // restoreChannelCalls 把响应里的通道工具调用还原成真实客户端工具调用：
 // 从 arguments 的 _tool 取真实工具名，把 _args 展开为顶层参数。
 // 支持 chat（choices[].message/delta.tool_calls）与 responses（output[]）。
-func restoreChannelCalls(payload map[string]any) bool {
+func restoreChannelCalls(payload map[string]any, renames *ToolRenames) bool {
 	changed := false
 	rewriteFn := func(fn map[string]any) {
 		name, _ := fn["name"].(string)
@@ -310,7 +345,7 @@ func restoreChannelCalls(payload map[string]any) bool {
 		if name == "" || args == "" {
 			return
 		}
-		real, expanded := applyChannelArgs(name, args)
+		real, expanded := applyChannelArgs(name, args, renames.Declared)
 		if real != name || expanded != args {
 			fn["name"] = real
 			fn["arguments"] = expanded
@@ -350,7 +385,7 @@ func restoreChannelCalls(payload map[string]any) bool {
 		}
 		if name, ok := item["name"].(string); ok && name != "" {
 			if args, ok := item["arguments"].(string); ok && args != "" {
-				real, expanded := applyChannelArgs(name, args)
+				real, expanded := applyChannelArgs(name, args, renames.Declared)
 				if real != name || expanded != args {
 					item["name"] = real
 					item["arguments"] = expanded
@@ -362,7 +397,10 @@ func restoreChannelCalls(payload map[string]any) bool {
 	return changed
 }
 
-func applyChannelArgs(toolName, arguments string) (string, string) {
+// applyChannelArgs 把模型返回的 _tool 选择器还原成真实客户端工具名，
+// 并把 _args 展开成顶层参数。declared 用于区分"客户端真名"与"模型回显的
+// 通道名"——subagent 这类既是客户端真名又是官方名的值不能误映射。
+func applyChannelArgs(toolName, arguments string, declared func(string) bool) (string, string) {
 	var m map[string]any
 	if err := json.Unmarshal([]byte(arguments), &m); err != nil {
 		return toolName, arguments
@@ -370,12 +408,21 @@ func applyChannelArgs(toolName, arguments string) (string, string) {
 	real, _ := m[channelSelector].(string)
 	if real == "" {
 		// 没填选择器：模型直接以通道名调用（常见于它沿用官方 shell 语义）。
-		// 此时把通道名兜底还原成该通道的默认客户端工具，否则客户端收到
-		// 未知工具名（如 shell）直接报"unknown tool"，表现为工具用不了。
-		if def, ok := channelDefaultTool[toolName]; ok {
-			return def, arguments
+		// 若通道名本身是客户端真名（如 subagent）则保留；否则兜底到通道默认
+		// 客户端工具，避免客户端收到未知工具名（shell）报 unknown tool。
+		if !declared(toolName) {
+			if def, ok := channelDefaultTool[toolName]; ok && def != toolName {
+				return def, arguments
+			}
 		}
 		return toolName, arguments
+	}
+	// _tool 填了通道名本身（回显官方语义）：映射到该通道默认客户端工具。
+	// 客户端真名（declared）或任意其他值原样保留。
+	if real == toolName && !declared(real) {
+		if def, ok := channelDefaultTool[toolName]; ok && def != toolName {
+			real = def
+		}
 	}
 	out := map[string]any{}
 	if args, ok := m[channelArgs].(map[string]any); ok {

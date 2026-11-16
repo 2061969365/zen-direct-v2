@@ -100,6 +100,7 @@ type streamToolRenameState struct {
 	pendingArguments strings.Builder
 	callIndex        any
 	choiceIndex      any
+	modelID          string
 	emitted          bool
 }
 
@@ -109,9 +110,36 @@ type streamToolRenamer struct {
 	tools     map[string]*streamToolRenameState
 	order     []string
 	channelOn bool
+	// keyAlias 把同一 tool_call 的两种 key 形态（choice:index / choice:id）
+	// 都指向 canonical key，解决"首帧只有 id、后续帧只有 index"的分叉。
+	keyAlias map[string]string
 	// channelArgs/channelNames 累积每个 tool call 的完整 arguments/name（跨 chunk）。
 	channelArgs  map[string]*strings.Builder
 	channelNames map[string]string
+}
+
+// callKey 计算 canonical key：choiceIndex 前缀 + index/id。已见过的别名
+// 直接解析到原 canonical，保证跨帧一致。
+func (renamer *streamToolRenamer) callKey(choiceIndex, index any, id string, fallback int) string {
+	ck := fmt.Sprint(choiceIndex)
+	candidates := []string{}
+	if index != nil {
+		candidates = append(candidates, ck+":i:"+fmt.Sprint(index))
+	}
+	if id != "" {
+		candidates = append(candidates, ck+":id:"+id)
+	}
+	candidates = append(candidates, ck+":n:"+fmt.Sprint(fallback))
+	for _, c := range candidates {
+		if canonical, ok := renamer.keyAlias[c]; ok {
+			return canonical
+		}
+	}
+	canonical := candidates[0]
+	for _, c := range candidates {
+		renamer.keyAlias[c] = canonical
+	}
+	return canonical
 }
 
 // newStreamToolRenamer 构造流式改名器；channelOn 时启用通道选择器还原。
@@ -120,6 +148,7 @@ func newStreamToolRenamer(protocol Format, renames *ToolRenames) *streamToolRena
 		protocol:     protocol,
 		renames:      renames,
 		tools:        map[string]*streamToolRenameState{},
+		keyAlias:     map[string]string{},
 		channelOn:    channelModeOn(),
 		channelArgs:  map[string]*strings.Builder{},
 		channelNames: map[string]string{},
@@ -140,6 +169,38 @@ func (renamer *streamToolRenamer) rewriteFrame(raw string) []byte {
 			if err := json.Unmarshal([]byte(raw), &payload); err == nil {
 				if resp, ok := payload["response"].(map[string]any); ok && restoreChannelCalls(resp, renamer.renames) {
 					payload["response"] = resp
+					if enc, err := json.Marshal(payload); err == nil {
+						return enc
+					}
+				}
+			}
+		}
+		// 中间帧（output_item.added/done、function_call_arguments.done）里
+		// name 仍是通道名：逐事件消费的客户端会先见到未还原的名字，在此还原。
+		if renamer.channelOn && (strings.Contains(raw, `"function_call"`) || strings.Contains(raw, `"function_call_arguments.done"`)) && !strings.Contains(raw, `"response.completed"`) {
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(raw), &payload); err == nil {
+				changed := false
+				if item, ok := payload["item"].(map[string]any); ok {
+					if n := asStr(item["name"]); n != "" && !renamer.renames.Declared(n) {
+						if def := channelDefaultResolver(renamer.renames)(n); def != "" && def != n {
+							item["name"] = def
+							changed = true
+						}
+					}
+				}
+				if n := asStr(payload["name"]); n != "" && !renamer.renames.Declared(n) {
+					if args := asStr(payload["arguments"]); args != "" {
+						real, expanded := applyChannelArgsDefault(n, args, renamer.renames.Declared, channelDefaultResolver(renamer.renames))
+						payload["name"] = real
+						payload["arguments"] = expanded
+						changed = true
+					} else if def := channelDefaultResolver(renamer.renames)(n); def != "" && def != n {
+						payload["name"] = def
+						changed = true
+					}
+				}
+				if changed {
 					if enc, err := json.Marshal(payload); err == nil {
 						return enc
 					}
@@ -186,8 +247,14 @@ func (renamer *streamToolRenamer) rewriteChatFrame(raw string) []byte {
 				if !ok {
 					continue
 				}
-				key := fmt.Sprint(firstAny(call["index"], asStr(call["id"]), callIndex))
+				// key 规范化：以 choiceIndex 为前缀避免多 choice 碰撞；同一调用
+				// 的 index 形态与 id 形态两个别名都指向同一个 canonical key，
+				// 解决"首帧只有 id、后续帧只有 index"的分叉。
+				key := renamer.callKey(choiceIndex, call["index"], asStr(call["id"]), callIndex)
 				state := renamer.toolState(key)
+				if id := asStr(call["id"]); id != "" && state.modelID == "" {
+					state.modelID = id
+				}
 				state.callIndex = firstAny(call["index"], callIndex)
 				state.choiceIndex = choiceIndex
 				seen[key] = true
@@ -255,10 +322,15 @@ func (renamer *streamToolRenamer) rewriteChatFrame(raw string) []byte {
 					if sb := renamer.channelArgs[key]; sb != nil {
 						args = sb.String()
 					}
-					real, expanded := applyChannelArgs(channel, args, renamer.renames.Declared)
+					real, expanded := applyChannelArgsDefault(channel, args, renamer.renames.Declared, channelDefaultResolver(renamer.renames))
+					callID := state.modelID
+					if callID == "" {
+						// 上游真 id 缺失时才合成，保证客户端历史回放的 id 关联稳定。
+						callID = "call_" + key
+					}
 					calls = append(calls, map[string]any{
 						"index": state.callIndex,
-						"id":    "call_" + key,
+						"id":    callID,
 						"type":  "function",
 						"function": map[string]any{
 							"name":      real,
@@ -363,6 +435,69 @@ func (renamer *streamToolRenamer) pendingCall(state *streamToolRenameState) any 
 func (renamer *streamToolRenamer) finish() []byte {
 	if renamer.protocol != FmtChat {
 		return nil
+	}
+	// 通道模式截断补发：上游在 finish_reason 之前断流（free 层常见）时，
+	// 已被吞掉的 tool_call 分片在此补发完整调用，否则客户端本轮收不到任何调用。
+	if renamer.channelOn {
+		type choiceCalls struct {
+			index any
+			calls []any
+		}
+		var groups []*choiceCalls
+		byIndex := map[string]*choiceCalls{}
+		for _, key := range renamer.order {
+			state := renamer.tools[key]
+			if state == nil || state.emitted {
+				continue
+			}
+			channel := renamer.channelNames[key]
+			if channel == "" {
+				continue
+			}
+			args := ""
+			if sb := renamer.channelArgs[key]; sb != nil {
+				args = sb.String()
+			}
+			real, expanded := applyChannelArgsDefault(channel, args, renamer.renames.Declared, channelDefaultResolver(renamer.renames))
+			callID := state.modelID
+			if callID == "" {
+				callID = "call_" + key
+			}
+			index := state.choiceIndex
+			if index == nil {
+				index = 0
+			}
+			indexKey := fmt.Sprint(index)
+			group := byIndex[indexKey]
+			if group == nil {
+				group = &choiceCalls{index: index}
+				byIndex[indexKey] = group
+				groups = append(groups, group)
+			}
+			group.calls = append(group.calls, map[string]any{
+				"index": state.callIndex,
+				"id":    callID,
+				"type":  "function",
+				"function": map[string]any{
+					"name":      real,
+					"arguments": expanded,
+				},
+			})
+			state.emitted = true
+		}
+		if len(groups) > 0 {
+			choices := make([]any, 0, len(groups))
+			for _, group := range groups {
+				choices = append(choices, map[string]any{
+					"index":         group.index,
+					"delta":         map[string]any{"tool_calls": group.calls},
+					"finish_reason": "tool_calls",
+				})
+			}
+			if encoded, err := json.Marshal(map[string]any{"choices": choices}); err == nil {
+				return append(append([]byte("data: "), encoded...), '\n', '\n')
+			}
+		}
 	}
 	type choiceCalls struct {
 		index any

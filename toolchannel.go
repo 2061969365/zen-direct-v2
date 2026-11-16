@@ -287,6 +287,10 @@ func rewriteChannelToolChoice(payload map[string]any, protocol Format) {
 				fn["name"] = mapName(n)
 			}
 		}
+		// responses 扁平形态：{"type":"function","name":"web_search"}
+		if n := asStr(tc["name"]); n != "" {
+			tc["name"] = mapName(n)
+		}
 		return
 	}
 	if fc, ok := payload["function_call"].(map[string]any); ok {
@@ -345,7 +349,7 @@ func restoreChannelCalls(payload map[string]any, renames *ToolRenames) bool {
 		if name == "" || args == "" {
 			return
 		}
-		real, expanded := applyChannelArgs(name, args, renames.Declared)
+		real, expanded := applyChannelArgsDefault(name, args, renames.Declared, channelDefaultResolver(renames))
 		if real != name || expanded != args {
 			fn["name"] = real
 			fn["arguments"] = expanded
@@ -385,7 +389,7 @@ func restoreChannelCalls(payload map[string]any, renames *ToolRenames) bool {
 		}
 		if name, ok := item["name"].(string); ok && name != "" {
 			if args, ok := item["arguments"].(string); ok && args != "" {
-				real, expanded := applyChannelArgs(name, args, renames.Declared)
+				real, expanded := applyChannelArgsDefault(name, args, renames.Declared, channelDefaultResolver(renames))
 				if real != name || expanded != args {
 					item["name"] = real
 					item["arguments"] = expanded
@@ -401,26 +405,51 @@ func restoreChannelCalls(payload map[string]any, renames *ToolRenames) bool {
 // 并把 _args 展开成顶层参数。declared 用于区分"客户端真名"与"模型回显的
 // 通道名"——subagent 这类既是客户端真名又是官方名的值不能误映射。
 func applyChannelArgs(toolName, arguments string, declared func(string) bool) (string, string) {
+	return applyChannelArgsDefault(toolName, arguments, declared, nil)
+}
+
+// channelDefaultResolver 生成通道缺省还原函数：该通道下恰好声明了一个客户端
+// 工具时优先还原到它（漏填或回显 _tool 时避免换成未声明的通道默认工具，
+// 导致客户端收到 unknown tool）；否则退回 channelDefaultTool。nil renames 安全。
+func channelDefaultResolver(renames *ToolRenames) func(string) string {
+	return func(channel string) string {
+		if only := renames.DeclaredForChannel(channel); only != "" {
+			return only
+		}
+		return channelDefaultTool[channel]
+	}
+}
+
+// applyChannelArgsDefault 同 applyChannelArgs；defaultFor 允许调用方按已声明
+// 工具集合决定通道缺省还原目标（nil 时用 channelDefaultTool）。
+func applyChannelArgsDefault(toolName, arguments string, declared func(string) bool, defaultFor func(string) string) (string, string) {
+	if defaultFor == nil {
+		defaultFor = func(channel string) string { return channelDefaultTool[channel] }
+	}
 	var m map[string]any
 	if err := json.Unmarshal([]byte(arguments), &m); err != nil {
+		// 不可解析的 JSON 无法判断模型意图（无参还是截断）：原样保留名字与
+		// 参数。名字泄漏（通道名）在此场景是已知限制——客户端报 unknown tool
+		// 时参数也在，重试可自愈。
 		return toolName, arguments
 	}
 	real, _ := m[channelSelector].(string)
 	if real == "" {
 		// 没填选择器：模型直接以通道名调用（常见于它沿用官方 shell 语义）。
 		// 若通道名本身是客户端真名（如 subagent）则保留；否则兜底到通道默认
-		// 客户端工具，避免客户端收到未知工具名（shell）报 unknown tool。
+		// 客户端工具（优先该通道下已声明的工具），避免客户端收到未知工具名
+		// （shell）报 unknown tool。
 		if !declared(toolName) {
-			if def, ok := channelDefaultTool[toolName]; ok && def != toolName {
+			if def := defaultFor(toolName); def != "" && def != toolName {
 				return def, arguments
 			}
 		}
 		return toolName, arguments
 	}
-	// _tool 填了通道名本身（回显官方语义）：映射到该通道默认客户端工具。
-	// 客户端真名（declared）或任意其他值原样保留。
+	// _tool 填了通道名本身（回显官方语义）：映射到该通道默认客户端工具
+	// （优先该通道下已声明的工具）。客户端真名（declared）或任意其他值原样保留。
 	if real == toolName && !declared(real) {
-		if def, ok := channelDefaultTool[toolName]; ok && def != toolName {
+		if def := defaultFor(toolName); def != "" && def != toolName {
 			real = def
 		}
 	}

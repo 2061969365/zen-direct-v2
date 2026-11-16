@@ -293,6 +293,26 @@ func (r *ToolRenames) Declared(name string) bool {
 	return r.declared[name]
 }
 
+// DeclaredForChannel 返回通道 channel 下已声明的客户端工具名：恰好声明了一个
+// 时返回它，零个或多个返回 ""（多个时语义不明，交给 channelDefaultTool 兜底）。
+// 通道模式用：模型漏填或回显 _tool 时，优先还原到客户端真正声明过的工具，
+// 避免换成未声明的通道默认工具导致客户端收到 unknown tool。
+func (r *ToolRenames) DeclaredForChannel(channel string) string {
+	if r == nil || r.declared == nil {
+		return ""
+	}
+	found := ""
+	for name := range r.declared {
+		if channelForTool(name) == channel {
+			if found != "" {
+				return ""
+			}
+			found = name
+		}
+	}
+	return found
+}
+
 func (r *ToolRenames) Wire(client string) (string, bool) {
 	if r == nil || client == "" {
 		return "", false

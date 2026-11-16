@@ -243,3 +243,13 @@ func TestResponsesStreamChannelRestore(t *testing.T) {
 		t.Fatalf("responses 流还原失败: %s", out)
 	}
 }
+
+// TestRewriteChannelToolChoiceFlat responses 扁平 tool_choice 形态。
+func TestRewriteChannelToolChoiceFlat(t *testing.T) {
+	p := mustJSON(t, `{"tool_choice":{"type":"function","name":"web_search"}}`)
+	rewriteChannelToolChoice(p, FmtResponses)
+	tc := asMap(p["tool_choice"])
+	if asStr(tc["name"]) != "websearch" {
+		t.Fatalf("扁平 tool_choice 未映射: %v", tc["name"])
+	}
+}

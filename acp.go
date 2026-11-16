@@ -130,6 +130,7 @@ func (c *cappedBuffer) String() string {
 	defer c.mu.Unlock()
 	return string(c.buf)
 }
+
 type acpEnvelope struct {
 	JSONRPC string `json:"jsonrpc"`
 	ID      int64  `json:"id"`

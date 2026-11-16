@@ -35,7 +35,7 @@ var (
 	// 注：现签已修正为 descending（低 12 位大计数），本身即过门禁；
 	// 名单仅作无 service/无 ACP 环境的兜底。
 	genuineSessions []string
-	genuineSet       = map[string]bool{}
+	genuineSet      = map[string]bool{}
 	// badSes 401/403/免费额度烧掉的 session（落盘名单，重启由 badSesLoad 恢复；
 	// 上限防 403 风暴无界涨）。
 	badSes = map[string]bool{}
@@ -246,7 +246,6 @@ func freeLimitSesFromLine(line string) string {
 	}
 	return rest
 }
-
 
 // badSesAddLocked 记一条毒名单（精确表 + 前缀表）。已在表内返回 false。
 // 残条（日志里被截断的短 id）若已被某条全长 id 覆盖，就不再重复记。
@@ -467,6 +466,7 @@ func pickGenuine(fp string, salt uint64) string {
 	defer poolMu.Unlock()
 	return pickGenuineLocked(fp, salt)
 }
+
 // fpKey 会话键。sid 非空即 hdr: 前缀（同头同键，与 body 无关）。
 func fpKey(sid, first, instructions string) string {
 	if sid != "" {

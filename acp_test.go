@@ -179,6 +179,7 @@ func TestAcpBinaryPathShim(t *testing.T) {
 		t.Fatalf(".cmd 垫片应拒收，得 %q", got)
 	}
 }
+
 // 非 ses_ 前缀拒收（上游只认 ses_，错值入库等于埋雷）。
 func TestAcpExchangeRejectsPrefix(t *testing.T) {
 	cr, cw := io.Pipe()

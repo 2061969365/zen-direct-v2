@@ -118,6 +118,7 @@ func TestGenuineLoadFromFile(t *testing.T) {
 	}
 	resetPoolForTest()
 }
+
 // 借用顺序：service → harvest → ACP → 现签；每层为空才往下一层掉。
 func TestPoolMintChainOrder(t *testing.T) {
 	resetPoolForTest()

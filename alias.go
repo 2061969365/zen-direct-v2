@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"strings"
-	"sync"
 )
 
 // alias.go: 上游保留工具名映射（V2 FreeTier 门禁）。
@@ -59,32 +58,11 @@ func unaliasToolName(name string) string {
 	return name
 }
 
-var (
-	lastRenamesMu sync.RWMutex
-	lastRenames   *ToolRenames
-)
-
-func recordLastRenames(r *ToolRenames) {
-	lastRenamesMu.Lock()
-	lastRenames = r
-	lastRenamesMu.Unlock()
-}
-
-func restoreLastRenames(line []byte) []byte {
-	lastRenamesMu.RLock()
-	r := lastRenames
-	lastRenamesMu.RUnlock()
-	if r != nil {
-		line = RenameResponseTool(line, r)
-	}
-	return line
-}
-
 // restoreAliasNames 把上游体里的别名还原（同格式透传路径用：pipeSSE 按行、
 // 非流 outBytes 整包）。只认 `"name":"zd_x"` 两种空白形态；JSON 字符串内的
 // 转义形态（\"name\":\"zd_x\"）天然碰不到，安全。
-func restoreAliasNames(line []byte) []byte {
-	line = restoreLastRenames(line)
+func restoreAliasNames(line []byte, renames *ToolRenames) []byte {
+	line = RenameResponseTool(line, renames)
 	if !bytes.Contains(line, []byte("zd_")) {
 		return line
 	}
@@ -99,6 +77,7 @@ func restoreAliasNames(line []byte) []byte {
 	}
 	return line
 }
+
 // toolNamesForLog 提取上游请求里的工具名集合（diag 用：上游 4xx 时一眼
 // 看出是不是新增了保留名）。两种形态通吃，去重保序。
 func toolNamesForLog(upReq map[string]any) []string {

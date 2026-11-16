@@ -16,8 +16,10 @@ import (
 	"time"
 )
 
-// defaultTableURL 官方 zen 文档 raw 地址（table.go 注释同源）。
-const defaultTableURL = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/zen.mdx"
+// defaultTableURL 官方模型表 raw 地址（table.go 注释同源）。
+// 2026-11 起文档从 packages/web/src/content/docs/zen.mdx 迁到
+// services/www/src/docs/content/console/models.mdx，旧地址已 404。
+const defaultTableURL = "https://raw.githubusercontent.com/anomalyco/opencode/dev/services/www/src/docs/content/console/models.mdx"
 
 // zenTableClient 刷新专用客户端：15s 超时，走环境代理。
 var zenTableClient = &http.Client{Timeout: 15 * time.Second}
@@ -43,8 +45,9 @@ func endpointToFormat(ep string) (Format, bool) {
 	}
 }
 
-// parseEndpointsTable 解析 zen.mdx 的 Endpoints 表。
-// 只认含 "https://opencode.ai/zen/v1" 的行（自动跳过表头/分隔行/价格表/下线表）。
+// parseEndpointsTable 解析官方模型表的 Endpoints 表。
+// 接受旧版 /zen/v1 与新版 /inference/openai/v1 两种端点前缀，
+// 自动跳过表头/分隔行/价格表/下线表。
 // 返回：模型->格式，模型->不支持端点。id 统一小写（lookup 用小写查）。
 func parseEndpointsTable(md string) (map[string]Format, map[string]string) {
 	formats := map[string]Format{}
@@ -54,7 +57,8 @@ func parseEndpointsTable(md string) (map[string]Format, map[string]string) {
 		if !strings.HasPrefix(t, "|") {
 			continue
 		}
-		if !strings.Contains(t, "https://opencode.ai/zen/v1") {
+		if !strings.Contains(t, "opencode.ai/zen/v1") &&
+			!strings.Contains(t, "opencode.ai/inference/openai/v1") {
 			continue
 		}
 		// | Model | Model ID | Endpoint | AI SDK Package |

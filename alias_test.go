@@ -132,7 +132,7 @@ func TestAliasEndToEnd(t *testing.T) {
 // 字节恢复：转义态碰不到，非别名不动。
 func TestRestoreAliasNamesBytes(t *testing.T) {
 	in := []byte(`data: {"type":"x","name":"zd_read"} {"name": "zd_bash"} {"name":"mytool"}`)
-	out := string(restoreAliasNames(in))
+	out := string(restoreAliasNames(in, nil))
 	if strings.Contains(out, "zd_read") || strings.Contains(out, "zd_bash") {
 		t.Fatalf("别名应还原：%s", out)
 	}
@@ -140,10 +140,10 @@ func TestRestoreAliasNamesBytes(t *testing.T) {
 		t.Fatalf("还原形状不对：%s", out)
 	}
 	esc := []byte(`data: {"arguments":"{\\"name\\":\\"zd_read\\"}"}`)
-	if string(restoreAliasNames(esc)) != string(esc) {
+	if string(restoreAliasNames(esc, nil)) != string(esc) {
 		t.Fatal("转义态不得改动")
 	}
-	if string(restoreAliasNames([]byte("plain line"))) != "plain line" {
+	if string(restoreAliasNames([]byte("plain line"), nil)) != "plain line" {
 		t.Fatal("无 zd_ 行应原样（零拷贝语义可顺带）")
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -777,7 +778,38 @@ func marshalOrderedMessages(msgs []any) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func buildUpstream(entry Format, target Format, in map[string]any) (map[string]any, error) {
+// cloneForShaping deep-copies the request fields mutated by tool shaping and
+// format conversion, so the client body handed to the handler is never changed
+// (retries rebuild from the same plain names instead of double-hashing).
+func cloneForShaping(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	for _, key := range []string{"tools", "functions", "tool_choice", "messages", "input", "reasoning"} {
+		if value, ok := in[key]; ok {
+			if copied, err := deepCopyJSON(value); err == nil {
+				out[key] = copied
+			}
+		}
+	}
+	return out
+}
+
+func deepCopyJSON(value any) (any, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var out any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func buildUpstream(entry Format, target Format, in map[string]any) (map[string]any, *ToolRenames, error) {
+	in = cloneForShaping(in)
 	upReq := in
 	if entry == FmtChat && target == FmtResponses {
 		upReq = chatToResponsesReq(in)
@@ -791,9 +823,12 @@ func buildUpstream(entry Format, target Format, in map[string]any) (map[string]a
 		in["tools"] = []any{}
 	}
 	// Opaque tool shaping（对齐 opencode2api commit 4a4db10）：
-	// 所有客户端工具统一重命名为 clint_<12hex> 隐藏指纹，并补齐官方 13 个工具
-	renames, _ := renameAndCompleteTools(upReq, target)
-	recordLastRenames(renames)
+	// 所有客户端工具统一重命名为 clint_<12hex> 隐藏指纹，并补齐官方 13 个工具。
+	// 标题请求保持无工具形态，不补官方工具集，否则会触发 FreeTier/额度 429。
+	renames := NewToolRenames()
+	if !(entry == FmtChat && isTitleGenerationRequest(in)) {
+		renames, _ = renameAndCompleteTools(upReq, target)
+	}
 	if debugOn() && renames != nil && renames.Count() > 0 {
 		log.Printf("renamed %d client tool(s) to clint_<digest>", renames.Count())
 	}
@@ -806,7 +841,7 @@ func buildUpstream(entry Format, target Format, in map[string]any) (map[string]a
 	} else {
 		// Chat 的 tool 消息装不了图片：带图的 tool 结果抬成独立 user 消息。
 		if err := hoistChatToolImages(upReq); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if _, ok := upReq["max_completion_tokens"]; !ok {
 			if _, ok := upReq["max_tokens"]; !ok {
@@ -816,7 +851,7 @@ func buildUpstream(entry Format, target Format, in map[string]any) (map[string]a
 	}
 	// V2 全路径拒绝显式 tool_choice:none，缺省即 auto 语义。
 	// 上方已剥离客户端 none；转换函数只透传用户自带的有效选择。
-	return upReq, nil
+	return upReq, renames, nil
 }
 
 // writeBodyWithType 透传已读的上游错误体（保留原 Content-Type）。
@@ -1007,10 +1042,17 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		}
 	}
 
+	var reqRenames *ToolRenames
 	buildBody := func() ([]byte, error) {
-		u, err := buildUpstream(entry, target, in)
+		u, rn, err := buildUpstream(entry, target, in)
 		if err != nil {
 			return nil, err
+		}
+		reqRenames = rn
+		// 上游严格 content 校验兜底：chat 目标下剔除空 assistant、
+		// 补齐空 user 的 content，避免整单 400（见 empty_content.go）。
+		if target == FmtChat {
+			normalizeEmptyMessageContent(u)
 		}
 		// 免费层门禁：messages[0] 必须是 OpenCode 官方 system 提示词。
 		// 上游目标为 chat（/chat/completions）时一律注入，覆盖 entry=chat 及 entry=responses->target=chat 全路径。
@@ -1041,6 +1083,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		writeErr(w, 400, "invalid_request_error", err.Error())
 		return
 	}
+	titleReq := entry == FmtChat && isTitleGenerationRequest(in)
 	// 失败轮不进池：本轮新建的 session 若首战即败（传输错/非 2xx），
 	// 直接驱逐，免死 session 占池坑；命中轮（老 lineage）绝不驱逐。
 	// 半截流（terminal=false）不驱逐：首轮已有响应输出，lineage 有效，
@@ -1104,6 +1147,11 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 				log.Printf("[REQ %s] egress ip %s -> %s, free-limit cooldown cleared", reqID, oldIP, newIP)
 				freeLimitUntil.Store(0)
 			} else {
+				if titleReq {
+					log.Printf("[REQ %s] free-limit cooldown, synthesized title", reqID)
+					writeSynthesizedTitle(w, model, stream, in)
+					return
+				}
 				secs := int(left.Seconds()) + 1
 				w.Header().Set("Retry-After", strconv.Itoa(secs))
 				log.Printf("[REQ %s] free-limit cooldown, %ds left, short-circuit", reqID, secs)
@@ -1116,18 +1164,29 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	// 传输层失败（建连即断，无响应字节）同请求重试一次：
 	// zen 经本地代理时对端 RST/EOF 是常态，重试一次多半就通；
 	// 写下游字节前判定，流/非流皆安全，且仅一次。
-	if err != nil && isTransportRetryable(err) {
+	if err != nil && isTransportRetryable(err) && !titleReq {
 		log.Printf("[REQ %s] transport error, retry once: %.150s", reqID, err.Error())
 		statsAddTransportRetry()
 		resp, err = doUpstream(upSes, upBody)
 	}
 	if err != nil {
+		if titleReq {
+			log.Printf("[REQ %s] title transport error, synthesized fallback: %.150s", reqID, err.Error())
+			writeSynthesizedTitle(w, model, stream, in)
+			return
+		}
 		evictIfNewFP()
 		writeErr(w, 502, "upstream_error", "upstream unreachable: "+err.Error())
 		return
 	}
 	// 池 session 401/403：原子轮换并同请求重试一次（新签 session，body 不变）。
 	if (resp.StatusCode == 401 || resp.StatusCode == 403) && usePool {
+		if titleReq {
+			resp.Body.Close()
+			log.Printf("[REQ %s] title upstream %d, synthesized fallback", reqID, resp.StatusCode)
+			writeSynthesizedTitle(w, model, stream, in)
+			return
+		}
 		resp.Body.Close()
 		log.Printf("[REQ %s] pooled session expired, rotate and retry once", reqID)
 		poolSes, _ = poolRotate(fp)
@@ -1144,6 +1203,13 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	// 旧逻辑对 429 一律透传且不换号，等于每次续聊都把毒 session 再喂一次，
 	// 复现“聊到一半整个网关全 429”。
 	if resp.StatusCode == 429 {
+		if titleReq {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			resp.Body.Close()
+			log.Printf("[REQ %s] title upstream 429, synthesized fallback", reqID)
+			writeSynthesizedTitle(w, model, stream, in)
+			return
+		}
 		// 429 分支会直接 return（换 session/记毒），不会走到下面的
 		// statsAddUpstream，所以必须在这里单独计数。
 		statsAddUp429()
@@ -1237,6 +1303,12 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	// （同 session 硬冲越冲越死），到这里说明轮换后仍非 200，不再重试。
 	// 注意：自愈分支的 400 重试若撞上 502/503，会落到这里再重试一次（最多 3 次上游调用）。
 	if resp.StatusCode == 502 || resp.StatusCode == 503 {
+		if titleReq {
+			resp.Body.Close()
+			log.Printf("[REQ %s] title upstream %d, synthesized fallback", reqID, resp.StatusCode)
+			writeSynthesizedTitle(w, model, stream, in)
+			return
+		}
 		log.Printf("[REQ %s] upstream %d flaky, backoff retry once", reqID, resp.StatusCode)
 		statsAddFlakyRetry()
 		resp.Body.Close()
@@ -1260,6 +1332,12 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	ir := newIdleTimeoutBody(resp.Body, streamIdle)
 	defer ir.Close()
 	if resp.StatusCode != 200 {
+		if titleReq {
+			_, _ = io.Copy(io.Discard, io.LimitReader(ir, 64<<10))
+			log.Printf("[REQ %s] title upstream %d, synthesized fallback", reqID, resp.StatusCode)
+			writeSynthesizedTitle(w, model, stream, in)
+			return
+		}
 		cbRecord(resp.StatusCode) // 只计 5xx；4xx（门禁/毒串）是请求问题，不熔断。
 		statsAddUpstream(resp.StatusCode)
 		evictIfNewFP()
@@ -1277,20 +1355,26 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	resetFreeLimitCooldown() // 通了：下一次免费额度 429 从基础冷却重新起算
 	cbRecord(200)            // 上游受理（流式以响应头 200 为准，中途截断不影响受理计数）。
 	if stream {
+		// 先还原 wire 工具名，再交给同格式透传或跨格式转换；转换函数因此
+		// 始终看到客户端声明的名字，Chat 分片名也在这里被完整重组。
+		var streamReader io.Reader = ir
+		if !reqRenames.Empty() {
+			streamReader = NewRenameStreamReader(ir, target, reqRenames)
+		}
 		// 同格式 responses 直传；跨格式走转换（DONE 语义由各转换函数保证）。
 		if entry == FmtResponses && target == FmtResponses {
-			pipeSSE(w, ir, reqID, model, ttfbMs)
+			pipeSSEFor(w, streamReader, reqID, model, ttfbMs, reqRenames, entry)
 			return
 		}
 		if entry == FmtChat && target == FmtResponses {
-			streamResponsesToChat(w, ir, model)
+			streamResponsesToChat(w, streamReader, model)
 			return
 		}
 		if entry == FmtResponses && target == FmtChat {
-			streamChatToResponses(w, ir, model)
+			streamChatToResponses(w, streamReader, model)
 			return
 		}
-		pipeSSE(w, ir, reqID, model, ttfbMs)
+		pipeSSEFor(w, streamReader, reqID, model, ttfbMs, reqRenames, entry)
 		return
 	}
 	// 上游恒为 SSE（buildBody 强制 stream:true）；客户端非流时聚合回 JSON。
@@ -1326,7 +1410,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	outBytes, _ := json.Marshal(out)
-	outBytes = restoreAliasNames(outBytes)
+	outBytes = restoreAliasNames(outBytes, reqRenames)
 	log.Printf("[REQ %s] non-stream done ttfbMs=%d ms=%d outBytes=%d",
 		reqID, ttfbMs, time.Since(reqStart).Milliseconds(), len(outBytes))
 	_, _ = w.Write(outBytes)
@@ -1367,7 +1451,19 @@ func stripCompletedToolsLine(line []byte) []byte {
 	return append(append([]byte("data: "), out...), '\n')
 }
 
-func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int64) {
+// chatFinishRe 匹配任何非 null 的 finish_reason（容忍空格）。
+// 正文里的同名字面量在 JSON 中是转义形态，不会命中。
+var chatFinishRe = regexp.MustCompile(`"finish_reason"\s*:\s*"[^"]*"`)
+
+// pipeSSE 保持既有签名（responses 直传语义），生产入口用 pipeSSEFor 指定协议。
+func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int64, renames *ToolRenames) {
+	pipeSSEFor(w, r, reqID, model, ttfbMs, renames, FmtResponses)
+}
+
+// pipeSSEFor 同格式流原样透传；entry 决定截断时的错误帧协议：
+// chat 入口发 chat.completion.chunk（含 choices 与 error.code），
+// responses 入口发规范的 response.failed。
+func pipeSSEFor(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int64, renames *ToolRenames, entry Format) {
 	start := time.Now()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1393,7 +1489,8 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int
 			t := strings.TrimSpace(ln)
 			if strings.HasPrefix(t, "event:") {
 				ev := strings.TrimSpace(strings.TrimPrefix(t, "event:"))
-				if ev == "response.completed" || ev == "response.incomplete" || ev == "response.failed" {
+				switch ev {
+				case "response.completed", "response.incomplete", "response.failed", "error":
 					sawTerminal = true
 				}
 			}
@@ -1406,9 +1503,13 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int
 				sawDone = true
 				sawTerminal = true
 			}
-			if strings.Contains(t, `"finish_reason":"stop"`) ||
-				strings.Contains(t, `"finish_reason":"tool_calls"`) ||
-				strings.Contains(t, `"finish_reason":"length"`) {
+			// 任何非 null 的 finish_reason 都是终态（含 content_filter 等）。
+			if chatFinishRe.MatchString(t) {
+				sawTerminal = true
+			}
+			// chat 协议的上游错误帧同样是终态：原样转发，不再追加第二帧。
+			if strings.HasPrefix(t, "data:") &&
+				(strings.Contains(t, `"type":"error"`) || strings.Contains(t, `"error":{`)) {
 				sawTerminal = true
 			}
 		}
@@ -1442,7 +1543,7 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int
 				if i < 0 {
 					break
 				}
-				emit(restoreAliasNames(stripCompletedToolsLine(pending[:i+1])))
+				emit(restoreAliasNames(stripCompletedToolsLine(pending[:i+1]), renames))
 				pending = pending[i+1:]
 				if downErr != nil {
 					break
@@ -1469,12 +1570,10 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int
 			break
 		}
 	}
-	timedOut := false
-	firstByte := false
-	if ib, ok := r.(*idleTimeoutBody); ok && ib.wasTimeout() {
-		timedOut = true
-		firstByte = ib.timedOutWaitingFirst()
-	}
+	// 超时分类走哨兵 error：reader 常被 renameStreamReader 包装，
+	// 具体类型断言会失效（带工具的真实请求几乎必中）。
+	timedOut := errors.Is(upErr, errUpstreamIdle) || errors.Is(upErr, errUpstreamFirstByte)
+	firstByte := errors.Is(upErr, errUpstreamFirstByte)
 	log.Printf("[REQ %s] stream end bytes=%d terminal=%v done=%v upErr=%v downErr=%v ttfbMs=%d ms=%d",
 		reqID, nBytes, sawTerminal, sawDone, upErr, downErr, ttfbMs, time.Since(start).Milliseconds())
 	if downErr != nil {
@@ -1500,11 +1599,27 @@ func pipeSSE(w http.ResponseWriter, r io.Reader, reqID, model string, ttfbMs int
 			} else {
 				msg, code = "upstream idle timeout", "upstream_timeout"
 			}
+		} else if upErr != nil {
+			msg += " (" + upErr.Error() + ")"
 		}
-		fb, _ := json.Marshal(map[string]any{"type": "response.failed",
-			"response": map[string]any{"id": reqID, "model": model, "status": "failed",
-				"error": map[string]any{"message": msg, "type": code, "code": code}}})
-		_, _ = io.WriteString(w, "event: response.failed\ndata: "+string(fb)+"\n\n")
+		if entry == FmtChat {
+			// chat 客户端只认 chat.completion.chunk：保留 choices 数组让 union
+			// 校验通过，error.code 供客户端判定可重试。
+			fb, _ := json.Marshal(map[string]any{
+				"id": newID("chatcmpl-"), "object": "chat.completion.chunk",
+				"created": time.Now().Unix(), "model": model, "choices": []any{},
+				"error": map[string]any{"message": msg, "type": "upstream_error", "code": code},
+			})
+			_, _ = io.WriteString(w, "data: "+string(fb)+"\n\n")
+		} else {
+			fb, _ := json.Marshal(map[string]any{"type": "response.failed",
+				"response": map[string]any{
+					"id": newID("resp_"), "object": "response", "created_at": time.Now().Unix(),
+					"model": model, "status": "failed", "output": []any{},
+					"usage": map[string]any{},
+					"error": map[string]any{"message": msg, "type": code, "code": code}}})
+			_, _ = io.WriteString(w, "event: response.failed\ndata: "+string(fb)+"\n\n")
+		}
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 		if fl != nil {
 			fl.Flush()
@@ -1584,9 +1699,9 @@ func main() {
 			runID = strings.TrimSpace(os.Getenv("GITHUB_RUN_ID"))
 		}
 		repo := strings.TrimSpace(os.Getenv("GITHUB_REPOSITORY"))
-		fmt.Fprintf(w, `{"status":"ok","mode":"direct","version":%q,"table_models":%d,"run_id":%q,"repo":%q,"started_at":%q,"uptime_sec":%d,"egress_ip":%q,"sidecar":%s,"stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"up429":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d}}`,
+		fmt.Fprintf(w, `{"status":"ok","mode":"direct","version":%q,"table_models":%d,"run_id":%q,"repo":%q,"started_at":%q,"uptime_sec":%d,"egress_ip":%q,"sidecar":%s,"stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"up429":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d,"last_ttfb_ms":%d,"ttfb_samples":%d}}`,
 			appVersion, tableModelCount(), runID, repo, processStart.UTC().Format(time.RFC3339), int(time.Since(processStart).Seconds()), egressIP(),
-			sidecar.statusJSON(), s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.Up429, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
+			sidecar.statusJSON(), s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.Up429, s.CircuitOpens, s.TTFBP50, s.TTFBP95, s.LastTTFBMs, s.Samples)
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != "GET" {

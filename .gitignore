@@ -21,3 +21,18 @@ gw.log
 state/
 logs/
 dist/
+
+# 排障期间的抓包/中继产物：请求体里含真实凭证与 session id，不入库
+captures/
+relay/
+_cap/
+/out/
+*.pcap
+*.pcapng
+
+# 网关落盘的上一次请求/响应快照（含真实 body）
+last_*_req.json
+last_*_resp.json
+last_*_body.json
+last_*Body.json
+last_*UpBody.json

@@ -218,7 +218,7 @@ func TestIdleTimeoutFires(t *testing.T) {
 func TestDoneQuotedMarkers(t *testing.T) {
 	// 正文含裸词 response.completed（前后无引号）但无终态帧：发 failed + DONE，不静默。
 	rec := httptest.NewRecorder()
-	pipeSSE(rec, strings.NewReader("data: {\"text\":\"see response.completed docs\"}\n\n"), "req_t1", "m", 0)
+	pipeSSE(rec, strings.NewReader("data: {\"text\":\"see response.completed docs\"}\n\n"), "req_t1", "m", 0, nil)
 	body := rec.Body.String()
 	if !strings.Contains(body, "response.failed") {
 		t.Fatalf("无终态应发 failed：%q", body)
@@ -231,7 +231,7 @@ func TestDoneQuotedMarkers(t *testing.T) {
 	}
 	// 真 JSON 终态补 DONE，且不发 failed。
 	rec2 := httptest.NewRecorder()
-	pipeSSE(rec2, strings.NewReader("data: {\"type\":\"response.completed\"}\n\n"), "req_t2", "m", 0)
+	pipeSSE(rec2, strings.NewReader("data: {\"type\":\"response.completed\"}\n\n"), "req_t2", "m", 0, nil)
 	if !strings.Contains(rec2.Body.String(), "[DONE]") {
 		t.Fatalf("真终态应补 DONE：%q", rec2.Body.String())
 	}
@@ -240,13 +240,13 @@ func TestDoneQuotedMarkers(t *testing.T) {
 	}
 	// 上游主形态 event: 行终态补 DONE。
 	rec3 := httptest.NewRecorder()
-	pipeSSE(rec3, strings.NewReader("event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"), "req_t3", "m", 0)
+	pipeSSE(rec3, strings.NewReader("event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"), "req_t3", "m", 0, nil)
 	if !strings.Contains(rec3.Body.String(), "[DONE]") {
 		t.Fatalf("event 行终态应补 DONE：%q", rec3.Body.String())
 	}
 	// 上游自带 data: DONE（无空格形态也认）：不重复。
 	rec4 := httptest.NewRecorder()
-	pipeSSE(rec4, strings.NewReader("event: response.completed\ndata: {\"x\":1}\n\ndata:[DONE]\n\n"), "req_t4", "m", 0)
+	pipeSSE(rec4, strings.NewReader("event: response.completed\ndata: {\"x\":1}\n\ndata:[DONE]\n\n"), "req_t4", "m", 0, nil)
 	if strings.Count(rec4.Body.String(), "[DONE]") != 1 {
 		t.Fatalf("DONE 应恰好一个：%q", rec4.Body.String())
 	}
@@ -420,7 +420,7 @@ func TestShortStr(t *testing.T) {
 
 func TestPipeSSEFailedHasCode(t *testing.T) {
 	rec := httptest.NewRecorder()
-	pipeSSE(rec, strings.NewReader("data: {\"a\":1}\n\n"), "req_fc", "mm", 0)
+	pipeSSE(rec, strings.NewReader("data: {\"a\":1}\n\n"), "req_fc", "mm", 0, nil)
 	if !strings.Contains(rec.Body.String(), `"code":"upstream_truncated"`) {
 		t.Fatalf("failed缺code: %q", rec.Body.String())
 	}
@@ -434,7 +434,7 @@ func TestPipeSSEIdleTimeoutMsg(t *testing.T) {
 	defer ir.Close()
 	defer pw.Close()
 	rec := httptest.NewRecorder()
-	pipeSSE(rec, ir, "req_to", "mm", 0)
+	pipeSSE(rec, ir, "req_to", "mm", 0, nil)
 	if !strings.Contains(rec.Body.String(), "upstream first byte timeout") {
 		t.Fatalf("无字节 stall 应报首字节超时：%q", rec.Body.String())
 	}
@@ -449,7 +449,7 @@ func TestPipeSSEIdleTimeoutMsg(t *testing.T) {
 		time.Sleep(2 * time.Second)
 	}()
 	rec2 := httptest.NewRecorder()
-	pipeSSE(rec2, ir2, "req_to2", "mm", 0)
+	pipeSSE(rec2, ir2, "req_to2", "mm", 0, nil)
 	if !strings.Contains(rec2.Body.String(), "upstream idle timeout") {
 		t.Fatalf("中途 stall 应报间隔超时：%q", rec2.Body.String())
 	}
@@ -537,7 +537,7 @@ func TestPipeSSEFarTerminal(t *testing.T) {
 	pad := strings.Repeat("x", 9000)
 	body := "data: {\"type\":\"response.completed\"}\n\ndata: {\"pad\":\"" + pad + "\"}\n\n"
 	rec := httptest.NewRecorder()
-	pipeSSE(rec, strings.NewReader(body), "req_far", "mm", 0)
+	pipeSSE(rec, strings.NewReader(body), "req_far", "mm", 0, nil)
 	out := rec.Body.String()
 	if strings.Contains(out, "response.failed") {
 		t.Fatalf("远端标记不得误报 failed: %.200s", out)
@@ -602,7 +602,7 @@ func TestTransportRetryOnce(t *testing.T) {
 func TestPipeSSESwallowsPartial(t *testing.T) {
 	rec := httptest.NewRecorder()
 	// 半截行：无换行结尾、无终态 → 下游不得见到半截 data:，只见 failed+DONE。
-	pipeSSE(rec, strings.NewReader("data: {\"type\":\"response.output_text.del"), "req_part", "m", 0)
+	pipeSSE(rec, strings.NewReader("data: {\"type\":\"response.output_text.del"), "req_part", "m", 0, nil)
 	body := rec.Body.String()
 	if strings.Contains(body, "output_text.del") {
 		t.Fatalf("半截行被透传下游: %.200s", body)

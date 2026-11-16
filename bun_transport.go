@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -60,6 +61,13 @@ type bunConn struct {
 	key   string
 	br    *bufio.Reader
 	timer *time.Timer
+}
+
+// bunConnTiming 记录取连接各阶段耗时；复用池连接时 dial/handshake 为 0。
+type bunConnTiming struct {
+	reused    bool
+	dial      time.Duration
+	handshake time.Duration
 }
 
 // newBunTransport 构造传输层。proxy 为 nil 时直连；responseTimeout 是
@@ -114,16 +122,23 @@ func (t *bunTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	key := u.Scheme + "://" + addr
 
 	for attempt := 0; ; attempt++ {
-		conn, reused, err := t.conn(req.Context(), key, addr, u.Hostname(), u.Scheme)
+		connStart := time.Now()
+		conn, timing, err := t.conn(req.Context(), key, addr, u.Hostname(), u.Scheme)
 		if err != nil {
 			return nil, err
 		}
+		exchangeStart := time.Now()
 		resp, dropped, err := t.exchange(req, conn, head, body, addedEncoding)
 		if err == nil {
+			if diagOn() {
+				log.Printf("[TIMING] host=%s attempt=%d reused=%v dial_ms=%d handshake_ms=%d first_byte_ms=%d total_ms=%d",
+					u.Hostname(), attempt, timing.reused, timing.dial.Milliseconds(), timing.handshake.Milliseconds(),
+					time.Since(exchangeStart).Milliseconds(), time.Since(connStart).Milliseconds())
+			}
 			return resp, nil
 		}
 		// 池里捞出来的连接可能已被服务端悄悄关掉：没读到任何响应字节时换新连接重试一次。
-		if reused && dropped && attempt == 0 && req.Context().Err() == nil {
+		if timing.reused && dropped && attempt == 0 && req.Context().Err() == nil {
 			continue
 		}
 		return nil, err
@@ -155,30 +170,35 @@ func bunReadBody(req *http.Request) ([]byte, error) {
 }
 
 // conn 取一条连接：优先复用池里的，否则新建（必要时先过代理，再做 uTLS 握手）。
-func (t *bunTransport) conn(ctx context.Context, key, addr, serverName, scheme string) (*bunConn, bool, error) {
+func (t *bunTransport) conn(ctx context.Context, key, addr, serverName, scheme string) (*bunConn, bunConnTiming, error) {
 	if c := t.takeIdle(key); c != nil {
-		return c, true, nil
+		return c, bunConnTiming{reused: true}, nil
 	}
+	var timing bunConnTiming
+	dialStart := time.Now()
 	raw, err := t.dial(ctx, addr)
+	timing.dial = time.Since(dialStart)
 	if err != nil {
-		return nil, false, err
+		return nil, timing, err
 	}
 	if scheme == "https" {
 		tlsConn := utls.UClient(raw, &utls.Config{ServerName: serverName}, utls.HelloCustom)
 		if err := tlsConn.ApplyPreset(bunHello()); err != nil {
 			raw.Close()
-			return nil, false, err
+			return nil, timing, err
 		}
 		hsCtx, cancel := context.WithTimeout(ctx, bunHandshakeTimeout)
+		hsStart := time.Now()
 		err = tlsConn.HandshakeContext(hsCtx)
+		timing.handshake = time.Since(hsStart)
 		cancel()
 		if err != nil {
 			raw.Close()
-			return nil, false, err
+			return nil, timing, err
 		}
 		raw = tlsConn
 	}
-	return &bunConn{Conn: raw, key: key, br: bufio.NewReader(raw)}, false, nil
+	return &bunConn{Conn: raw, key: key, br: bufio.NewReader(raw)}, timing, nil
 }
 
 // dial 建立到 addr 的 TCP 连接，按需穿过代理。

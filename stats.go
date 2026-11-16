@@ -17,8 +17,20 @@ var diagEnabled = os.Getenv("DIRECT_DIAG") != "0"
 func diagOn() bool { return diagEnabled }
 
 // stats.go: 被动观测——网关自身就是探针，不打 synthetic 流量。
-// 每请求几次原子加法 + 首字节釆样（环形 cap 256）；每 5 分钟一行 [STATS]，
+// 每请求几次原子加法 + 首字节采样（环形 cap 256，带时间戳）；p50/p95 只统计
+// 最近 5 分钟内样本，旧样本自然过期；每 5 分钟一行 [STATS]，
 // /health 同口径暴露累计值。测试直接调 record/snapshot，无需等 ticker。
+const (
+	ttfbWindow  = 5 * time.Minute
+	ttfbRingCap = 256
+)
+
+// ttfbSample 是一条首字节观测；时间戳用于 5 分钟滚动窗口淘汰。
+type ttfbSample struct {
+	ms int64
+	at time.Time
+}
+
 type statsKeeper struct {
 	mu             sync.Mutex
 	reqs           uint64
@@ -28,8 +40,11 @@ type statsKeeper struct {
 	up4xx          uint64
 	up429          uint64
 	circuitOpens   uint64
-	ttfb           []int64
+	ttfb           []ttfbSample
 }
+
+// statsClock 让单测可以注入时间，避免真等 5 分钟。
+var statsClock = time.Now
 
 var stats = &statsKeeper{}
 
@@ -74,11 +89,16 @@ func statsAddCircuitOpen() {
 }
 
 func statsAddTTFB(ms int64) {
+	statsAddTTFBAt(ms, statsClock())
+}
+
+// statsAddTTFBAt 记录一条带时间戳的首字节样本；只保留最近 ttfbRingCap 条。
+func statsAddTTFBAt(ms int64, at time.Time) {
 	stats.mu.Lock()
 	defer stats.mu.Unlock()
-	stats.ttfb = append(stats.ttfb, ms)
-	if len(stats.ttfb) > 256 {
-		stats.ttfb = stats.ttfb[len(stats.ttfb)-256:]
+	stats.ttfb = append(stats.ttfb, ttfbSample{ms: ms, at: at})
+	if len(stats.ttfb) > ttfbRingCap {
+		stats.ttfb = stats.ttfb[len(stats.ttfb)-ttfbRingCap:]
 	}
 }
 
@@ -86,6 +106,8 @@ type statsSnap struct {
 	Reqs, TransportRetry, FlakyRetry  uint64
 	Up5xx, Up4xx, Up429, CircuitOpens uint64
 	TTFBP50, TTFBP95                  int64
+	LastTTFBMs                        int64
+	Samples                           int
 }
 
 func statsSnapshot() statsSnap {
@@ -96,11 +118,21 @@ func statsSnapshot() statsSnap {
 		FlakyRetry: stats.flakyRetry, Up5xx: stats.up5xx,
 		Up4xx: stats.up4xx, Up429: stats.up429, CircuitOpens: stats.circuitOpens,
 	}
-	if len(stats.ttfb) > 0 {
-		cp := append([]int64{}, stats.ttfb...)
-		sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
-		s.TTFBP50 = cp[len(cp)/2]
-		s.TTFBP95 = cp[len(cp)*95/100]
+	if n := len(stats.ttfb); n > 0 {
+		s.LastTTFBMs = stats.ttfb[n-1].ms
+	}
+	now := statsClock()
+	window := make([]int64, 0, len(stats.ttfb))
+	for _, smp := range stats.ttfb {
+		if now.Sub(smp.at) <= ttfbWindow {
+			window = append(window, smp.ms)
+		}
+	}
+	s.Samples = len(window)
+	if len(window) > 0 {
+		sort.Slice(window, func(i, j int) bool { return window[i] < window[j] })
+		s.TTFBP50 = window[len(window)/2]
+		s.TTFBP95 = window[len(window)*95/100]
 	}
 	return s
 }
@@ -120,7 +152,7 @@ func statsReporter(d time.Duration) {
 	defer t.Stop()
 	for range t.C {
 		s := statsSnapshot()
-		log.Printf("[STATS] window=5m reqs=%d transport_retry=%d flaky_retry=%d up5xx=%d up4xx=%d up429=%d circuit_open=%d ttfb_p50=%dms p95=%dms",
-			s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.Up429, s.CircuitOpens, s.TTFBP50, s.TTFBP95)
+		log.Printf("[STATS] window=5m reqs=%d transport_retry=%d flaky_retry=%d up5xx=%d up4xx=%d up429=%d circuit_open=%d ttfb_p50=%dms p95=%dms last=%dms samples=%d",
+			s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.Up429, s.CircuitOpens, s.TTFBP50, s.TTFBP95, s.LastTTFBMs, s.Samples)
 	}
 }

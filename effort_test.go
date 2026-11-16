@@ -38,7 +38,7 @@ func TestNormalizeReasoningEffort(t *testing.T) {
 // 缺 reasoning 键时不动（沿用上游默认，不改模型行为）。
 func TestBuildUpstreamNormalizesResponsesEffort(t *testing.T) {
 	in := mustJSON(t, `{"model":"m","input":[],"reasoning":{"effort":"none"}}`)
-	out, err := buildUpstream(FmtResponses, FmtResponses, in)
+	out, _, err := buildUpstream(FmtResponses, FmtResponses, in)
 	if err != nil {
 		t.Fatalf("buildUpstream: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestBuildUpstreamNormalizesResponsesEffort(t *testing.T) {
 		t.Fatalf("none 应归一 high，得 %s", got)
 	}
 	in2 := mustJSON(t, `{"model":"m","input":[]}`)
-	out2, err := buildUpstream(FmtResponses, FmtResponses, in2)
+	out2, _, err := buildUpstream(FmtResponses, FmtResponses, in2)
 	if err != nil {
 		t.Fatalf("buildUpstream2: %v", err)
 	}

@@ -1,7 +1,7 @@
 // table.go: 模型 -> 所需上游格式映射。
 //
-// 数据来源：opencode 官网 zen 文档（opencode.ai/docs/zen），源文件位于
-// anomalyco/opencode@dev:packages/web/src/content/docs/zen.mdx。
+// 数据来源：opencode 官方模型表（opencode.ai/docs/zen），源文件位于
+// anomalyco/opencode@dev:services/www/src/docs/content/console/models.mdx。
 // 网关启动时抓取该 raw 文件解析 Endpoints 表格，失败则用内置快照兜底。
 // 覆盖方式：环境变量 ZEN_TABLE_URL 换地址，ZEN_TABLE_REFRESH=0 关闭刷新。
 package main
@@ -71,6 +71,9 @@ func seedBuiltinTable() {
 		// longcat-2.5-preview-free：实测仅 /chat（全套头+桩+none 才过门禁），
 		// /responses 与 /messages 均为上游 500。
 		"longcat-2.5-preview-free",
+		// 2026-11 新增 stealth free 模型，官方表端点为 /inference/openai/v1/chat/completions。
+		// 内置快照必须兜住，否则旧刷新地址 404 时会按未知模型错误地走 /responses。
+		"pulse-alpha-free", "crouton-alpha-free",
 	}
 	gemini := []string{
 		"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",

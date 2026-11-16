@@ -102,12 +102,12 @@ func TestHoistChatToolImagesRejectsBadDataURI(t *testing.T) {
 }
 
 func TestBuildUpstreamHoistsChatToolImage(t *testing.T) {
-	in := mustJSON(t, `{"model":"m","messages":[
+	in := mustJSON(t, `{"model":"m","tools":[{"type":"function","function":{"name":"f","description":"","parameters":{"type":"object"}}}],"messages":[
 		{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
 		{"role":"tool","tool_call_id":"c1","content":[
 			{"type":"text","text":"shot"},
 			{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`)
-	out, err := buildUpstream(FmtChat, FmtChat, in)
+	out, _, err := buildUpstream(FmtChat, FmtChat, in)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -94,6 +94,13 @@ func headerTimeout() time.Duration {
 	return 120 * time.Second
 }
 
+// 上游读取超时哨兵：调用方用 errors.Is 分类，不依赖 reader 的具体类型
+// （reader 常被 renameStreamReader 等包装，类型断言会失效）。
+var (
+	errUpstreamIdle      = errors.New("upstream idle timeout")
+	errUpstreamFirstByte = errors.New("upstream first byte timeout")
+)
+
 func newIdleTimeoutBody(rc io.ReadCloser, idle time.Duration) *idleTimeoutBody {
 	b := &idleTimeoutBody{rc: rc, idle: idle, first: firstByteTimeout()}
 	wait := b.first
@@ -136,9 +143,9 @@ func (b *idleTimeoutBody) Read(p []byte) (int, error) {
 	defer b.mu.Unlock()
 	if b.timedOut {
 		if b.gotFirst {
-			return 0, errors.New("upstream idle timeout")
+			return 0, errUpstreamIdle
 		}
-		return 0, errors.New("upstream first byte timeout")
+		return 0, errUpstreamFirstByte
 	}
 	if b.closed {
 		return n, err
@@ -170,7 +177,8 @@ func (b *idleTimeoutBody) Close() error {
 }
 
 // wasTimeout 上游是否因包体空闲超时被掐断（供 pipeSSE 定 failed 文案）。
-func (b *idleTimeoutBody) wasTimeout() bool {	b.mu.Lock()
+func (b *idleTimeoutBody) wasTimeout() bool {
+	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.timedOut
 }
@@ -204,22 +212,48 @@ func isSSEvent(t string) bool {
 		strings.HasPrefix(t, "response.") || t == "ping" || t == "error"
 }
 
-// emitAnthropicError / emitChatError / emitResponsesFailed：P1a-2 终态 error，
+// emitAnthropicError / emitChatError / emitResponsesFailed*：P1a-2 终态 error，
 // 发完后调用方必须置 finished 终态位，禁止再补成功尾。
+// chat 错误帧保留 choices 数组：多数客户端（含双协议 union 校验）先按
+// chat.completion.chunk 校验，缺 choices 会报 schema 错、掩盖真实错误码；
+// error.code 供客户端判定可重试性。
 func (s *sseSink) emitAnthropicError(msg string) {
 	s.emit(map[string]any{"type": "error",
 		"error": map[string]any{"type": "api_error", "message": msg}})
 }
 
-func (s *sseSink) emitChatError(msg string) {
-	s.emit(map[string]any{"error": map[string]any{"message": msg, "type": "stream_error"}})
+func (s *sseSink) emitChatError(model, msg, code string) {
+	if code == "" {
+		code = "upstream_truncated"
+	}
+	s.emit(map[string]any{
+		"id": newID("chatcmpl-"), "object": "chat.completion.chunk",
+		"created": time.Now().Unix(), "model": model, "choices": []any{},
+		"error": map[string]any{"message": msg, "type": "upstream_error", "code": code},
+	})
 	s.done()
 }
 
 func (s *sseSink) emitResponsesFailed(id, model, msg string) {
+	s.emitResponsesFailedDetail(id, model, msg, "upstream_truncated", nil)
+}
+
+// emitResponsesFailedDetail 发规范形态的 response.failed：补齐 object/
+// created_at/output/usage 与 error.code，严格 schema 客户端也能解析。
+func (s *sseSink) emitResponsesFailedDetail(id, model, msg, code string, output []any) {
+	if output == nil {
+		output = []any{}
+	}
+	if code == "" {
+		code = "upstream_truncated"
+	}
 	s.emit(map[string]any{"type": "response.failed",
-		"response": map[string]any{"id": id, "model": model, "status": "failed",
-			"error": map[string]any{"message": msg, "type": "upstream_error"}}})
+		"response": map[string]any{
+			"id": id, "object": "response", "created_at": time.Now().Unix(),
+			"model": model, "status": "failed", "output": output,
+			"usage": map[string]any{},
+			"error": map[string]any{"message": msg, "type": code, "code": code},
+		}})
 	s.done()
 }
 
@@ -236,7 +270,23 @@ func (s *sseSink) done() {
 // 天然容忍 UTF-8 跨包与 \r\n；块内多 data: 行按规范 join("\n")；
 // 单块 16MB 上限防 OOM。chat/responses 只有 data 行；anthropic 有 event+data 对。
 // handler(event, data)：event 对 chat/responses 为 ""，anthropic 为事件名；data=="[DONE]" 表结束。
-func pumpSSE(r io.Reader, handler func(event, data string)) {
+// classifyUpstreamEnd 把读取错误归一成 (message, code)：
+// 空闲/首字节超时与真截断必须可区分，客户端据此决定是否重试。
+func classifyUpstreamEnd(err error) (string, string) {
+	switch {
+	case errors.Is(err, errUpstreamIdle):
+		return "upstream idle timeout", "upstream_timeout"
+	case errors.Is(err, errUpstreamFirstByte):
+		return "upstream first byte timeout", "upstream_first_byte_timeout"
+	}
+	msg := "upstream stream ended without terminal event"
+	if err != nil && !errors.Is(err, io.EOF) {
+		msg += " (" + err.Error() + ")"
+	}
+	return msg, "upstream_truncated"
+}
+
+func pumpSSE(r io.Reader, handler func(event, data string)) error {
 	var buf []byte
 	var pend []byte // 上一块尾部悬空的 \r（\r\n 被读边界切开时）
 	tmp := make([]byte, 32*1024)
@@ -276,7 +326,7 @@ func pumpSSE(r io.Reader, handler func(event, data string)) {
 			buf = append(buf, pend...)
 			pend = nil
 			flush(true)
-			return
+			return err
 		}
 	}
 }
@@ -382,16 +432,7 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 	sawFinish := false // 是否见过上游终态（finish_reason 或 [DONE] 前的完成）
 	hasOutput := false // 是否有实质输出（文本/tool/usage）
 
-	flushCompleted := func(finish string) {
-		if finished {
-			return
-		}
-		finished = true
-		// P2b-7：上游宣称工具调用却零 tool 增量 → failed，不撒谎报 completed。
-		if (finish == "tool_calls" || finish == "function_call") && len(order) == 0 {
-			sink.emitResponsesFailed(respID, model, "upstream tool call dropped")
-			return
-		}
+	buildOutput := func() []any {
 		var output []any
 		if t := text.String(); t != "" {
 			output = append(output, map[string]any{"type": "message", "role": "assistant",
@@ -410,6 +451,20 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 		if output == nil {
 			output = []any{}
 		}
+		return output
+	}
+
+	flushCompleted := func(finish string) {
+		if finished {
+			return
+		}
+		finished = true
+		// P2b-7：上游宣称工具调用却零 tool 增量 → failed，不撒谎报 completed。
+		if (finish == "tool_calls" || finish == "function_call") && len(order) == 0 {
+			sink.emitResponsesFailedDetail(respID, model, "upstream tool call dropped", "upstream_tool_dropped", nil)
+			return
+		}
+		output := buildOutput()
 		status := "completed"
 		if finish == "length" {
 			status = "incomplete"
@@ -421,12 +476,13 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 		sink.emit(ev)
 	}
 
-	pumpSSE(r, func(_, data string) {
+	readErr := pumpSSE(r, func(_, data string) {
 		if data == "[DONE]" {
 			// P1a-2：裸 [DONE] 且无终态无输出 → failed。
 			if !sawFinish && !hasOutput && !finished {
 				finished = true
-				sink.emitResponsesFailed(respID, model, "upstream closed without terminal event")
+				msg, code := classifyUpstreamEnd(nil)
+				sink.emitResponsesFailedDetail(respID, model, msg, code, nil)
 				return
 			}
 			flushCompleted("stop")
@@ -435,6 +491,22 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 		}
 		chunk := parseSSEData(data)
 		if chunk == nil {
+			return
+		}
+		// chat 上游自带的错误帧：转发原始错误（含 message/code），
+		// 不要覆盖成 truncated。
+		if asStr(chunk["type"]) == "error" {
+			finished = true
+			msg, code := "upstream error", "upstream_error"
+			if e := asMap(chunk["error"]); len(e) > 0 {
+				if m := getStr(e, "message"); m != "" {
+					msg = m
+				}
+				if c := getStr(e, "code"); c != "" {
+					code = c
+				}
+			}
+			sink.emitResponsesFailedDetail(respID, model, msg, code, buildOutput())
 			return
 		}
 		if u, ok := chunk["usage"].(map[string]any); ok && len(u) > 0 {
@@ -516,11 +588,12 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 		}
 	})
 	if !finished {
-		// P1a-2：EOF 无终态。见过 finish 按 stop 收尾；有实质输出按成功收尾；
-		// 零输出直接 failed，不伪造 completed。
-		if !sawFinish && !hasOutput {
+		// 无终态 EOF：见过 finish 才是正常收尾；否则绝不伪造 completed
+		//（带已生成部分内容发 failed，客户端可重试且不丢已有文本）。
+		if !sawFinish {
 			finished = true
-			sink.emitResponsesFailed(respID, model, "upstream closed without terminal event")
+			msg, code := classifyUpstreamEnd(readErr)
+			sink.emitResponsesFailedDetail(respID, model, msg, code, buildOutput())
 			return
 		}
 		flushCompleted("stop")
@@ -549,6 +622,8 @@ func streamResponsesToChat(w http.ResponseWriter, r io.Reader, model string) {
 	incomplete := false  // 上游是否为 response.incomplete（截断）
 	failed := false      // 上游是否为 response.failed
 	hasOutput := false   // 是否有实质输出
+	failMsg := "upstream response.failed"
+	failCode := "upstream_failed"
 
 	finish := func() {
 		if finished {
@@ -556,7 +631,7 @@ func streamResponsesToChat(w http.ResponseWriter, r io.Reader, model string) {
 		}
 		finished = true
 		if failed {
-			sink.emitChatError("upstream response.failed")
+			sink.emitChatError(model, failMsg, failCode)
 			return
 		}
 		// P1a-3：截断走 length，不再一律 stop（finishFromResponsesStatus）。
@@ -573,11 +648,12 @@ func streamResponsesToChat(w http.ResponseWriter, r io.Reader, model string) {
 		sink.done()
 	}
 
-	pumpSSE(r, func(_, data string) {
+	readErr := pumpSSE(r, func(_, data string) {
 		if data == "[DONE]" {
 			// P1a-2：裸 [DONE] 且无终态无输出 → error。
 			if !sawTerminal && !hasOutput {
 				failed = true
+				failMsg, failCode = classifyUpstreamEnd(nil)
 			}
 			finish()
 			return
@@ -659,12 +735,23 @@ func streamResponsesToChat(w http.ResponseWriter, r io.Reader, model string) {
 			// P1a-2：上游失败转 error 事件，禁止补成功尾。
 			sawTerminal = true
 			failed = true
+			if resp := asMap(ev["response"]); resp != nil {
+				if e := asMap(resp["error"]); e != nil {
+					if m := getStr(e, "message"); m != "" {
+						failMsg = m
+					}
+					if c := getStr(e, "code"); c != "" {
+						failCode = c
+					}
+				}
+			}
 			finish()
 		}
 	})
-	// P1a-2：EOF 无终态。零输出直接 error；有输出按已见状态收尾。
-	if !sawTerminal && !hasOutput {
+	// 无终态 EOF：即使已有一点输出也按失败收尾，不伪造 stop。
+	if !sawTerminal && !finished {
 		failed = true
+		failMsg, failCode = classifyUpstreamEnd(readErr)
 	}
 	finish()
 }
@@ -869,7 +956,7 @@ func streamMessagesToChat(w http.ResponseWriter, r io.Reader, model string) {
 		finished = true
 		// P1a-2：EOF 无终态且零输出 → error，不伪造 stop。
 		if finish == "" && !hasOutput {
-			sink.emitChatError("upstream closed without terminal event")
+			sink.emitChatError(model, "upstream closed without terminal event", "upstream_truncated")
 			return
 		}
 		last := chatChunk(chatID, model, map[string]any{}, finishFromAnthropicStop(finish, len(toolIdx) > 0))

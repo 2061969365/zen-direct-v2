@@ -68,12 +68,41 @@ func TestParseEndpointsTable(t *testing.T) {
 	}
 }
 
+const sampleInferenceEndpointsMD = `## Endpoints
+
+| Model | Model ID | Endpoint | AI SDK Package |
+| ----- | -------- | -------- | -------------- |
+| Pulse Alpha Free | pulse-alpha-free | ` + "`https://opencode.ai/inference/openai/v1/chat/completions`" + ` | @ai-sdk/openai-compatible |
+| Crouton Alpha Free | crouton-alpha-free | ` + "`https://opencode.ai/inference/openai/v1/chat/completions`" + ` | @ai-sdk/openai-compatible |
+`
+
+func TestParseInferenceEndpointsTable(t *testing.T) {
+	formats, _ := parseEndpointsTable(sampleInferenceEndpointsMD)
+
+	for _, id := range []string{"pulse-alpha-free", "crouton-alpha-free"} {
+		if formats[id] != FmtChat {
+			t.Errorf("%s: got %q want %q", id, formats[id], FmtChat)
+		}
+	}
+}
+
+func TestBuiltinAlphaFreeModelsUseChat(t *testing.T) {
+	seedBuiltinTable()
+	for _, id := range []string{"pulse-alpha-free", "crouton-alpha-free"} {
+		if f, ok := lookupFormat(id); !ok || f != FmtChat {
+			t.Errorf("%s: got %q,%v want %q,true", id, f, ok, FmtChat)
+		}
+	}
+}
+
 func TestEndpointToFormat(t *testing.T) {
 	cases := map[string]Format{
-		"https://opencode.ai/zen/v1/responses":        FmtResponses,
-		"https://opencode.ai/zen/v1/chat/completions": FmtChat,
-		"https://opencode.ai/zen/v1/messages":         FmtMessages,
-		"https://opencode.ai/zen/v1/models/gemini-3x": FmtGemini,
+		"https://opencode.ai/zen/v1/responses":                     FmtResponses,
+		"https://opencode.ai/zen/v1/chat/completions":              FmtChat,
+		"https://opencode.ai/zen/v1/messages":                      FmtMessages,
+		"https://opencode.ai/zen/v1/models/gemini-3x":              FmtGemini,
+		"https://opencode.ai/inference/openai/v1/chat/completions": FmtChat,
+		"https://opencode.ai/inference/openai/v1/responses":        FmtResponses,
 	}
 	for ep, want := range cases {
 		if f, ok := endpointToFormat(ep); !ok || f != want {

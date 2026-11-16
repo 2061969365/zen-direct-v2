@@ -21,9 +21,15 @@ type opencodeToolDefinition struct {
 	Parameters  map[string]any `json:"parameters"`
 }
 
+// v2OfficialToolOrder 是官方 CLI 声明的工具名全集。
+//
+// experimental_image_generate 来自 2026-11-16 抓到的官方 CLI 2.2.5 实际出站
+// （13 个工具，含它）。官方会按配置增减工具，这里做的是"已知官方名"集合，
+// 供 allOfficialToolNames 判断"这份 tools 是不是官方原样"。
 var v2OfficialToolOrder = []string{
 	"edit", "execute", "glob", "grep", "question", "read", "shell",
 	"skill", "subagent", "webfetch", "websearch", "write", "patch",
+	"experimental_image_generate",
 }
 
 // 客户端工具一个不裁，官方集整份拼在后面。
@@ -65,7 +71,6 @@ func describeDroppedTools(dropped []map[string]any, protocol Format) string {
 	}
 	return strings.Join(names, ",")
 }
-
 
 var (
 	opencodeToolsOnce sync.Once
@@ -805,6 +810,17 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 		ranked = append(ranked, entry)
 	}
 	official := officialToolset(protocol)
+	// 客户端已经自带官方工具集（官方 CLI / 官方 SDK 就是这种形态）时，
+	// 整份原样透传：不改名、不追加、不脱敏描述。
+	//
+	// 为什么必须这样：官方 CLI 发出的 tools 名称就是 edit/read/shell…，
+	// 上游按“工具名集合是否官方原样”判定客户端身份。把它们改名成
+	// clint_<digest> 再补一份官方集，出站变成 26 个工具、顺序也与原版不同，
+	// 实测同一份 body 从 200 直接掉到 429 FreeUsageLimitError；不整形则 200，
+	// 且 upBytes 与原请求字节数一致。
+	if len(ranked) > 0 && allOfficialToolNames(ranked, protocol) {
+		return renames, false
+	}
 	for _, entry := range ranked {
 		name := entryToolName(entry, protocol)
 		declaredNames = append(declaredNames, name)
@@ -833,8 +849,12 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 		}
 		shaped = append(shaped, entry)
 	}
-	// 官方集整份拼在客户端工具之后——与 opencode2api v1.4.7 的
-	// renameAndCompleteTools 同形。上游不校验数组长度，见文件头实测记录。
+	// 第三方客户端工具重命名并脱敏后，若缺官方名则补上官方集。
+	//
+	// 上游的判定是“工具名集合是否为官方原样”，所以补官方集本身就是给
+	// 第三方工具打通行证。2026-11-16 实测：只发一个官方名 read（描述/参数
+	// 自定义）即可 200，非官方名 pwsh 一律 429——放行的不是描述，是名字集合。
+	// 这里保留补集行为，让非官方客户端仍能被上游接受。
 	shaped = append(shaped, official...)
 	payload["tools"] = shaped
 	if protocol == FmtChat || protocol == FmtResponses {
@@ -947,4 +967,24 @@ func RenameResponseTool(line []byte, renames *ToolRenames) []byte {
 		}
 		return bytes.Replace(match, sub[1], []byte(client), 1)
 	})
+}
+
+// allOfficialToolNames 判断客户端 tools 是否全部使用官方工具名。
+//
+// 判定只做“全命中”，不做“齐全”：官方 CLI 允许按需隐藏部分工具
+// （如 experimental_image_generate、patch 是否出现取决于配置），
+// 只要声明的每一个名字都在官方集合里，就说明这是官方工具集形态，
+// 应当原样透传，而不是当成第三方工具去改名。
+func allOfficialToolNames(ranked []map[string]any, protocol Format) bool {
+	if len(ranked) == 0 {
+		return false
+	}
+	set := officialToolNameSet()
+	for _, entry := range ranked {
+		name := entryToolName(entry, protocol)
+		if name == "" || !set[name] {
+			return false
+		}
+	}
+	return true
 }

@@ -137,12 +137,16 @@ func TestSanitizeToolDescriptionRewritesPhrases(t *testing.T) {
 
 // 整形后的出站请求体里不能残留封禁短语。这条直接钉住 DSH 429 的回归：
 // 真实 43 工具请求体在修复前稳定 429，清理 read/edit/write/skill 后转 200。
+//
+// 注意工具名用非官方名（dsh_read…）：官方工具名现在走“原样透传”分支，
+// 描述按官方原文出站、不做脱敏（见 renameAndCompleteTools 的说明），
+// 这条用例要覆盖的是第三方客户端工具那条路径。
 func TestOutboundHasNoBannedPhrases(t *testing.T) {
 	tools := []any{
-		chatTool("read", "Read a UTF-8 text file and return line-numbered content."),
-		chatTool("edit", "Edit an existing UTF-8 text file by replacing literal text."),
-		chatTool("write", "Create or fully replace a UTF-8 text file."),
-		chatTool("skill", "Load the full instructions for a skill in the session skill catalog."),
+		chatTool("dsh_read", "Read a UTF-8 text file and return line-numbered content."),
+		chatTool("dsh_edit", "Edit an existing UTF-8 text file by replacing literal text."),
+		chatTool("dsh_write", "Create or fully replace a UTF-8 text file."),
+		chatTool("dsh_skill", "Load the full instructions for a skill in the session skill catalog."),
 		chatTool("grep", "Search file contents using regular expression syntax."),
 	}
 	payload := map[string]any{

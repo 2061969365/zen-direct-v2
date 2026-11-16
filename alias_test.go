@@ -105,8 +105,10 @@ func TestAliasRequestMappingChat(t *testing.T) {
 // 端到端（mock 上游）：harness 碰撞名进 → 别名上游；上游别名调用回 → 原名下游。
 func TestAliasEndToEnd(t *testing.T) {
 	resetPoolForTest()
-	withMockUpstream(t, "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"resp_fc1\",\"call_id\":\"call_9\",\"name\":\"zd_edit\",\"arguments\":\"{}\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r9\",\"status\":\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n")
-	body := `{"model":"m","stream":true,"input":[{"role":"user","content":"hi"}],"tools":[{"type":"function","name":"edit","description":"d","parameters":{"type":"object"}}]}`
+	// mock 上游回传的必须是真实 wire 名（clint_<digest>），下游才应还原成 myedit。
+	wire := ClientToolWireName("myedit", nil)
+	withMockUpstream(t, "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"resp_fc1\",\"call_id\":\"call_9\",\"name\":\""+wire+"\",\"arguments\":\"{}\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r9\",\"status\":\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n")
+	body := `{"model":"m","stream":true,"input":[{"role":"user","content":"hi"}],"tools":[{"type":"function","name":"myedit","description":"d","parameters":{"type":"object"}}]}`
 	code, out := postResponses(t, "http://x", body)
 	if code != 200 {
 		t.Fatalf("http=%d body=%.200s", code, out)
@@ -120,11 +122,18 @@ func TestAliasEndToEnd(t *testing.T) {
 	for _, raw := range asArr(up["tools"]) {
 		names[asStr(asMap(raw)["name"])] = true
 	}
-	editWire := ClientToolWireName("edit", nil)
-	if !names[editWire] || !names["edit"] {
+	// 客户端工具（myedit，非官方名）应改名成 clint_<digest>，官方集同时在场。
+	var editWire string
+	for n := range names {
+		if strings.HasPrefix(n, ClientToolPrefix) {
+			editWire = n
+		}
+	}
+	// edit 是官方名，走原样透传那一支，必须仍在。
+	if editWire == "" || !names["edit"] {
 		t.Fatalf("上游应见别名：%v", names)
 	}
-	if !strings.Contains(out, `"name":"edit"`) || strings.Contains(out, editWire) {
+	if !strings.Contains(out, `"name":"myedit"`) || strings.Contains(out, editWire) {
 		t.Fatalf("下游应还原原名：%.300s", out)
 	}
 }

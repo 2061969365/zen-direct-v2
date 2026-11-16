@@ -61,6 +61,12 @@ func bunHello() *utls.ClientHelloSpec {
 				utls.PKCS1WithSHA384,
 				utls.PSSWithSHA512,
 				utls.PKCS1WithSHA512,
+				// 抓包实测：官方 CLI（Bun 2.2.5 / BoringSSL）在 PKCS1WithSHA512 之后
+				// 还有 ed25519 与 ecdsa_secp521r1_sha512，最后才是 rsa_pkcs1_sha1。
+				// 漏这两项会让 JA3 从 fc5d1fd2ab14d10c3e63b5125ef8a07d 变成
+				// f1a138f3c44152789a56f20783385a90，上游按指纹判定非官方客户端。
+				utls.Ed25519,
+				utls.ECDSAWithP521AndSHA512,
 				utls.PKCS1WithSHA1,
 			}},
 			&utls.SCTExtension{},

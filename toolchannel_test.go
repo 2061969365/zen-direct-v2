@@ -144,3 +144,34 @@ func TestStripChannelSelector(t *testing.T) {
 		t.Fatalf("_args 未提升为顶层参数: %s", out)
 	}
 }
+
+// TestApplyChannelArgsAllChannels 全通道还原矩阵：
+// 1) 每个已知客户端工具经 _tool 选择器都还原回原名
+// 2) 模型漏填 _tool 时兜底还原到通道默认工具（shell->pwsh 等）
+// 3) 未知通道名不动
+func TestApplyChannelArgsAllChannels(t *testing.T) {
+	for client, channel := range toolChannelMap {
+		got, expanded := applyChannelArgs(channel,
+			`{"`+channelSelector+`":"`+client+`","`+channelArgs+`":{"k":"v"}}`)
+		if got != client {
+			t.Errorf("通道 %s 的 %s 还原失败: got %q", channel, client, got)
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(expanded), &m); err != nil {
+			t.Errorf("%s 参数不是合法 JSON: %s", client, expanded)
+			continue
+		}
+		if m["k"] != "v" {
+			t.Errorf("%s _args 未展开: %s", client, expanded)
+		}
+	}
+	for channel, def := range channelDefaultTool {
+		got, _ := applyChannelArgs(channel, `{"command":"ls"}`)
+		if got != def {
+			t.Errorf("通道 %s 缺选择器时应兜底到 %s: got %q", channel, def, got)
+		}
+	}
+	if got, _ := applyChannelArgs("notachannel", `{"a":1}`); got != "notachannel" {
+		t.Errorf("未知通道名应原样保留: %q", got)
+	}
+}

@@ -75,6 +75,24 @@ func channelForTool(client string) string {
 	return "execute"
 }
 
+// channelDefaultTool 是模型没填 _tool 时的兜底还原目标：每个通道选一个
+// 语义最直接的客户端工具。没有兜底时，客户端会收到通道原名（如 shell），
+// 在 DSH 侧就是 unknown tool。
+var channelDefaultTool = map[string]string{
+	"shell":     "pwsh",
+	"read":      "read",
+	"write":     "write",
+	"edit":      "edit",
+	"glob":      "glob",
+	"grep":      "grep",
+	"question":  "ask_user_question",
+	"skill":     "skill",
+	"subagent":  "spawn_teammate",
+	"webfetch":  "web_fetch",
+	"websearch": "web_search",
+	"execute":   "workflow",
+}
+
 // buildChannelTools 把客户端 tools 数组转换成 12 个官方通道工具。
 // 每个通道的描述里列出它承载的客户端工具及其原始 schema，
 // 参数里注入 _tool（枚举）与 _args（自由对象）。
@@ -351,7 +369,12 @@ func applyChannelArgs(toolName, arguments string) (string, string) {
 	}
 	real, _ := m[channelSelector].(string)
 	if real == "" {
-		// 没有选择器：原样返回，交由现有改名机制还原。
+		// 没填选择器：模型直接以通道名调用（常见于它沿用官方 shell 语义）。
+		// 此时把通道名兜底还原成该通道的默认客户端工具，否则客户端收到
+		// 未知工具名（如 shell）直接报"unknown tool"，表现为工具用不了。
+		if def, ok := channelDefaultTool[toolName]; ok {
+			return def, arguments
+		}
 		return toolName, arguments
 	}
 	out := map[string]any{}

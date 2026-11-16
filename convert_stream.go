@@ -413,6 +413,45 @@ func chatChunk(id, model string, delta map[string]any, finish string) map[string
 
 // ---------- 1. chat -> responses ----------
 
+// toolCallIndex 决定这条 tool_calls 增量归属哪个工具槽位。
+//
+// 正常情况下用上游给的 index。但上游有两类异常：
+//   - 完全不发 index：所有增量都落到 0，后一个工具覆盖前一个，只剩最后一个
+//   - 多个工具共用同一个 index：同上
+//
+// 判据是"这个 index 是否已被另一个工具占用"：若该槽位已有工具、而本条增量
+// 带了自己的 id 且与已有工具不同，说明这是另一个工具，分配新槽位。带 id 是
+// 新工具首片的标志（续传分片的 id 为空或 null）。
+func toolCallIndex(call map[string]any, tools map[int]*crtTool, order []int) (int, bool) {
+	raw, present := call["index"]
+	idx := int(toFloat(raw))
+	if !present || raw == nil {
+		// 没有 index：若槽位 idx 已被占用且本条是新工具首片，另起一个。
+		if existing, taken := tools[idx]; taken {
+			if id := getStr(call, "id"); id != "" && existing.callID != "" && id != existing.callID {
+				return nextFreeToolIndex(tools), false
+			}
+		}
+		return idx, false
+	}
+	// 有 index 但被别的工具占了：同样另起槽位，避免覆盖。
+	if existing, taken := tools[idx]; taken {
+		if id := getStr(call, "id"); id != "" && existing.callID != "" && id != existing.callID {
+			return nextFreeToolIndex(tools), true
+		}
+	}
+	return idx, true
+}
+
+// nextFreeToolIndex 返回未被占用的最小非负槽位。
+func nextFreeToolIndex(tools map[int]*crtTool) int {
+	for i := 0; ; i++ {
+		if _, taken := tools[i]; !taken {
+			return i
+		}
+	}
+}
+
 type crtTool struct {
 	callID string
 	name   string
@@ -549,7 +588,8 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 			}
 			for _, tc := range asArr(delta["tool_calls"]) {
 				tm := asMap(tc)
-				idx := int(toFloat(tm["index"]))
+				idx, hasIdx := toolCallIndex(tm, tools, order)
+				_ = hasIdx
 				t, ok := tools[idx]
 				if !ok {
 					// 新工具：占下一个 output 位置（message=0，reasoning=1，

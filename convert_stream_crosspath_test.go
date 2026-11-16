@@ -417,3 +417,53 @@ func TestCrossPathMessagesToChatParallelTools(t *testing.T) {
 
 
 
+
+// 上游不发 index、或多个工具共用同一个 index 时，不能互相覆盖。
+//
+// 2026-11-16 实测回归：idx 直接取 int(toFloat(tm["index"]))，缺 index 时得到 0，
+// 两个工具都落到槽位 0，后一个覆盖前一个，最终只剩最后一个工具。
+func TestChatToResponsesMissingOrDuplicateIndex(t *testing.T) {
+	cases := []struct {
+		name string
+		up   string
+	}{
+		{
+			name: "完全不发 index",
+			up: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"c_a\",\"function\":{\"name\":\"a\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"c_b\",\"function\":{\"name\":\"b\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+				"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+		},
+		{
+			name: "两个工具共用 index 0",
+			up: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c_a\",\"function\":{\"name\":\"a\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c_b\",\"function\":{\"name\":\"b\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+				"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+		},
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		streamChatToResponses(rec, strings.NewReader(c.up), "mimo-v2.5-free")
+		facts := collectResponsesToolCalls(t, rec.Body.String())
+		if len(facts) != 2 {
+			t.Errorf("%s: 期望 2 个工具，得到 %d 个：%+v", c.name, len(facts), facts)
+			continue
+		}
+		assertToolCallInvariants(t, c.name, facts, []string{"a", "b"})
+	}
+}
+
+// 同一工具的续传分片仍须归到同一个槽位（不能被当成新工具）。
+func TestChatToResponsesFragmentsStayOnSameSlot(t *testing.T) {
+	up := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c_a\",\"function\":{\"name\":\"a\",\"arguments\":\"{\\\"x\\\":\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n"
+	rec := httptest.NewRecorder()
+	streamChatToResponses(rec, strings.NewReader(up), "mimo-v2.5-free")
+	facts := collectResponsesToolCalls(t, rec.Body.String())
+	if len(facts) != 1 {
+		t.Fatalf("续传分片被拆成了 %d 个工具：%+v", len(facts), facts)
+	}
+	if facts[0].arguments != `{"x":1}` {
+		t.Errorf("参数拼接错误：%q", facts[0].arguments)
+	}
+}

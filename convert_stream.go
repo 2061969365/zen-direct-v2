@@ -449,8 +449,14 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 			if t.name == "" {
 				t.name = "unknown_tool"
 			}
+			// 无参工具给 "{}"：function_call.arguments 是 JSON 字符串，空串会让
+			// 部分客户端解析失败。added 事件里的空串表示"开始"，这里必须给完整值。
+			args := t.args.String()
+			if args == "" {
+				args = "{}"
+			}
 			output = append(output, map[string]any{"type": "function_call",
-				"id": "fc_" + t.callID, "call_id": t.callID, "name": t.name, "arguments": t.args.String()})
+				"id": "fc_" + t.callID, "call_id": t.callID, "name": t.name, "arguments": args})
 		}
 		if output == nil {
 			output = []any{}
@@ -581,13 +587,37 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 				sawFinish = true
 				for _, idx := range order {
 					t := tools[idx]
+					// 工具名或 id 缺失时流式阶段从未发过 added。收尾前补发一条，
+					// 否则客户端在流式过程中看不到这个工具，只能从最终 output
+					// 里发现它——那时已经错过调用时机。
+					if !t.added {
+						t.added = true
+						if t.callID == "" {
+							t.callID = fallbackToolID("", idx)
+						}
+						if t.name == "" {
+							t.name = "unknown_tool"
+						}
+						sink.emit(map[string]any{"type": "response.output_item.added",
+							"output_index": t.outputIndex, "item": map[string]any{
+								"type": "function_call", "id": "fc_" + t.callID,
+								"call_id": t.callID, "name": t.name, "arguments": "",
+							}})
+					}
 					if t.added {
+						// 上游可能不发 arguments（无参工具），此时给 "{}"：
+						// OpenAI 语义里 function_call.arguments 是 JSON 字符串，
+						// 空串会让部分客户端解析失败。
+						args := t.args.String()
+						if args == "" {
+							args = "{}"
+						}
 						sink.emit(map[string]any{"type": "response.function_call_arguments.done",
-							"item_id": "fc_" + t.callID, "output_index": t.outputIndex, "arguments": t.args.String()})
+							"item_id": "fc_" + t.callID, "output_index": t.outputIndex, "arguments": args})
 						sink.emit(map[string]any{"type": "response.output_item.done",
 							"output_index": t.outputIndex, "item": map[string]any{
 								"type": "function_call", "id": "fc_" + t.callID,
-								"call_id": t.callID, "name": t.name, "arguments": t.args.String()}})
+								"call_id": t.callID, "name": t.name, "arguments": args}})
 					}
 				}
 				flushCompleted(fr)
@@ -1233,8 +1263,19 @@ func streamMessagesToResponses(w http.ResponseWriter, r io.Reader, model string)
 	outIdx := 0
 	kindByIdx := map[int]string{}
 	toolCallID := map[int]string{}
-	var toolArgs strings.Builder
-	toolItemID := ""
+	// 每个 tool_use 块按 content block index 独立累积。上游允许并行 tool_use
+	//（多个块交错发 delta），用单个 builder 会让后一个工具清掉前一个的参数。
+	// 2026-11-16 实测回归：两个并行 tool_use 时第二个拿到拼接后的脏参数，
+	// 且两个块共用一个 item id。
+	type msgToolState struct {
+		callID      string
+		itemID      string
+		name        string
+		args        strings.Builder
+		outputIndex int
+	}
+	toolState := map[int]*msgToolState{}
+	toolOrder := []int{}
 	var usage map[string]any
 	finished := false
 	sawStop := false    // 是否见过 message_stop（正常终态）
@@ -1308,12 +1349,20 @@ func streamMessagesToResponses(w http.ResponseWriter, r io.Reader, model string)
 				// P2b-7：空 id 给 fallback，不发 "fc_" 裸前缀。
 				callID := fallbackToolID(getStr(cb, "id"), idx)
 				toolCallID[idx] = callID
-				toolItemID = "fc_" + callID
-				toolArgs.Reset()
+				state := &msgToolState{
+					callID: callID,
+					itemID: "fc_" + callID,
+					name:   getStr(cb, "name"),
+					// 每个 tool_use 块占一个独立 output 位置，与 chat 路径一致
+					// （message=0、reasoning=1、工具从 2 起）。
+					outputIndex: len(toolOrder) + 2,
+				}
+				toolState[idx] = state
+				toolOrder = append(toolOrder, idx)
 				sink.emit(map[string]any{"type": "response.output_item.added",
-					"output_index": outIdx, "item": map[string]any{
-						"type": "function_call", "id": toolItemID, "call_id": callID,
-						"name": getStr(cb, "name"), "arguments": ""}})
+					"output_index": state.outputIndex, "item": map[string]any{
+						"type": "function_call", "id": state.itemID, "call_id": callID,
+						"name": state.name, "arguments": ""}})
 			case "thinking", "redacted_thinking":
 				hasOutput = true
 				sink.emit(map[string]any{"type": "response.output_item.added",
@@ -1330,14 +1379,25 @@ func streamMessagesToResponses(w http.ResponseWriter, r io.Reader, model string)
 				}
 			case "input_json_delta":
 				if p := asStr(d["partial_json"]); p != "" {
-					toolArgs.WriteString(p)
+					state := toolState[idx]
+					if state == nil {
+						// 没收到 content_block_start 的 delta：补一个占位，避免丢参数。
+						state = &msgToolState{
+							callID:      fallbackToolID("", idx),
+							outputIndex: len(toolOrder) + 2,
+						}
+						state.itemID = "fc_" + state.callID
+						toolState[idx] = state
+						toolOrder = append(toolOrder, idx)
+					}
+					state.args.WriteString(p)
 					sink.emit(map[string]any{"type": "response.function_call_arguments.delta",
-						"item_id": toolItemID, "output_index": outIdx, "delta": p})
+						"item_id": state.itemID, "output_index": state.outputIndex, "delta": p})
 				}
 			case "thinking_delta":
 				if t := asStr(d["thinking"]); t != "" {
 					sink.emit(map[string]any{"type": "response.reasoning_summary_text.delta",
-						"item_id": "rs_0", "output_index": outIdx, "delta": t})
+						"item_id": "rs_0", "output_index": 1, "delta": t})
 				}
 			}
 		case "content_block_stop":
@@ -1349,11 +1409,20 @@ func streamMessagesToResponses(w http.ResponseWriter, r io.Reader, model string)
 					"output_index": outIdx, "item": map[string]any{"type": "message"}})
 				outIdx++
 			case "tool_use":
+				state := toolState[idx]
+				if state == nil {
+					break
+				}
+				args := state.args.String()
+				if args == "" {
+					args = "{}"
+				}
 				sink.emit(map[string]any{"type": "response.function_call_arguments.done",
-					"item_id": toolItemID, "output_index": outIdx, "arguments": toolArgs.String()})
+					"item_id": state.itemID, "output_index": state.outputIndex, "arguments": args})
 				sink.emit(map[string]any{"type": "response.output_item.done",
-					"output_index": outIdx, "item": map[string]any{"type": "function_call"}})
-				outIdx++
+					"output_index": state.outputIndex, "item": map[string]any{
+						"type": "function_call", "id": state.itemID,
+						"call_id": state.callID, "name": state.name, "arguments": args}})
 			case "thinking", "redacted_thinking":
 				sink.emit(map[string]any{"type": "response.output_item.done",
 					"output_index": outIdx, "item": map[string]any{"type": "reasoning"}})

@@ -420,3 +420,149 @@ func TestChatToResponsesReasoningIndexStable(t *testing.T) {
 }
 
 
+
+// messages 上游的多个并行 tool_use 块必须各自独立累积参数。
+//
+// 2026-11-16 实测回归：参数曾用单个 strings.Builder + 单个 itemID 保存，两个
+// 并行 tool_use 时第二个拿到拼接后的脏参数（{"path":"ls"}"a.txt"}），第一个
+// 完全消失，且两个块的 output_index 都是 0。
+func TestMessagesToResponsesParallelToolArgs(t *testing.T) {
+	up := "event: message_start\ndata: {\"message\":{\"model\":\"m\"}}\n\n" +
+		"event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_a\",\"name\":\"pwsh\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\"}}\n\n" +
+		"event: content_block_start\ndata: {\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_b\",\"name\":\"read\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"ls\\\"}\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"a.txt\\\"}\"}}\n\n" +
+		"event: content_block_stop\ndata: {\"index\":0}\n\n" +
+		"event: content_block_stop\ndata: {\"index\":1}\n\n" +
+		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
+		"event: message_stop\ndata: {}\n\n"
+	rec := httptest.NewRecorder()
+	streamMessagesToResponses(rec, strings.NewReader(up), "muse-spark-1.3")
+
+	args := map[string]string{}
+	indices := map[string]int{}
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err != nil {
+			continue
+		}
+		item, ok := ev["item"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if asStr(item["type"]) != "function_call" {
+			continue
+		}
+		callID := asStr(item["call_id"])
+		if callID == "" {
+			continue
+		}
+		if a := asStr(item["arguments"]); a != "" {
+			args[callID] = a
+		}
+		if _, seen := indices[callID]; !seen {
+			indices[callID] = int(toFloat(ev["output_index"]))
+		}
+	}
+	want := map[string]string{"tu_a": `{"cmd":"ls"}`, "tu_b": `{"path":"a.txt"}`}
+	for callID, expected := range want {
+		if args[callID] != expected {
+			t.Errorf("%s 的参数是 %q，期望 %q", callID, args[callID], expected)
+		}
+	}
+	if indices["tu_a"] == indices["tu_b"] {
+		t.Errorf("两个工具占了同一个 output_index=%d", indices["tu_a"])
+	}
+}
+
+// 单个 tool_use 时参数与 item 信息仍须完整（不能因为改成 map 就丢字段）。
+func TestMessagesToResponsesSingleToolComplete(t *testing.T) {
+	up := "event: message_start\ndata: {\"message\":{\"model\":\"m\"}}\n\n" +
+		"event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_x\",\"name\":\"grep\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"x\\\"}\"}}\n\n" +
+		"event: content_block_stop\ndata: {\"index\":0}\n\n" +
+		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
+		"event: message_stop\ndata: {}\n\n"
+	rec := httptest.NewRecorder()
+	streamMessagesToResponses(rec, strings.NewReader(up), "muse-spark-1.3")
+	body := rec.Body.String()
+	if !strings.Contains(body, `{\"q\":\"x\"}`) {
+		t.Errorf("参数丢失:\n%s", body)
+	}
+	if !strings.Contains(body, `"name":"grep"`) {
+		t.Errorf("工具名丢失:\n%s", body)
+	}
+	if !strings.Contains(body, `"call_id":"tu_x"`) {
+		t.Errorf("call_id 丢失:\n%s", body)
+	}
+}
+
+
+// 上游不发 arguments（无参工具）时，function_call.arguments 必须给 "{}"。
+// 空串会让部分客户端 JSON 解析失败。
+func TestChatToResponsesEmptyArgumentsBecomeObject(t *testing.T) {
+	up := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"f\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n"
+	rec := httptest.NewRecorder()
+	streamChatToResponses(rec, strings.NewReader(up), "mimo-v2.5-free")
+	body := rec.Body.String()
+	// added 事件的空 arguments 表示"开始"，是正确语义；只要求 done 与最终 output 给 {}。
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "data: ") || strings.Contains(line, "output_item.added") {
+			continue
+		}
+		if strings.Contains(line, `"arguments":""`) {
+			t.Errorf("非 added 事件里出现空 arguments，应为 {}：%s", line)
+		}
+	}
+	if !strings.Contains(body, `"arguments":"{}"`) {
+		t.Errorf("缺少 arguments:{}：\n%s", body)
+	}
+}
+
+// 工具缺 name / 缺 id 时，流式阶段仍要发出 added/done 事件。
+// 否则客户端在流式过程中看不到这个工具，只能从最终 output 里发现，已错过调用时机。
+func TestChatToResponsesMissingNameOrIDStillEmits(t *testing.T) {
+	cases := []struct {
+		name      string
+		up        string
+		wantName  string
+		wantCall  string
+	}{
+		{
+			name:     "缺 name",
+			up:       "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"arguments\":\"{}\"}}]}}]}\n\ndata: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+			wantName: "unknown_tool",
+			wantCall: "c1",
+		},
+		{
+			name:     "缺 id",
+			up:       "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\ndata: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+			wantName: "f",
+			wantCall: "call_0",
+		},
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		streamChatToResponses(rec, strings.NewReader(c.up), "mimo-v2.5-free")
+		body := rec.Body.String()
+		if !strings.Contains(body, `"type":"response.output_item.added"`) {
+			t.Errorf("%s: 缺 output_item.added：\n%s", c.name, body)
+		}
+		if !strings.Contains(body, `"type":"response.output_item.done"`) {
+			t.Errorf("%s: 缺 output_item.done：\n%s", c.name, body)
+		}
+		if !strings.Contains(body, `"name":"`+c.wantName+`"`) {
+			t.Errorf("%s: 缺 name=%s：\n%s", c.name, c.wantName, body)
+		}
+		if !strings.Contains(body, `"call_id":"`+c.wantCall+`"`) {
+			t.Errorf("%s: 缺 call_id=%s：\n%s", c.name, c.wantCall, body)
+		}
+	}
+}
+

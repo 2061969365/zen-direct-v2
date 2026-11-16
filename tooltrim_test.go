@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 )
 
@@ -47,12 +46,15 @@ func outboundToolNames(t *testing.T, payload map[string]any) []string {
 	return names
 }
 
-// 2026-11-16 实测：上游免费层对 tools 数组长度有硬上限 21。
-//   - 13 官方 + 8 客户端 = 21 → 200
-//   - 13 官方 + 9 客户端 = 22 → 429 FreeUsageLimitError
+// 客户端工具一个不裁。
 //
-// DSH 一次请求带 43 个工具，撞上限后每次必 429。整形后必须把总数压到 21。
-func TestToolsTrimmedToUpstreamCap(t *testing.T) {
+// 2026-11-16 在干净出口逐档加压实测：出站 21 → 26 → 30 → 35 → 43 → 56 个工具全部
+// 200；56 个连测三次通过，up429 始终不增；补字节到 36750 也仍 200。所以数量与字节
+// 都不是 429 的触发条件，触发点是工具描述文本指纹（见 bannedDescriptionFragments）。
+//
+// 曾把总数封顶到 21，后果是丢掉 team_task_* / send_message / spawn_teammate 这些多
+// agent 协作必需的工具，webfetch / websearch 的官方桩也绑不上。
+func TestNoClientToolTrimmed(t *testing.T) {
 	for _, clientCount := range []int{1, 8, 9, 12, 30, 43, 60} {
 		payload := map[string]any{
 			"model": "deepseek-v4.1-flash-free",
@@ -62,107 +64,109 @@ func TestToolsTrimmedToUpstreamCap(t *testing.T) {
 			},
 		}
 		names := outboundToolNames(t, payload)
-		if len(names) > maxUpstreamTools {
-			t.Errorf("客户端 %d 个工具时出站 %d 个，超过上限 %d：%v",
-				clientCount, len(names), maxUpstreamTools, names)
-		}
-		if clientCount <= 8 && len(names) != clientCount+len(v2OfficialToolOrder) {
-			t.Errorf("客户端 %d 个工具时不该丢工具，出站 %d 个：%v",
-				clientCount, len(names), names)
+		want := clientCount + len(v2OfficialToolOrder)
+		if len(names) != want {
+			t.Errorf("客户端 %d 个工具时出站应 %d 个（客户端 + 官方 %d），得到 %d",
+				clientCount, want, len(v2OfficialToolOrder), len(names))
 		}
 	}
 }
 
-// 客户端工具优先保留：超出上限时被裁掉的是末尾的客户端工具，官方集始终完整。
-func TestClientToolsKeptBeforeOfficialOverflow(t *testing.T) {
+// 真实 DSH 的 43 个工具必须全部出站，一个都不能少。
+// 这条直接钉住"工具被裁掉导致模型没法用"的回归。
+func TestDSHCoreToolsAllSurvive(t *testing.T) {
+	// DSH 实际携带的工具，覆盖执行、读写、检索、协作、委托、任务板、调度、联网。
+	names := []string{
+		"anysearch_batch_search", "anysearch_capabilities", "anysearch_search",
+		"ask_user_question", "create_goal", "dsh_im_group_file", "dsh_im_group_history",
+		"dsh_im_return_file", "edit", "exit_plan_mode", "get_goal", "glob", "grep",
+		"interrupt_agent", "job_kill", "job_list", "job_output", "list_agents", "present",
+		"pwsh", "read", "read_image", "schedule_create", "schedule_delete", "schedule_list",
+		"schedule_update", "send_message", "skill", "spawn_teammate", "subagent",
+		"subagent_fork", "team_task_create", "team_task_get", "team_task_list",
+		"team_task_update", "todo_write", "update_goal", "wait_agent", "web_fetch",
+		"web_search", "workflow", "working_directory", "write",
+	}
+	tools := make([]any, 0, len(names))
+	for _, name := range names {
+		tools = append(tools, chatTool(name, "Tool "+name))
+	}
 	payload := map[string]any{
 		"model":    "deepseek-v4.1-flash-free",
-		"tools":    buildChatTools("keep_", 12),
-		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
-	}
-	names := outboundToolNames(t, payload)
-	if len(names) != maxUpstreamTools {
-		t.Fatalf("出站应为 %d 个，得到 %d：%v", maxUpstreamTools, len(names), names)
-	}
-	// 官方 13 个必须全在。
-	present := map[string]bool{}
-	for _, name := range names {
-		present[name] = true
-	}
-	for _, official := range v2OfficialToolOrder {
-		if !present[official] {
-			t.Errorf("官方工具 %q 被裁掉了", official)
-		}
-	}
-	// 客户端工具保留前面的 8 个（上限 21 - 官方 13）。
-	clientKept := 0
-	for _, name := range names {
-		if len(name) >= len(ClientToolPrefix) && name[:len(ClientToolPrefix)] == ClientToolPrefix {
-			clientKept++
-		}
-	}
-	if clientKept != maxUpstreamTools-len(v2OfficialToolOrder) {
-		t.Errorf("应保留 %d 个客户端工具，实际 %d：%v",
-			maxUpstreamTools-len(v2OfficialToolOrder), clientKept, names)
-	}
-}
-
-// 被裁掉的工具必须从重命名表里消失，否则响应映射与历史改写会指向不存在的名字。
-func TestTrimmedToolsLeaveNoRenameResidue(t *testing.T) {
-	payload := map[string]any{
-		"model":    "deepseek-v4.1-flash-free",
-		"tools":    buildChatTools("gone_", 20),
+		"tools":    tools,
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 	}
 	up, renames, err := buildUpstream(FmtChat, FmtChat, payload)
 	if err != nil {
 		t.Fatalf("buildUpstream: %v", err)
 	}
-	tools, _ := up["tools"].([]any)
-	wireNames := map[string]bool{}
-	for _, item := range tools {
-		if entry, ok := item.(map[string]any); ok {
-			if fn, ok := entry["function"].(map[string]any); ok {
-				if name, ok := fn["name"].(string); ok {
-					wireNames[name] = true
-				}
-			}
-		}
+	entries, _ := up["tools"].([]any)
+	if len(entries) != len(names)+len(v2OfficialToolOrder) {
+		t.Fatalf("出站应为 %d 个工具，得到 %d", len(names)+len(v2OfficialToolOrder), len(entries))
 	}
-	for i := 0; i < 20; i++ {
-		client := "gone_" + string(rune('a'+i%26)) + string(rune('a'+i/26))
-		wire, ok := renames.Wire(client)
-		if !ok {
-			continue // 已被裁掉且登记已撤销，符合预期
-		}
-		if !wireNames[wire] {
-			t.Errorf("客户端工具 %q 的重命名 %q 仍留在表里，但它不在出站 tools 中", client, wire)
+	for _, name := range names {
+		if _, ok := renames.Wire(name); !ok {
+			t.Errorf("客户端工具 %q 没有登记重命名，说明整形丢了它", name)
 		}
 	}
 }
 
-// 历史里引用了被裁掉的工具时，该调用连同配对结果应被清掉，不能把不存在的名字
-// 发给上游（那正是 opencode2api v1.4.7 修掉的“幽灵调用”）。
-func TestHistoryGhostCallsDroppedAfterTrim(t *testing.T) {
-	tools := buildChatTools("ghost_", 20)
-	// 最后一个工具会被裁掉；历史里引用它。
-	droppedTool := "ghost_" + string(rune('a'+19%26)) + string(rune('a'+19/26))
+// 官方桩必须绑定到客户端真实工具，否则模型看到的是调不动的空壳。
+// 其中 shell -> pwsh 就是用户最初报告的"网关 shell 工具没有了"。
+func TestOfficialStubsBindToClientTools(t *testing.T) {
+	want := map[string]string{
+		"shell": "pwsh", "read": "read", "write": "write", "edit": "edit",
+		"grep": "grep", "glob": "glob", "subagent": "subagent", "skill": "skill",
+		"webfetch": "web_fetch", "websearch": "web_search",
+	}
+	tools := make([]any, 0, len(want))
+	seen := map[string]bool{}
+	for _, client := range want {
+		if seen[client] {
+			continue
+		}
+		seen[client] = true
+		tools = append(tools, chatTool(client, "Tool "+client))
+	}
+	payload := map[string]any{
+		"model":    "deepseek-v4.1-flash-free",
+		"tools":    tools,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}
+	_, renames, err := buildUpstream(FmtChat, FmtChat, payload)
+	if err != nil {
+		t.Fatalf("buildUpstream: %v", err)
+	}
+	for official, client := range want {
+		bound, ok := renames.Official(official)
+		if !ok {
+			t.Errorf("官方桩 %q 没有绑定，模型调用它会落空", official)
+			continue
+		}
+		if bound != client {
+			t.Errorf("官方桩 %q 绑到 %q，期望 %q", official, bound, client)
+		}
+	}
+}
+
+// 历史里的工具调用必须跟着重命名走，不能被误清。
+func TestHistoryKeepsDeclaredToolCalls(t *testing.T) {
 	payload := map[string]any{
 		"model": "deepseek-v4.1-flash-free",
-		"tools": tools,
+		"tools": buildChatTools("keep_", 30),
 		"messages": []any{
 			map[string]any{"role": "user", "content": "hi"},
 			map[string]any{"role": "assistant", "tool_calls": []any{
 				map[string]any{
-					"id":   "call_ghost",
+					"id":   "call_keep",
 					"type": "function",
 					"function": map[string]any{
-						"name":      droppedTool,
+						"name":      "keep_aa",
 						"arguments": "{}",
 					},
 				},
 			}},
-			map[string]any{"role": "tool", "tool_call_id": "call_ghost", "content": "result"},
+			map[string]any{"role": "tool", "tool_call_id": "call_keep", "content": "result"},
 			map[string]any{"role": "user", "content": "again"},
 		},
 	}
@@ -171,7 +175,21 @@ func TestHistoryGhostCallsDroppedAfterTrim(t *testing.T) {
 		t.Fatalf("buildUpstream: %v", err)
 	}
 	raw, _ := json.Marshal(up)
-	if strings.Contains(string(raw), droppedTool) {
-		t.Errorf("出站 body 里仍有被裁掉的工具名 %q：%.400s", droppedTool, raw)
+	if !json.Valid(raw) {
+		t.Fatalf("出站 body 不是合法 JSON")
+	}
+	messages, _ := up["messages"].([]any)
+	sawToolCall := false
+	for _, rawMessage := range messages {
+		message, ok := rawMessage.(map[string]any)
+		if !ok {
+			continue
+		}
+		if calls, ok := message["tool_calls"].([]any); ok && len(calls) > 0 {
+			sawToolCall = true
+		}
+	}
+	if !sawToolCall {
+		t.Errorf("声明过的工具的调用被误清了")
 	}
 }

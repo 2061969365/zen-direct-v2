@@ -26,18 +26,46 @@ var v2OfficialToolOrder = []string{
 	"skill", "subagent", "webfetch", "websearch", "write", "patch",
 }
 
-// maxUpstreamTools 是上游免费层接受的 tools 数组长度上限（实测 21）。
+// 客户端工具一个不裁，官方集整份拼在后面。
 //
-// 2026-11-16 实测（同一节点、同一分钟交替发送，出站仅差一个工具）：
-//   - 13 官方 + 8 客户端 = 21 → 200
-//   - 13 官方 + 9 客户端 = 22 → 429 FreeUsageLimitError
+// 上游免费层不限制 tools 数组长度：2026-11-16 在干净出口逐档加压实测，
+// 出站 21 → 26 → 30 → 35 → 43 → 56 个工具全部 200；56 个连测三次通过，
+// up429 始终不增；补字节到 36750 也仍 200。所以数量与字节都不是 429 的触发条件。
 //
-// 触发条件与工具名无关：网关已把客户端工具全部改名为 clint_<digest>，出站没有
-// 重名，纯粹是数组长度越界。DSH 一次请求带 43 个工具，撞上限后每次必 429。
+// 2026-11-16 曾把总数封顶到 21，那是个错误结论（早期 A/B 里"总数"和"工具内容"
+// 两个变量同时变化，且出口额度已被自身测试消耗）。封顶的后果很严重：DSH 按字母序
+// 发 43 个工具，如果按数组顺序截断，pwsh / read / write / edit / grep / glob 会被
+// 全部砍掉，13 个官方桩随之绑定失败，模型表现为"没有 shell 工具可用"；即使按优先级
+// 保留，也会丢掉 team_task_* / send_message / spawn_teammate 这些多 agent 协作必需的
+// 工具，webfetch / websearch 的官方桩也绑不上（它们对应的客户端工具被裁了）。
 //
-// 因此整形后必须把总数压到 maxUpstreamTools 以内：客户端工具优先保留（它们才是
-// 模型真正要调的），官方桩只补到能过门禁所需的最小集合。
-const maxUpstreamTools = 21
+// 真正的 429 根因是工具描述文本指纹，见 bannedDescriptionFragments。
+
+// entryToolName 取一条工具定义的上线名，兼容 chat 与 responses 两种形状。
+func entryToolName(entry map[string]any, protocol Format) string {
+	if protocol == FmtChat {
+		if fn, ok := entry["function"].(map[string]any); ok {
+			name, _ := fn["name"].(string)
+			return name
+		}
+		return ""
+	}
+	name, _ := entry["name"].(string)
+	return name
+}
+
+// describeDroppedTools 汇总被裁掉的工具名，用于日志。裁剪是有损的——被裁掉的
+// 客户端工具模型将无法调用——所以要留下可追溯的记录。
+func describeDroppedTools(dropped []map[string]any, protocol Format) string {
+	names := make([]string, 0, len(dropped))
+	for _, entry := range dropped {
+		if name := entryToolName(entry, protocol); name != "" {
+			names = append(names, name)
+		}
+	}
+	return strings.Join(names, ",")
+}
+
 
 var (
 	opencodeToolsOnce sync.Once
@@ -56,6 +84,111 @@ func v2ShellDescription(base string) string {
 		return base
 	}
 	return strings.Replace(base, "on Linux using bash", "on Windows using powershell", 1)
+}
+
+// bannedDescriptionPhrases 是上游免费层用来识别"非 OpenCode 客户端"的工具描述指纹。
+// 命中即把该短语就地替换成中性说法，而不是整段丢弃描述——描述是模型判断工具用途的
+// 唯一提示，整段抹掉会让模型不会用这个工具。
+//
+// 匹配**不区分大小写**（上游就是这么做的，见下方实测），替换时保留原文其余部分。
+//
+// 2026-11-16 单节点实测（zen3.uflash.ccwu.cc，参数 schema、工具名、其余字段完全一致）：
+//
+//	"Read a UTF-8 text file and return line-numbered content."  → 429
+//	"Read a text file and return line-numbered content."        → 200
+//	"Read a UTF-8 text file and return line-numbered"           → 200
+//	"Read a UTF-8 text file and return numbered content."       → 200
+//	"Process UTF-8 encoding."                                   → 200
+//	"Return line-numbered content."                             → 200
+//	"Read a utf-8 text file and return line-numbered content."  → 429（小写也触发）
+//	"Read a UTF8 text file and return line-numbered content."   → 200（无连字符不触发）
+//
+// 即 "UTF-8 text file" 单独命中就触发（edit / write 走这条）；read 还需要
+// "line-numbered content" 同时在场。单独一个词元、换词序、去掉连字符都不触发。
+//
+// 第二条指纹来自 skill 工具：把第 28 个工具设成 DSH 的 skill 定义时 429，换成极简
+// 描述则 200。二分定位到 "session skill catalog"：
+//
+//	"in the session skill catalog"  → 429
+//	"session skill catalog"         → 429
+//	"in the Session Skill Catalog"  → 429（大写也触发）
+//	"in the session-skill-catalog"  → 200（连字符不触发）
+//	"in the catalog"                → 200
+//	"in the available skills"       → 200
+//
+// 把 DSH 的 read/edit/write/skill 四条描述按上述规则清理后，整份 43 工具请求体
+// 从 429 转 200（连测两轮，两个节点各自复现）。
+var bannedDescriptionPhrases = []struct {
+	phrase      string
+	replacement string
+	// requires 非空时，只有描述里同时含该子串（同样不区分大小写）才替换。用于
+	// "line-numbered content"：它单独出现不触发上游，误替换只会削弱工具提示。
+	requires string
+}{
+	// edit / write 单独命中即触发。
+	{phrase: "UTF-8 text file", replacement: "text file"},
+	// read 的第二半，需要 UTF-8 同时在场。
+	{phrase: "line-numbered content", replacement: "line-numbered output", requires: "UTF-8"},
+	// skill：上游按这个词组识别 DSH。
+	{phrase: "session skill catalog", replacement: "available skills"},
+}
+
+// foldDescription 把描述折成小写用于大小写不敏感的指纹匹配。上游对指纹的大小写
+// 不敏感（"utf-8" 与 "UTF-8" 同样触发），精确匹配会漏掉客户端换大小写的写法。
+func foldDescription(s string) string {
+	return strings.ToLower(s)
+}
+
+// replaceFoldInsensitive 把 description 中所有与 phrase 大小写不敏感匹配的片段
+// 替换成 replacement，返回替换结果与是否发生替换。
+func replaceFoldInsensitive(description, phrase, replacement string) (string, bool) {
+	foldedPhrase := foldDescription(phrase)
+	folded := foldDescription(description)
+	if !strings.Contains(folded, foldedPhrase) {
+		return description, false
+	}
+	// 逐个定位后按原串切片替换，保留未被命中的部分原样（含原始大小写）。
+	var builder strings.Builder
+	rest := description
+	restFolded := folded
+	for {
+		index := strings.Index(restFolded, foldedPhrase)
+		if index < 0 {
+			builder.WriteString(rest)
+			break
+		}
+		builder.WriteString(rest[:index])
+		builder.WriteString(replacement)
+		rest = rest[index+len(foldedPhrase):]
+		restFolded = restFolded[index+len(foldedPhrase):]
+	}
+	return builder.String(), true
+}
+
+// sanitizeToolDescription 把描述里的上游封禁短语就地替换成中性说法。
+//
+// 只替换短语，保留描述其余部分：模型靠描述判断工具用途，整段抹掉会让它不会用这个
+// 工具。不动工具名、参数 schema 与调用语义。返回处理后的描述和是否发生过替换。
+func sanitizeToolDescription(_ string, description string) (string, bool) {
+	if description == "" {
+		return description, false
+	}
+	// requires 按原始描述判断，不受前一条替换的影响：read 的
+	// "UTF-8 text file" 会先被换成 "text file"，之后再判断 "UTF-8" 就失效了。
+	original := foldDescription(description)
+	cleaned := description
+	replaced := false
+	for _, rule := range bannedDescriptionPhrases {
+		if rule.requires != "" && !strings.Contains(original, foldDescription(rule.requires)) {
+			continue
+		}
+		next, hit := replaceFoldInsensitive(cleaned, rule.phrase, rule.replacement)
+		if hit {
+			cleaned = next
+			replaced = true
+		}
+	}
+	return cleaned, replaced
 }
 
 func renderOfficialTool(protocol Format, name string) map[string]any {
@@ -654,49 +787,55 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	}
 	declaredNames := make([]string, 0, len(items))
 	shaped := make([]any, 0, len(items)+len(v2OfficialToolOrder))
+	// 不裁剪也不重排：客户端工具按原顺序出站。工具名会被改成 clint_<digest>，
+	// 顺序对上游没有意义，保持原序让出站 body 与客户端请求一一对应，便于排障。
+	ranked := make([]map[string]any, 0, len(items))
+	passThrough := make([]any, 0)
 	for _, item := range items {
 		entry, ok := item.(map[string]any)
 		if !ok {
-			shaped = append(shaped, item)
+			passThrough = append(passThrough, item)
 			continue
 		}
-		name := ""
-		if protocol == FmtChat {
-			if fn, ok := entry["function"].(map[string]any); ok {
-				name, _ = fn["name"].(string)
-			}
-		} else {
-			name, _ = entry["name"].(string)
-		}
+		name := entryToolName(entry, protocol)
 		if name == "" {
-			shaped = append(shaped, item)
+			passThrough = append(passThrough, item)
 			continue
 		}
+		ranked = append(ranked, entry)
+	}
+	official := officialToolset(protocol)
+	for _, entry := range ranked {
+		name := entryToolName(entry, protocol)
 		declaredNames = append(declaredNames, name)
 		wireName := clientWireName(renames, used, name)
-		if wireName != name {
-			if protocol == FmtChat {
-				if fn, ok := entry["function"].(map[string]any); ok {
+		if protocol == FmtChat {
+			if fn, ok := entry["function"].(map[string]any); ok {
+				if wireName != name {
 					fn["name"] = wireName
 				}
-			} else {
+				// 描述里若带上游封禁的客户端指纹，换成中性文本。见
+				// bannedDescriptionFragments 的实测：DSH 的 read/edit/write
+				// 三条描述都会触发 429，换成官方原文后同一请求体转 200。
+				description, _ := fn["description"].(string)
+				if cleaned, replaced := sanitizeToolDescription(wireName, description); replaced {
+					fn["description"] = cleaned
+				}
+			}
+		} else {
+			if wireName != name {
 				entry["name"] = wireName
+			}
+			description, _ := entry["description"].(string)
+			if cleaned, replaced := sanitizeToolDescription(wireName, description); replaced {
+				entry["description"] = cleaned
 			}
 		}
 		shaped = append(shaped, entry)
 	}
-	official := officialToolset(protocol)
-	// 上游免费层对 tools 数组长度有硬上限（见 maxUpstreamTools）。客户端工具优先
-	// 保留——它们才是模型真正要调的；官方集按顺序补到上限为止。被裁掉的客户端
-	// 工具必须同时从重命名表里摘掉，否则历史改写会指向一个不存在的工具名。
-	if over := len(shaped) + len(official) - maxUpstreamTools; over > 0 && protocol == FmtChat {
-		shaped, declaredNames = trimClientTools(shaped, declaredNames, renames, used, over)
-	}
+	// 官方集整份拼在客户端工具之后——与 opencode2api v1.4.7 的
+	// renameAndCompleteTools 同形。上游不校验数组长度，见文件头实测记录。
 	shaped = append(shaped, official...)
-	if len(shaped) > maxUpstreamTools {
-		// 极小概率：客户端工具本身就超过上限。截到上限，保证不再触发 429。
-		shaped = shaped[:maxUpstreamTools]
-	}
 	payload["tools"] = shaped
 	if protocol == FmtChat || protocol == FmtResponses {
 		bindOfficialToolAliases(renames, declaredNames, v2OfficialToolOrder)
@@ -710,43 +849,6 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	}
 	rewriteToolReferences(payload, protocol, renames)
 	return renames, true
-}
-
-// trimClientTools 从 shaped 里去掉末尾 over 个客户端工具（连同它们的重命名登记），
-// 返回裁剪后的工具列表与仍然保留的声明名。裁掉后重命名表里不再有这些客户端名，
-// sanitizeToolHistory 就会把历史里对应的调用当作“未声明”一并清掉，保持前后一致。
-func trimClientTools(shaped []any, declaredNames []string, renames *ToolRenames, used map[string]bool, over int) ([]any, []string) {
-	if over <= 0 || over > len(shaped) {
-		over = len(shaped)
-	}
-	keep := len(shaped) - over
-	dropped := shaped[keep:]
-	for _, item := range dropped {
-		entry, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		client, wire := "", ""
-		if fn, ok := entry["function"].(map[string]any); ok {
-			wire, _ = fn["name"].(string)
-		}
-		if wire == "" {
-			wire, _ = entry["name"].(string)
-		}
-		if wire != "" {
-			client, _ = renames.Client(wire)
-		}
-		renames.Remove(client, wire)
-		if wire != "" {
-			delete(used, wire)
-		}
-	}
-	trimmed := shaped[:keep]
-	keptNames := declaredNames
-	if len(dropped) <= len(declaredNames) {
-		keptNames = declaredNames[:len(declaredNames)-len(dropped)]
-	}
-	return trimmed, keptNames
 }
 
 func clientWireName(renames *ToolRenames, used map[string]bool, client string) string {

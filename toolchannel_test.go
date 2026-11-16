@@ -101,3 +101,46 @@ func TestRestoreChannelCalls(t *testing.T) {
 		t.Fatalf("参数未展开: %s", asStr(fn["arguments"]))
 	}
 }
+
+// TestRewriteChannelHistoryNoSelector 钉住多轮 429 的根因：
+// 历史 tool_calls 的 arguments 必须是干净的官方参数，绝不能带 _tool/_args。
+// 只有 name 映射回通道名，arguments 保持（或清理回）原样。
+func TestRewriteChannelHistoryNoSelector(t *testing.T) {
+	payload := mustJSON(t, `{"messages":[
+		{"role":"user","content":"search"},
+		{"role":"assistant","content":null,"tool_calls":[
+			{"id":"c1","type":"function","function":{"name":"web_search","arguments":"{\"query\":\"opencode\"}"}}
+		]},
+		{"role":"tool","tool_call_id":"c1","content":"result"}
+	]}`)
+	rewriteChannelHistory(payload, FmtChat)
+	msgs := asArr(payload["messages"])
+	call := asMap(asArr(asMap(msgs[1])["tool_calls"])[0])
+	fn := asMap(call["function"])
+	if asStr(fn["name"]) != "websearch" {
+		t.Fatalf("历史 name 未映射回通道名: %v", fn["name"])
+	}
+	args := asStr(fn["arguments"])
+	if strings.Contains(args, channelSelector) || strings.Contains(args, channelArgs) {
+		t.Fatalf("历史 arguments 不得含选择器字段: %s", args)
+	}
+	if !strings.Contains(args, "opencode") {
+		t.Fatalf("历史参数被清空: %s", args)
+	}
+}
+
+// TestStripChannelSelector 验证回放上一轮响应时选择器字段被清理。
+func TestStripChannelSelector(t *testing.T) {
+	in := `{"query":"x","_tool":"web_search","_args":{"query":"y","limit":5}}`
+	out := stripChannelSelector(in)
+	if strings.Contains(out, channelSelector) || strings.Contains(out, channelArgs) {
+		t.Fatalf("选择器未清除: %s", out)
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(out), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["query"] != "y" || m["limit"] == nil {
+		t.Fatalf("_args 未提升为顶层参数: %s", out)
+	}
+}

@@ -181,34 +181,16 @@ const additionalPropertiesKey = "additionalProperties"
 // channelModeOn 报告是否启用了工具通道模式。
 func channelModeOn() bool { return os.Getenv("ZEN_TOOL_CHANNEL") != "" }
 
-// wrapChannelArgs 把真实工具调用的参数包装成通道形态：
-// {"path":"a.txt"} -> {"path":"a.txt","_tool":"read","_args":{"path":"a.txt"}}
-// 保留顶层参数是为了兼容通道描述里"参数可放顶层"的约定，_args 则是权威来源。
-func wrapChannelArgs(realTool, arguments string) string {
-	var m map[string]any
-	if err := json.Unmarshal([]byte(arguments), &m); err != nil {
-		return arguments
-	}
-	wrapped := map[string]any{
-		channelSelector: realTool,
-		channelArgs:     m,
-	}
-	for k, v := range m {
-		wrapped[k] = v
-	}
-	b, err := json.Marshal(wrapped)
-	if err != nil {
-		return arguments
-	}
-	return string(b)
-}
-
-// rewriteChannelHistory 把历史消息里真实工具名映射回通道名，并把参数重新包装。
-// 上游要求历史 tool_calls.name 与 tools 定义里的官方通道名一致，否则 429。
+// rewriteChannelHistory 把历史消息里真实工具名映射回通道名。
+//
+// 关键：参数必须原样保留，绝不能塞 _tool/_args。这两个字段是「模型 -> 网关」
+// 方向的私有约定，只出现在新生成的 tool_calls 里；历史里的 tool_call 代表
+// 「已经发生过的官方工具调用」，官方 CLI 的历史参数永远是干净的官方参数
+// （websearch 就是 {"query":...}）。带选择器字段的历史会被上游按指纹门禁判为
+// 第三方客户端，直接 429 FreeUsageLimitError。
+//
+// 这与 opencode2iori 的 sanitizeToolHistory 一致：只改 name，不动 arguments。
 func rewriteChannelHistory(payload map[string]any, protocol Format) {
-	for _, rawChoice := range asArr(payload["choices"]) {
-		_ = rawChoice
-	}
 	messages := asArr(payload["messages"])
 	for _, rawMessage := range messages {
 		message, ok := rawMessage.(map[string]any)
@@ -228,10 +210,13 @@ func rewriteChannelHistory(payload map[string]any, protocol Format) {
 			if name == "" {
 				continue
 			}
-			channel := channelForTool(name)
-			fn["name"] = channel
+			// 已是通道名（官方名）则保持；否则映射回通道名。
+			if !officialToolNameSet()[name] {
+				fn["name"] = channelForTool(name)
+			}
+			// arguments 原样保留：去掉可能残留的选择器字段（幂等）。
 			if args := asStr(fn["arguments"]); args != "" {
-				fn["arguments"] = wrapChannelArgs(name, args)
+				fn["arguments"] = stripChannelSelector(args)
 			}
 		}
 	}
@@ -245,14 +230,49 @@ func rewriteChannelHistory(payload map[string]any, protocol Format) {
 		if name == "" {
 			continue
 		}
-		if channelForTool(name) == "" {
-			continue
+		if !officialToolNameSet()[name] {
+			item["name"] = channelForTool(name)
 		}
-		item["name"] = channelForTool(name)
 		if args := asStr(item["arguments"]); args != "" {
-			item["arguments"] = wrapChannelArgs(name, args)
+			item["arguments"] = stripChannelSelector(args)
 		}
 	}
+}
+
+// stripChannelSelector 从 arguments 里移除 _tool/_args，只保留真实参数。
+// 历史调用里若被客户端自己带上这两个字段（例如把上一轮响应原样回放），
+// 也要清掉，否则同样触发指纹门禁。
+func stripChannelSelector(arguments string) string {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(arguments), &m); err != nil {
+		return arguments
+	}
+	_, hasSelector := m[channelSelector]
+	argsObj, hasArgs := m[channelArgs].(map[string]any)
+	if !hasSelector && !hasArgs {
+		return arguments
+	}
+	out := map[string]any{}
+	// 若存在 _args，以其为权威参数来源。
+	if hasArgs {
+		for k, v := range argsObj {
+			out[k] = v
+		}
+	}
+	// 顶层非选择器字段补充。
+	for k, v := range m {
+		if k == channelSelector || k == channelArgs || k == "_" {
+			continue
+		}
+		if _, exists := out[k]; !exists {
+			out[k] = v
+		}
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return arguments
+	}
+	return string(b)
 }
 
 // restoreChannelCalls 把响应里的通道工具调用还原成真实客户端工具调用：

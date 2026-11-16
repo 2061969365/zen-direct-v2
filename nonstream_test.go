@@ -122,3 +122,70 @@ func TestNonStreamSSEStripsTools(t *testing.T) {
 		t.Fatalf("正文丢失: %.300s", body)
 	}
 }
+
+// 非流聚合：上游不发 index、或多个工具共用同一个 index 时，两个工具不能合并。
+//
+// 2026-11-16 实测回归：聚合器直接用 index（缺省取数组下标，恒为 0）作槽位，
+// 两个工具合并成一个，name 被后者覆盖，参数拼成 {"x":1}{"y":2}（非法 JSON）。
+func TestNonStreamToolIndexCollision(t *testing.T) {
+	cases := []struct {
+		name string
+		up   string
+	}{
+		{
+			name: "完全不发 index",
+			up: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"c_a\",\"function\":{\"name\":\"a\",\"arguments\":\"{\\\"x\\\":1}\"}}]}}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"c_b\",\"function\":{\"name\":\"b\",\"arguments\":\"{\\\"y\\\":2}\"}}]}}]}\n\n" +
+				"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+		},
+		{
+			name: "两个工具共用 index 0",
+			up: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c_a\",\"function\":{\"name\":\"a\",\"arguments\":\"{\\\"x\\\":1}\"}}]}}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c_b\",\"function\":{\"name\":\"b\",\"arguments\":\"{\\\"y\\\":2}\"}}]}}]}\n\n" +
+				"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+		},
+	}
+	for _, c := range cases {
+		out, err := sseToChatCompletion([]byte(c.up), "mimo-v2.5-free")
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		msg := asMap(asArr(out["choices"])[0].(map[string]any)["message"])
+		tcs := asArr(msg["tool_calls"])
+		if len(tcs) != 2 {
+			t.Errorf("%s: 期望 2 个工具，得到 %d 个", c.name, len(tcs))
+			continue
+		}
+		got := map[string]string{}
+		for _, raw := range tcs {
+			fn := asMap(asMap(raw)["function"])
+			got[asStr(fn["name"])] = asStr(fn["arguments"])
+		}
+		if got["a"] != `{"x":1}` {
+			t.Errorf("%s: 工具 a 的参数是 %q", c.name, got["a"])
+		}
+		if got["b"] != `{"y":2}` {
+			t.Errorf("%s: 工具 b 的参数是 %q", c.name, got["b"])
+		}
+	}
+}
+
+// 同一工具的续传分片仍归同一槽位。
+func TestNonStreamToolFragmentsMerge(t *testing.T) {
+	up := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c_a\",\"function\":{\"name\":\"a\",\"arguments\":\"{\\\"x\\\":\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n"
+	out, err := sseToChatCompletion([]byte(up), "mimo-v2.5-free")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	msg := asMap(asArr(out["choices"])[0].(map[string]any)["message"])
+	tcs := asArr(msg["tool_calls"])
+	if len(tcs) != 1 {
+		t.Fatalf("续传分片被拆成 %d 个工具", len(tcs))
+	}
+	fn := asMap(asMap(tcs[0])["function"])
+	if got := asStr(fn["arguments"]); got != `{"x":1}` {
+		t.Errorf("参数拼接错误：%q", got)
+	}
+}

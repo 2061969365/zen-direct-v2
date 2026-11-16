@@ -134,6 +134,20 @@ func sseToChatCompletion(raw []byte, model string) (map[string]any, error) {
 				if n, ok := tm["index"].(float64); ok {
 					idx = int(n)
 				}
+				// 上游不发 index、或多个工具共用同一个 index 时，后一个工具会
+				// 覆盖前一个（实测两个工具合并成一个，参数拼成 {"x":1}{"y":2}）。
+				// 槽位已被另一个工具占用时另起槽位；带不同 id 是新工具首片的标志，
+				// 续传分片的 id 为空，仍归原槽位。
+				if acc, taken := toolCalls[idx]; taken {
+					if id := asStr(tm["id"]); id != "" && acc.id != "" && id != acc.id {
+						for n := 0; ; n++ {
+							if _, busy := toolCalls[n]; !busy {
+								idx = n
+								break
+							}
+						}
+					}
+				}
 				acc := toolCalls[idx]
 				if acc == nil {
 					acc = &tcAcc{}

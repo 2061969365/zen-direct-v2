@@ -38,7 +38,7 @@ func withMockUpstream(t *testing.T, sse string) {
 		for {
 			n, err := req.Body.Read(buf)
 			b = append(b, buf[:n]...)
-			if err != nil || len(b) > 64<<10 {
+			if err != nil || len(b) > 512<<10 {
 				break
 			}
 		}

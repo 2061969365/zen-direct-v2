@@ -1002,6 +1002,10 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	if !ok {
 		target = FmtResponses // 未知模型默认 responses 透传（现行行为）
 	}
+	if os.Getenv("ZEN_DUMP_INCOMING") != "" {
+		seq := time.Now().Format("150405.000000000")
+		_ = os.WriteFile("F:/worker/zen-direct-v2/incoming/"+seq+".json", raw, 0644)
+	}
 	if target == FmtGemini || target == FmtMessages {
 		writeErr(w, 400, "invalid_request_error", "model requires unsupported upstream format: "+string(target))
 		return

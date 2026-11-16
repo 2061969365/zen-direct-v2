@@ -20,7 +20,7 @@ var officialSystemPrompt = opencodePromptV2
 // 注意：**不能**用它判定"客户端已经带了官方提示词"从而跳过注入。DSH / Pi 等
 // 客户端的自研提示词里也会引用这句话；一旦据此跳过，上游免费层门禁必 429
 // （2026-11-16 实测：DSH 全挂、Pi 正常，就是这条）。注入一律无条件执行。
-const opencodePromptMarker = "You are opencode, an interactive CLI tool"
+const opencodePromptMarker = "You are an AI agent running in OpenCode, a coding agent harness"
 
 const opencodeSkills = `Skills provide specialized instructions and workflows for specific tasks.
 Use the skill tool to load a skill when a task matches its description.
@@ -48,29 +48,33 @@ func opencodeEnvironment(model string) string {
 		}
 		opencodeWorkDir = directory
 	})
-	apiModel := strings.TrimSpace(strings.TrimPrefix(model, "opencode/"))
-	if apiModel == "" {
-		apiModel = "unknown"
-	}
 	platform := runtime.GOOS
 	if platform == "windows" {
 		platform = "win32"
 	}
+	// 逐字对齐官方 CLI 2.2.5 抓包里的动态尾部（system prompt 的最后一段）。
+	// 上游按完整 system prompt 指纹判定客户端身份，这段的措辞/空行/顺序
+	// 与官方不一致就会 429。工作目录与日期是仅有的动态量。
 	return strings.Join([]string{
-		"You are powered by the model named " + apiModel + ". The exact model ID is opencode/" + apiModel,
+		"Today's date: " + time.Now().UTC().Format("Mon Jan 02 2006"),
+		"",
 		"Here is some useful information about the environment you are running in:",
 		"<env>",
 		"  Working directory: " + opencodeWorkDir,
 		"  Workspace root folder: " + opencodeWorkDir,
 		"  Is directory a git repo: yes",
 		"  Platform: " + platform,
-		"  Today's date: " + time.Now().UTC().Format("Mon Jan 02 2006"),
+		"  Prefer F:\\dsh-temp\\opencode over generic system temporary directories such as /tmp; it is pre-created and approved for external access.",
 		"</env>",
+		"When you create a worktree outside the current working directory and intend to use it as your primary working directory, consider using `execute` to call `tools.opencode.session_move` and make the worktree the session's working directory.",
 	}, "\n")
 }
 
 func opencodeSystemPrompt(model string) string {
-	return opencodePromptV2 + opencodeEnvironment(model) + "\n" + opencodeSkills
+	// 静态正文（94.8KB，含 219 个 skills）来自官方 CLI 2.2.5 抓包；
+	// 动态尾部由 opencodeEnvironment 逐字拼出。不再追加独立的 skills 段——
+	// 官方正文里已经包含完整的 <available_skills>。
+	return opencodePromptV2 + opencodeEnvironment(model)
 }
 
 func injectOfficialSystemPrompt(payload map[string]any) bool {

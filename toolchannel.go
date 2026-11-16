@@ -136,6 +136,12 @@ func channelDescription(channel string, members []map[string]any, protocol Forma
 		} else {
 			desc, _ = m["description"].(string)
 		}
+		// 成员描述必须过脱敏：DSH 的 read/edit/skill 描述带上游封禁短语
+		//（UTF-8 text file / line-numbered content 等），原样嵌入通道描述
+		// 会把指纹原封不动送出去——单轮都 429，与多轮无关。
+		if cleaned, replaced := sanitizeToolDescription(name, desc); replaced {
+			desc = cleaned
+		}
 		b.WriteString("- ")
 		b.WriteString(name)
 		if desc != "" {

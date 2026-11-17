@@ -189,3 +189,69 @@ func TestNonStreamToolFragmentsMerge(t *testing.T) {
 		t.Errorf("参数拼接错误：%q", got)
 	}
 }
+
+// TestNonStreamToolNameFragmentsMerge 盯的是工具名被上游分片下发的情形。
+// 之前 acc.name 是直接赋值（last-wins），`mcp__` + `re` + `ad` 三轮下来只剩 "ad"。
+// 可读名（mcp__read）比哈希名长，被切分的概率更高，所以这条必须有。
+func TestNonStreamToolNameFragmentsMerge(t *testing.T) {
+	cases := []struct {
+		name  string
+		chunks []string
+		want  string
+	}{
+		{
+			name:   "分片拼接",
+			chunks: []string{"mcp__", "re", "ad"},
+			want:   "mcp__read",
+		},
+		{
+			name:   "每片都重复完整名",
+			chunks: []string{"read", "read", "read"},
+			want:   "read",
+		},
+		{
+			name:   "单片完整名",
+			chunks: []string{"read"},
+			want:   "read",
+		},
+		{
+			name:   "先短后长（上游重发完整名）",
+			chunks: []string{"re", "read"},
+			want:   "read",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var sb strings.Builder
+			for i, frag := range tc.chunks {
+				delta := map[string]any{
+					"index":    0,
+					"function": map[string]any{"name": frag, "arguments": ""},
+				}
+				if i == 0 {
+					delta["id"] = "c_a"
+				}
+				frame := map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"tool_calls": []any{delta}}}}}
+				b, _ := json.Marshal(frame)
+				sb.WriteString("data: ")
+				sb.Write(b)
+				sb.WriteString("\n\n")
+			}
+			sb.WriteString("data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n")
+
+			out, err := sseToChatCompletion([]byte(sb.String()), "mimo-v2.5-free")
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			msg := asMap(asArr(out["choices"])[0].(map[string]any)["message"])
+			tcs := asArr(msg["tool_calls"])
+			if len(tcs) != 1 {
+				t.Fatalf("期望 1 个工具，得到 %d 个", len(tcs))
+			}
+			fn := asMap(asMap(tcs[0])["function"])
+			if got := asStr(fn["name"]); got != tc.want {
+				t.Errorf("名字拼接错误：得到 %q，期望 %q", got, tc.want)
+			}
+		})
+	}
+}

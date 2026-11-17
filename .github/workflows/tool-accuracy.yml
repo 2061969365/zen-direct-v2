@@ -2,8 +2,26 @@ name: tool-accuracy
 
 # A/B 测「模型选工具的准确率」：同一批任务，分别打改前和改后的二进制。
 #
-# 为什么要放 CI：免费层按出口 IP 计量，本地跑十来发就 429，样本根本不够。
-# 这里两侧之间重连一次 WARP，换出口 IP，等于各自拿一份干净额度。
+# 为什么要放 CI：免费层按「出口 IP」计量，本地跑十来发就 429，样本根本不够。
+# 所以 A/B 两侧必须各自拿到**不同的、还有额度的**出口 IP，否则样本会被 429 打断。
+#
+# 出口三条路径（workflow_dispatch 的 egress 输入切换，默认 vpngate）：
+#   direct  —— runner 直连（两侧共享同一张 IP，只在明确不care额度时用）
+#   warp    —— Cloudflare WARP，两侧之间 disconnect/connect 换出口（老路径，原样保留）
+#   vpngate —— VPN Gate 节点 + sing-box：**两个不同节点**，各自一个 mixed inbound
+#              （18080 给 A=baseline，18081 给 B=current），两侧出口 IP 必须不同
+#
+# vpngate 这条路的做法照搬本仓库 .github/workflows/asset-e2e.yml 里已经跑通的
+# 两个步骤（run 44066411545 / 44085846624）：
+#   - 节点来源 https://www.vpngate.net/api/iphone/ ，末列是 base64 的 OpenVPN 配置
+#   - sing-box 必须 1.11+（1.10.x 报 unknown field "endpoints"），版本走 GitHub API 动态取
+#   - 探测脚本从 2061969365/zen-vpngate-cloud-test 取两个文件到**同一目录**
+#     （probe_and_select_vpngate.py 里 import vpngate_to_singbox）
+#   - mixed inbound 必须带 host：--mixed 127.0.0.1:PORT，只写端口不会监听
+#   - 生成的配置必须是**单个 endpoint + route.final 直指它**；用 urltest 组
+#     （build_singbox_config 默认 final="auto"）对 openvpn endpoint 会永远
+#     "endpoint is not ready yet"，所以下面用 pin_sb.py 把配置钉死
+#   - public-vpn-* / 筑波公共段（219.100.37.x、150.40.105.x）会被刷满，脚本已把它们排到最后
 #
 # 判据只有三类：hit（选对）/ confusion（选了易混的邻近工具）/ miss（没调或调了个无关的）。
 
@@ -22,6 +40,15 @@ on:
         description: "只跑指定任务，逗号分隔（留空=全部 6 个）"
         required: false
         default: ""
+      egress:
+        description: "出口：vpngate = 两个 VPN Gate 节点（默认）；warp = Cloudflare WARP；direct = runner 直连"
+        required: false
+        type: choice
+        options:
+          - vpngate
+          - warp
+          - direct
+        default: "vpngate"
 
 permissions:
   contents: read
@@ -29,11 +56,16 @@ permissions:
 jobs:
   accuracy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 45 分钟：vpngate 选节点最坏 4 次 ×（12 候选 × 8 并发真实发包）+ 两组 accuracy
+    timeout-minutes: 45
     env:
       TRIALS: ${{ github.event.inputs.trials || '2' }}
       BASELINE_REF: ${{ github.event.inputs.baseline_ref || '97f9ca2' }}
       ONLY_TASKS: ${{ github.event.inputs.tasks || '' }}
+      EGRESS: ${{ github.event.inputs.egress || 'vpngate' }}
+      WORK: ${{ github.workspace }}/_vpn
+      # 单次选节点最多探测的候选数（每个候选是一个新 IP，会消耗一份免费额度）
+      VPMAX: "12"
 
     steps:
       - name: Checkout
@@ -48,7 +80,23 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install WARP and connect
+      - name: Build current binary
+        run: |
+          set -euo pipefail
+          bash scripts/sync_assets.sh || true
+          go build -o zen-current .
+          ls -l zen-current
+
+      - name: Build baseline binary (${{ github.event.inputs.baseline_ref || '97f9ca2' }})
+        run: |
+          set -euo pipefail
+          git worktree add --detach _baseline "$BASELINE_REF"
+          ( cd _baseline && go build -o zen-baseline . )
+          ls -l _baseline/zen-baseline
+
+      # ---------- egress=warp（老路径，逻辑不变，只是加了 if 门）----------
+      - name: "WARP: install and connect (egress=warp)"
+        if: env.EGRESS == 'warp'
         run: |
           set -euo pipefail
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
@@ -66,114 +114,461 @@ jobs:
           done
           curl -s -m 10 https://api.ipify.org | tee "$GITHUB_WORKSPACE/.warp_ip_a"
 
-      - name: Build current binary
+      # ---------- egress=vpngate：工具箱 ----------
+      # 一次取齐：节点快照 CSV、sing-box（1.11+）、探测脚本两个文件、配置钉扎脚本。
+      - name: "Egress vpngate: fetch toolbox (egress=vpngate)"
+        if: env.EGRESS == 'vpngate'
         run: |
-          set -euo pipefail
-          bash scripts/sync_assets.sh || true
-          go build -o zen-current .
+          set -uo pipefail
+          VD="$WORK/vpngate"
+          mkdir -p "$VD"
+          cd "$VD"
+
+          echo "--- 1. VPN Gate 官方快照（CSV，末列是 base64 OpenVPN 配置）"
+          curl -fsSL --retry 3 --retry-delay 1 -o nodes.csv "https://www.vpngate.net/api/iphone/" || {
+            echo "::error::取不到 VPN Gate 快照（vpngate.net 不可达）"; exit 1; }
+          echo "nodes.csv 行数=$(wc -l < nodes.csv)"
+
+          echo "--- 2. sing-box（linux-amd64，动态取最新版；必须 1.11+）"
+          # 必须 1.11+：配置里带 endpoints 字段，1.10.x 报 unknown field "endpoints"
+          sb_tag=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])' 2>/dev/null || echo v1.12.0)
+          sb_ver=${sb_tag#v}
+          echo "sing-box tag=$sb_tag"
+          curl -fsSL --retry 3 --retry-delay 1 -o sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/${sb_tag}/sing-box-${sb_ver}-linux-amd64.tar.gz" || {
+            echo "::error::下载 sing-box ${sb_tag} 失败"; exit 1; }
+          tar -xzf sing-box.tar.gz
+          install -m 0755 "sing-box-${sb_ver}-linux-amd64/sing-box" ./sing-box
+          ./sing-box version | head -3 || true
+          ver=$(./sing-box version | awk 'NR==1{print $NF}')
+          echo "sing-box version=$ver"
+          if [ "$(printf '%s\n1.11.0\n' "$ver" | sort -V | head -1)" != "1.11.0" ]; then
+            echo "::error::sing-box $ver < 1.11，endpoints 字段不认（换 tag）"
+            exit 1
+          fi
+
+          echo "--- 3. 探测脚本（必须同目录：probe 里 import vpngate_to_singbox）"
+          curl -fsSL --retry 3 -o probe_and_select_vpngate.py \
+            "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/probe_and_select_vpngate.py" || {
+            echo "::error::取 probe_and_select_vpngate.py 失败"; exit 1; }
+          curl -fsSL --retry 3 -o vpngate_to_singbox.py \
+            "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/vpngate_to_singbox.py" || {
+            echo "::error::取 vpngate_to_singbox.py 失败"; exit 1; }
+          wc -l probe_and_select_vpngate.py vpngate_to_singbox.py
+
+          echo "--- 4. 配置钉扎脚本"
+          # 探测脚本用 v2s.build_singbox_config() 默认 final="auto"（urltest 组），
+          # 对单个 openvpn endpoint 会永远 "endpoint is not ready yet"。
+          # 这里统一改成「唯一 endpoint + route.final 直指它」。
+          # 同时挡掉脚本的兜底分支：没验到 200 时会塞 3 个存活节点，那不是我们要的。
+          cat > pin_sb.py <<'PY'
+          import json
+          import sys
+
+          path = sys.argv[1]
+          cfg = json.load(open(path, encoding="utf-8"))
+          eps = cfg.get("endpoints") or []
+          if len(eps) != 1:
+              print(f"UNUSABLE endpoints={len(eps)}（要唯一节点；多了说明脚本走了兜底）", flush=True)
+              sys.exit(2)
+          ep = eps[0]
+          tag = ep.get("tag") or "vpngate-0"
+          ep["tag"] = tag
+          cfg["endpoints"] = [ep]
+          cfg["outbounds"] = [{"type": "direct", "tag": "direct"}]
+          cfg.setdefault("route", {})["final"] = tag
+          cfg.setdefault("log", {})["level"] = "info"
+          json.dump(cfg, open(path, "w", encoding="utf-8"), indent=2)
+          print("OK", ep.get("server"), ep.get("server_port"), tag, flush=True)
+          PY
+          python3 -c 'import ast,sys; ast.parse(open("pin_sb.py", encoding="utf-8").read())' \
+            && echo "pin_sb.py 语法 OK"
+
+      # ---------- egress=vpngate：A 侧节点 ----------
+      - name: "Egress vpngate: pick node A (egress=vpngate)"
+        if: env.EGRESS == 'vpngate'
+        run: |
+          set -uo pipefail
+          VD="$WORK/vpngate"
+          cd "$VD"
+          echo "EGRESS=$EGRESS  A=baseline（改前）  B=current（改后）"
+          ok=0
+          for attempt in 1 2 3; do
+            echo "--- 选节点 A：第 $attempt/3 次（最多 $VPMAX 个候选，每个候选一份免费额度）"
+            set +e
+            python3 probe_and_select_vpngate.py \
+              --csv nodes.csv \
+              --output "$VD/sb-a.json" \
+              --zen-bin "$GITHUB_WORKSPACE/zen-current" \
+              --singbox-bin "$VD/sing-box" \
+              --mixed-port 18080 \
+              --max-candidates "$VPMAX" \
+              --concurrency 8 \
+              --keep-nodes 1 > "select-a-$attempt.log" 2>&1
+            rc=$?
+            set -e
+            tail -40 "select-a-$attempt.log" || true
+            if [ "$rc" != "0" ] || [ ! -s sb-a.json ]; then
+              echo "A 第 $attempt 次没选出节点（rc=$rc）"
+              continue
+            fi
+            if ! line=$(python3 pin_sb.py sb-a.json); then
+              echo "A 第 $attempt 次配置不可用（$line），重试"
+              continue
+            fi
+            echo "A 节点：$line"
+            read -r _ a_srv a_prt a_tag <<< "$line"
+            printf '%s' "$a_srv" > node-a.server
+            printf '%s' "$a_srv:$a_prt" > node-a.endpoint
+            {
+              echo "VPN_NODE_A=$a_srv:$a_prt"
+              echo "VPN_TAG_A=$a_tag"
+            } >> "$GITHUB_ENV"
+            ok=1
+            break
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::vpngate 选不出 A 侧节点（免费节点此刻全挂/全被刷满）——本轮无法测量，不降级到 direct"
+            exit 1
+          fi
+
+      - name: "Egress vpngate: start sing-box A (egress=vpngate)"
+        if: env.EGRESS == 'vpngate'
+        run: |
+          set -uo pipefail
+          VD="$WORK/vpngate"
+          cd "$VD"
+          port_open() {
+            python3 -c "import socket,sys; s=socket.socket(); s.settimeout(1); sys.exit(0 if s.connect_ex(('127.0.0.1', int(sys.argv[1])))==0 else 1)" "$1"
+          }
+          nohup ./sing-box run -c sb-a.json > singbox-a.log 2>&1 &
+          echo $! > singbox-a.pid
+          listen=0
+          for i in $(seq 1 25); do
+            if port_open 18080; then listen=1; break; fi
+            sleep 1
+          done
+          if [ "$listen" != "1" ]; then
+            echo "::error::sing-box A 没监听 18080"
+            tail -40 singbox-a.log || true
+            exit 1
+          fi
+          echo "sing-box A 已在 127.0.0.1:18080 监听（节点 $(cat node-a.endpoint 2>/dev/null || echo ?)）"
+          ipa=""
+          for i in $(seq 1 4); do
+            ipa=$(curl -s -m 25 --proxy http://127.0.0.1:18080 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || true)
+            [ -n "$ipa" ] && break
+            sleep 3
+          done
+          if [ -z "$ipa" ]; then
+            echo "::error::A 侧（sing-box 18080）取不到出口 IP，隧道没通"
+            tail -40 singbox-a.log || true
+            exit 1
+          fi
+          echo "A 侧出口 IP: $ipa"
+          printf '%s' "$ipa" > ip-a.txt
+          echo "VPN_IP_A=$ipa" >> "$GITHUB_ENV"
+
+      # ---------- egress=vpngate：B 侧节点（必须换一张 IP）----------
+      # 探测脚本没有 --exclude 参数，所以这里自己保证不同：
+      #   1) 节点服务器 IP 与 A 相同 -> 直接重选
+      #   2) 起 sing-box B 后实测出口 IP，与 A 相同 -> 杀掉重选
+      # 最多 4 次，4 次都撞同一张 IP 就报错退出（绝不两侧共用一张烧穿的 IP）。
+      - name: "Egress vpngate: pick and start node B distinct from A (egress=vpngate)"
+        if: env.EGRESS == 'vpngate'
+        run: |
+          set -uo pipefail
+          VD="$WORK/vpngate"
+          cd "$VD"
+          port_open() {
+            python3 -c "import socket,sys; s=socket.socket(); s.settimeout(1); sys.exit(0 if s.connect_ex(('127.0.0.1', int(sys.argv[1])))==0 else 1)" "$1"
+          }
+          a_srv=$(cat node-a.server 2>/dev/null || echo "")
+          ipa=$(cat ip-a.txt 2>/dev/null || echo "")
+          echo "A: node=${a_srv:-?} exit_ip=${ipa:-?}"
+          ok=0
+          for attempt in 1 2 3 4; do
+            echo "--- 选节点 B：第 $attempt/4 次（最多 $VPMAX 个候选）"
+            if [ -f singbox-b.pid ]; then kill "$(cat singbox-b.pid)" 2>/dev/null || true; fi
+            sleep 1
+            set +e
+            python3 probe_and_select_vpngate.py \
+              --csv nodes.csv \
+              --output sb-b.json \
+              --zen-bin "$GITHUB_WORKSPACE/zen-current" \
+              --singbox-bin ./sing-box \
+              --mixed-port 18081 \
+              --max-candidates "$VPMAX" \
+              --concurrency 8 \
+              --keep-nodes 1 > "select-b-$attempt.log" 2>&1
+            rc=$?
+            set -e
+            tail -40 "select-b-$attempt.log" || true
+            if [ "$rc" != "0" ] || [ ! -s sb-b.json ]; then
+              echo "B 第 $attempt 次没选出节点（rc=$rc）"
+              continue
+            fi
+            if ! line=$(python3 pin_sb.py sb-b.json); then
+              echo "B 第 $attempt 次配置不可用（$line），重试"
+              continue
+            fi
+            read -r _ b_srv b_prt b_tag <<< "$line"
+            echo "B 节点：$b_srv:$b_prt"
+            if [ -n "$a_srv" ] && [ "$b_srv" = "$a_srv" ]; then
+              echo "B 选到了和 A 同一个节点（$a_srv），重选"
+              continue
+            fi
+            nohup ./sing-box run -c sb-b.json > singbox-b.log 2>&1 &
+            echo $! > singbox-b.pid
+            listen=0
+            for i in $(seq 1 25); do
+              if port_open 18081; then listen=1; break; fi
+              sleep 1
+            done
+            if [ "$listen" != "1" ]; then
+              echo "B 的 sing-box 没监听 18081"
+              tail -40 singbox-b.log || true
+              kill "$(cat singbox-b.pid)" 2>/dev/null || true
+              continue
+            fi
+            ipb=""
+            for i in $(seq 1 4); do
+              ipb=$(curl -s -m 25 --proxy http://127.0.0.1:18081 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || true)
+              [ -n "$ipb" ] && break
+              sleep 3
+            done
+            if [ -z "$ipb" ]; then
+              echo "B 侧取不到出口 IP（隧道没通），重选"
+              kill "$(cat singbox-b.pid)" 2>/dev/null || true
+              continue
+            fi
+            echo "A exit_ip=$ipa   B exit_ip=$ipb"
+            if [ -n "$ipa" ] && [ "$ipb" = "$ipa" ]; then
+              echo "两侧出口 IP 相同（$ipa）→ 选到了同一张出口，杀掉 B 重选"
+              kill "$(cat singbox-b.pid)" 2>/dev/null || true
+              continue
+            fi
+            {
+              echo "VPN_IP_B=$ipb"
+              echo "VPN_NODE_B=$b_srv:$b_prt"
+              echo "VPN_TAG_B=$b_tag"
+            } >> "$GITHUB_ENV"
+            printf '%s' "$ipb" > ip-b.txt
+            printf '%s' "$b_srv:$b_prt" > node-b.endpoint
+            ok=1
+            break
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::4 次都没拿到与 A 不同的 B 侧出口（免费节点池里没有第二张干净 IP）——本轮不测，绝不两侧共用一张 IP"
+            exit 1
+          fi
+          echo "两侧出口就绪：A=$ipa B=$(cat ip-b.txt)"
+          {
+            echo ""
+            echo "### 双侧出口（vpngate）"
+            echo "- A(baseline) sing-box: \`127.0.0.1:18080\` → exit \`$ipa\` → 节点 \`$(cat node-a.endpoint 2>/dev/null || echo ?)\`"
+            echo "- B(current)  sing-box: \`127.0.0.1:18081\` → exit \`$(cat ip-b.txt)\` → 节点 \`$(cat node-b.endpoint 2>/dev/null || echo ?)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Preflight — 确认出口 IP 还有额度
         run: |
           set -uo pipefail
-          PORT=18080 ./zen-current > _pf.log 2>&1 &
-          for i in $(seq 1 30); do
-            curl -fsS -m 3 http://127.0.0.1:18080/health >/dev/null 2>&1 && break
-            sleep 1
-          done
-
+          PF_PORT=18084
           body='{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}],"max_tokens":1}'
-          ip_now() { curl -s -m 8 https://api.ipify.org 2>/dev/null || true; }
 
-          rotate() {
-            local prev=$1
-            sudo warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
-            sleep 3
-            sudo warp-cli --accept-tos connect >/dev/null 2>&1 || true
-            # 等 IP 真的变：WARP 有时会粘在同一张出口上
-            for i in $(seq 1 20); do
-              sleep 2
-              local cur; cur=$(ip_now)
-              if [ -n "$cur" ] && [ "$cur" != "$prev" ]; then
-                return 0
-              fi
+          # $1 = mixed proxy url（空 = 不走代理，direct / warp 都走这条）
+          start_gw() {
+            if [ -n "${1:-}" ]; then
+              PORT=$PF_PORT HTTPS_PROXY="$1" HTTP_PROXY="$1" NO_PROXY=127.0.0.1,localhost \
+                ./zen-current > _pf.log 2>&1 &
+            else
+              PORT=$PF_PORT ./zen-current > _pf.log 2>&1 &
+            fi
+            GW_PID=$!
+            for i in $(seq 1 30); do
+              curl -fsS -m 3 "http://127.0.0.1:$PF_PORT/health" >/dev/null 2>&1 && return 0
+              sleep 1
             done
             return 1
           }
-
-          ok=0
-          stuck=0
-          for attempt in 1 2 3 4 5; do
+          pf_post() {
+            local code
+            # curl 自己失败（隧道断/连接拒绝）时会非零退出，这里吞掉，交给调用方按 http 码判断；
+            # 不吞的话 GitHub 的 `bash -e` 会直接把整步打断，重试逻辑就失效了。
             code=$(curl -s -o _pf.json -w '%{http_code}' -m 60 \
-              -X POST http://127.0.0.1:18080/v1/chat/completions \
-              -H 'content-type: application/json' -d "$body" 2>/dev/null)
-            code=${code:-curl_failed}
-            echo "preflight attempt=$attempt http=$code ip=$(ip_now)"
-            if [ "$code" = "200" ]; then ok=1; break; fi
-            if [ "$code" = "429" ] || [ "$code" = "402" ]; then
-              prev=$(ip_now)
-              if rotate "$prev"; then
-                echo "出口已换: $prev -> $(ip_now)"
-              else
-                stuck=$((stuck + 1))
-                echo "第 $stuck 次没换动，重新注册 WARP 身份"
-                sudo warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
-                sudo warp-cli --accept-tos registration new >/dev/null 2>&1 || true
-                sudo warp-cli --accept-tos connect >/dev/null 2>&1 || true
-                sleep 8
-              fi
-              [ "$stuck" -ge 3 ] && { echo "::error::WARP 连续换不出新出口"; break; }
-            else
-              echo "::error::preflight 非额度失败（http=$code）"; head -c 300 _pf.json || true
-              break
-            fi
-          done
-          pkill -f zen-current || true
-          sleep 1
-          if [ "$ok" != "1" ]; then
-            echo "::error::没有可用出口，本轮无法测量（免费层按出口 IP 计量，每个 IP 的额度都很小）"
-            exit 1
-          fi
+              -X POST "http://127.0.0.1:$PF_PORT/v1/chat/completions" \
+              -H 'content-type: application/json' -d "$body" 2>/dev/null || true)
+            echo "${code:-curl_failed}"
+          }
 
-      - name: Build baseline binary (${{ github.event.inputs.baseline_ref || '97f9ca2' }})
-        run: |
-          set -euo pipefail
-          git worktree add --detach _baseline "$BASELINE_REF"
-          ( cd _baseline && go build -o zen-baseline . )
-          ls -l _baseline/zen-baseline
+          case "$EGRESS" in
+            vpngate)
+              # 两侧各自的节点就是各自的出口，没法「换出口」，只能如实报告。
+              # 撞 429 不在这里判死：样本里会记 quota，汇总表会标注结论不可用。
+              ip_now_a() { curl -s -m 8 --proxy http://127.0.0.1:18080 https://api.ipify.org 2>/dev/null || true; }
+              ip_now_b() { curl -s -m 8 --proxy http://127.0.0.1:18081 https://api.ipify.org 2>/dev/null || true; }
+              for side in A B; do
+                if [ "$side" = "A" ]; then proxy="http://127.0.0.1:18080"; ipn=$(ip_now_a);
+                else proxy="http://127.0.0.1:18081"; ipn=$(ip_now_b); fi
+                if ! start_gw "$proxy"; then
+                  echo "::error::preflight 起网关失败（side=$side proxy=$proxy）"
+                  tail -30 _pf.log || true
+                  exit 1
+                fi
+                code=""
+                for attempt in 1 2 3; do
+                  code=$(pf_post)
+                  echo "preflight side=$side attempt=$attempt http=$code ip=$ipn"
+                  [ "$code" = "200" ] && break
+                  sleep 4
+                done
+                kill "$GW_PID" 2>/dev/null || true
+                pkill -f zen-current || true
+                sleep 1
+                if [ "$code" != "200" ]; then
+                  echo "::warning::$side 侧出口（$proxy, ip=$ipn）预检 http=$code，仍继续跑（样本会记 quota）"
+                fi
+              done
+              ;;
+            warp)
+              if ! start_gw ""; then
+                echo "::error::preflight 起网关失败"
+                tail -30 _pf.log || true
+                exit 1
+              fi
+              ip_now() { curl -s -m 8 https://api.ipify.org 2>/dev/null || true; }
+              rotate() {
+                local prev=$1
+                sudo warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+                sleep 3
+                sudo warp-cli --accept-tos connect >/dev/null 2>&1 || true
+                # 等 IP 真的变：WARP 有时会粘在同一张出口上
+                for i in $(seq 1 20); do
+                  sleep 2
+                  local cur; cur=$(ip_now)
+                  if [ -n "$cur" ] && [ "$cur" != "$prev" ]; then
+                    return 0
+                  fi
+                done
+                return 1
+              }
+              ok=0
+              stuck=0
+              for attempt in 1 2 3 4 5; do
+                code=$(pf_post)
+                echo "preflight attempt=$attempt http=$code ip=$(ip_now)"
+                if [ "$code" = "200" ]; then ok=1; break; fi
+                if [ "$code" = "429" ] || [ "$code" = "402" ]; then
+                  prev=$(ip_now)
+                  if rotate "$prev"; then
+                    echo "出口已换: $prev -> $(ip_now)"
+                  else
+                    stuck=$((stuck + 1))
+                    echo "第 $stuck 次没换动，重新注册 WARP 身份"
+                    sudo warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+                    sudo warp-cli --accept-tos registration new >/dev/null 2>&1 || true
+                    sudo warp-cli --accept-tos connect >/dev/null 2>&1 || true
+                    sleep 8
+                  fi
+                  [ "$stuck" -ge 3 ] && { echo "::error::WARP 连续换不出新出口"; break; }
+                else
+                  echo "::error::preflight 非额度失败（http=$code）"; head -c 300 _pf.json || true
+                  break
+                fi
+              done
+              kill "$GW_PID" 2>/dev/null || true
+              pkill -f zen-current || true
+              sleep 1
+              if [ "$ok" != "1" ]; then
+                echo "::error::没有可用出口，本轮无法测量（免费层按出口 IP 计量，每个 IP 的额度都很小）"
+                exit 1
+              fi
+              ;;
+            *)
+              # direct：两侧共用 runner 自己的 IP，只探一次额度
+              if ! start_gw ""; then
+                echo "::error::preflight 起网关失败"
+                tail -30 _pf.log || true
+                exit 1
+              fi
+              ok=0
+              for attempt in 1 2 3; do
+                code=$(pf_post)
+                echo "preflight attempt=$attempt http=$code ip=$(curl -s -m 8 https://api.ipify.org 2>/dev/null || true)"
+                if [ "$code" = "200" ]; then ok=1; break; fi
+                sleep 6
+              done
+              kill "$GW_PID" 2>/dev/null || true
+              pkill -f zen-current || true
+              sleep 1
+              if [ "$ok" != "1" ]; then
+                echo "::error::direct 出口没有额度，本轮无法测量（两侧会共用同一张被烧穿的 IP）"
+                exit 1
+              fi
+              ;;
+          esac
 
       - name: Run A — baseline accuracy
         run: |
           set -uo pipefail
-          PORT=18081 ./_baseline/zen-baseline > _e2e_base.log 2>&1 &
+          A_PORT=18082
+          # 网关的 bunTransport 把 HTTP(S)_PROXY 当**全局**代理（连 127.0.0.1 也走 CONNECT），
+          # 所以必须同时给 NO_PROXY=127.0.0.1,localhost，否则 accuracy 工具连不上网关。
+          if [ "$EGRESS" = "vpngate" ]; then
+            PORT=$A_PORT \
+            HTTPS_PROXY=http://127.0.0.1:18080 HTTP_PROXY=http://127.0.0.1:18080 \
+            ALL_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost \
+              ./_baseline/zen-baseline > _e2e_base.log 2>&1 &
+            echo "A(baseline) 出口：sing-box 127.0.0.1:18080（exit $(cat "$WORK/vpngate/ip-a.txt" 2>/dev/null || echo ?)）"
+          else
+            PORT=$A_PORT ./_baseline/zen-baseline > _e2e_base.log 2>&1 &
+            echo "A(baseline) 出口：$EGRESS 直连"
+          fi
+          gw_pid=$!
+          ready=0
           for i in $(seq 1 30); do
-            curl -fsS -m 3 http://127.0.0.1:18081/health >/dev/null 2>&1 && break
+            if curl -fsS -m 3 "http://127.0.0.1:$A_PORT/health" >/dev/null 2>&1; then ready=1; break; fi
             sleep 1
           done
+          if [ "$ready" != "1" ]; then
+            echo "::error::A 侧网关 /health 30s 内没起来"
+            tail -40 _e2e_base.log || true
+            exit 1
+          fi
           set +e
-          python3 tools/tool_accuracy.py --base http://127.0.0.1:18081 \
-            --out result-before.json --trials "$TRIALS" --only "$ONLY_TASKS"
+          # 探测工具自己只连 127.0.0.1，显式清掉代理变量，避免被上面那套带跑
+          env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+              NO_PROXY=127.0.0.1,localhost \
+            python3 tools/tool_accuracy.py --base "http://127.0.0.1:$A_PORT" \
+              --out result-before.json --trials "$TRIALS" --only "$ONLY_TASKS"
           echo "BEFORE_RC=$?" >> "$GITHUB_ENV"
           set -e
+          kill "$gw_pid" 2>/dev/null || true
           pkill -f zen-baseline || true
           sleep 1
 
-      - name: Reconnect WARP to rotate egress IP
+      - name: "Reconnect WARP to rotate egress IP (egress=warp)"
+        if: env.EGRESS == 'warp'
         run: |
           set -uo pipefail
           prev=$(cat "$GITHUB_WORKSPACE/.warp_ip_a" 2>/dev/null || echo unknown)
           sudo warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
           sleep 3
           sudo warp-cli --accept-tos connect >/dev/null 2>&1 || true
+          final=""
           for i in $(seq 1 30); do
             ip=$(curl -s -m 10 https://api.ipify.org || true)
             if [ -n "$ip" ] && [ "$ip" != "$prev" ]; then
               echo "egress IP rotated: $prev -> $ip"
+              final=$ip
               break
             fi
             sleep 2
           done
-          final=$(curl -s -m 10 https://api.ipify.org || echo unknown)
+          final=${final:-$(curl -s -m 10 https://api.ipify.org || echo unknown)}
           echo "egress IP for run B: $final"
+          echo "WARP_IP_B=$final" >> "$GITHUB_ENV"
           if [ "$final" = "$prev" ]; then
             echo "::warning::WARP 没换到新 IP（$prev），B 侧可能撞额度"
           fi
@@ -181,19 +576,52 @@ jobs:
       - name: Run B — current accuracy
         run: |
           set -uo pipefail
-          PORT=18082 ./zen-current > _e2e_cur.log 2>&1 &
+          B_PORT=18083
+          if [ "$EGRESS" = "vpngate" ]; then
+            PORT=$B_PORT \
+            HTTPS_PROXY=http://127.0.0.1:18081 HTTP_PROXY=http://127.0.0.1:18081 \
+            ALL_PROXY=http://127.0.0.1:18081 NO_PROXY=127.0.0.1,localhost \
+              ./zen-current > _e2e_cur.log 2>&1 &
+            echo "B(current) 出口：sing-box 127.0.0.1:18081（exit $(cat "$WORK/vpngate/ip-b.txt" 2>/dev/null || echo ?)）"
+          else
+            PORT=$B_PORT ./zen-current > _e2e_cur.log 2>&1 &
+            echo "B(current) 出口：$EGRESS 直连"
+          fi
+          gw_pid=$!
+          ready=0
           for i in $(seq 1 30); do
-            curl -fsS -m 3 http://127.0.0.1:18082/health >/dev/null 2>&1 && break
+            if curl -fsS -m 3 "http://127.0.0.1:$B_PORT/health" >/dev/null 2>&1; then ready=1; break; fi
             sleep 1
           done
+          if [ "$ready" != "1" ]; then
+            echo "::error::B 侧网关 /health 30s 内没起来"
+            tail -40 _e2e_cur.log || true
+            exit 1
+          fi
           set +e
-          python3 tools/tool_accuracy.py --base http://127.0.0.1:18082 \
-            --out result-after.json --trials "$TRIALS" --only "$ONLY_TASKS"
+          env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+              NO_PROXY=127.0.0.1,localhost \
+            python3 tools/tool_accuracy.py --base "http://127.0.0.1:$B_PORT" \
+              --out result-after.json --trials "$TRIALS" --only "$ONLY_TASKS"
           echo "AFTER_RC=$?" >> "$GITHUB_ENV"
           set -e
-          curl -fsS -m 5 http://127.0.0.1:18082/health | python3 -c 'import json,sys; d=json.load(sys.stdin); print("tool_shape:", json.dumps(d.get("tool_shape"), ensure_ascii=False))' || true
+          curl -fsS -m 5 "http://127.0.0.1:$B_PORT/health" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("tool_shape:", json.dumps(d.get("tool_shape"), ensure_ascii=False))' || true
+          kill "$gw_pid" 2>/dev/null || true
           pkill -f zen-current || true
           sleep 1
+
+      - name: Stop vpngate sing-box instances
+        if: always() && env.EGRESS == 'vpngate'
+        run: |
+          set -uo pipefail
+          VD="$WORK/vpngate"
+          for f in singbox-a.pid singbox-b.pid; do
+            if [ -f "$VD/$f" ]; then
+              kill "$(cat "$VD/$f")" 2>/dev/null || true
+            fi
+          done
+          pkill -f "sing-box run -c sb-" || true
+          echo "sing-box 已停"
 
       - name: Compare and summarise
         if: always()
@@ -205,6 +633,15 @@ jobs:
             echo "- baseline: \`$BASELINE_REF\`（改前）"
             echo "- current: \`${GITHUB_SHA::7}\`（P0 可读名 + P1 描述覆盖）"
             echo "- trials/task: \`$TRIALS\`"
+            echo "- egress: \`$EGRESS\`"
+            if [ "$EGRESS" = "vpngate" ]; then
+              echo "- A(baseline) 出口 IP: \`${VPN_IP_A:-?}\`（节点 \`${VPN_NODE_A:-?}\`，sing-box 18080）"
+              echo "- B(current) 出口 IP: \`${VPN_IP_B:-?}\`（节点 \`${VPN_NODE_B:-?}\`，sing-box 18081）"
+            elif [ "$EGRESS" = "warp" ]; then
+              echo "- WARP 出口 IP: A=\`$(cat "$GITHUB_WORKSPACE/.warp_ip_a" 2>/dev/null || echo ?)\` B=\`${WARP_IP_B:-?}\`"
+            else
+              echo "- 出口 IP: \`$(cat "$GITHUB_WORKSPACE/.warp_ip_a" 2>/dev/null || echo direct)\`（direct，两侧共用）"
+            fi
             echo ""
             python3 - <<'PY' || true
           import json, os
@@ -220,6 +657,9 @@ jobs:
           before, after = load("result-before.json"), load("result-after.json")
           print("| | baseline | current |")
           print("|---|---|---|")
+          ip_a = os.environ.get("VPN_IP_A") or "?"
+          ip_b = os.environ.get("VPN_IP_B") or os.environ.get("WARP_IP_B") or "?"
+          print(f"| 出口 IP | `{ip_a}` | `{ip_b}` |")
           for key, label in (("hit_rate", "hit_rate"), ("hits", "hit"),
                              ("confusions", "confusion"), ("misses", "miss"),
                              ("quota", "quota"), ("judged", "有效样本")):
@@ -242,15 +682,20 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           # 额度不够就不下结论
-          q = python3 - <<'PY'
-          import json, os
-          t = 0
-          for p in ("result-before.json", "result-after.json"):
-              if os.path.exists(p):
-                  t += json.load(open(p)).get("quota", 0)
-          print(t)
-          PY
+          q=0
+          for p in result-before.json result-after.json; do
+            if [ -s "$p" ]; then
+              n=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1], encoding="utf-8")).get("quota") or 0))' "$p" 2>/dev/null || echo 0)
+              q=$((q + n))
+            fi
+          done
           if [ "${q:-0}" -gt 0 ]; then
+            {
+              echo ""
+              echo "> **本轮结论不可用**：有 $q 条样本撞额度（429/402），"
+              echo "> 两侧分母被削得不一样，不能据此判断 P0/P1 的收益方向。"
+              echo "> 换时间重跑，或把 egress 切成 vpngate 换两个新节点。"
+            } >> "$GITHUB_STEP_SUMMARY"
             echo "::warning::本轮有 $q 次撞额度，结论不可用；换个时间或用 --tasks 缩小任务集重跑"
           fi
 
@@ -264,5 +709,11 @@ jobs:
             result-after.json
             _e2e_base.log
             _e2e_cur.log
+            _vpn/vpngate/sb-a.json
+            _vpn/vpngate/sb-b.json
+            _vpn/vpngate/select-a-*.log
+            _vpn/vpngate/select-b-*.log
+            _vpn/vpngate/singbox-a.log
+            _vpn/vpngate/singbox-b.log
           retention-days: 7
           if-no-files-found: warn

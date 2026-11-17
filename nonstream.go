@@ -161,7 +161,11 @@ func sseToChatCompletion(raw []byte, model string) (map[string]any, error) {
 				}
 				if fn, ok := tm["function"].(map[string]any); ok {
 					if v := asStr(fn["name"]); v != "" {
-						acc.name = v
+						// 上游可能把工具名分片下发（`mcp__` + `re` + `ad`）。
+						// 这里原先是直接赋值（last-wins），非流聚合只会留下最后一片，
+						// 实测拿到过 "ad"。可读名比哈希名长，被切分的概率更高，
+						// 所以必须走和流式同一套合并语义。
+						acc.name = mergeToolName(acc.name, v)
 					}
 					acc.args.WriteString(asStr(fn["arguments"]))
 				}

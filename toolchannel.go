@@ -270,7 +270,13 @@ const additionalPropertiesKey = "additionalProperties"
 // applyChannelArgs 把模型返回的 _args 展开成真实参数，并去掉选择器字段。
 // 返回 (真实工具名, 真实参数 JSON 字符串)。
 // channelModeOn 报告是否启用了工具通道模式。
-func channelModeOn() bool { return os.Getenv("ZEN_TOOL_CHANNEL") != "" }
+func channelModeOn() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ZEN_TOOL_CHANNEL"))) {
+	case "", "0", "off", "false", "no":
+		return false
+	}
+	return true
+}
 
 // rewriteChannelHistory 把历史消息里真实工具名映射回通道名。
 //

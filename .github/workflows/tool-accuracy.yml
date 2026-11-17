@@ -1,0 +1,203 @@
+name: tool-accuracy
+
+# A/B 测「模型选工具的准确率」：同一批任务，分别打改前和改后的二进制。
+#
+# 为什么要放 CI：免费层按出口 IP 计量，本地跑十来发就 429，样本根本不够。
+# 这里两侧之间重连一次 WARP，换出口 IP，等于各自拿一份干净额度。
+#
+# 判据只有三类：hit（选对）/ confusion（选了易混的邻近工具）/ miss（没调或调了个无关的）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      trials:
+        description: "每个任务跑几次"
+        required: false
+        default: "2"
+      baseline_ref:
+        description: "对照用的提交（改前）"
+        required: false
+        default: "3b944fa"
+      tasks:
+        description: "只跑指定任务，逗号分隔（留空=全部 6 个）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  accuracy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TRIALS: ${{ github.event.inputs.trials || '2' }}
+      BASELINE_REF: ${{ github.event.inputs.baseline_ref || '3b944fa' }}
+      ONLY_TASKS: ${{ github.event.inputs.tasks || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go (version from go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install WARP and connect
+        run: |
+          set -euo pipefail
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cloudflare-warp
+          sudo warp-cli --accept-tos registration new >/dev/null 2>&1 || true
+          sudo warp-cli --accept-tos connect >/dev/null 2>&1 || true
+          for i in $(seq 1 30); do
+            ip=$(curl -s -m 10 https://api.ipify.org || true)
+            [ -n "$ip" ] && { echo "egress IP: $ip"; break; }
+            sleep 2
+          done
+          curl -s -m 10 https://api.ipify.org | tee "$GITHUB_WORKSPACE/.warp_ip_a"
+
+      - name: Build current binary
+        run: |
+          set -euo pipefail
+          bash scripts/sync_assets.sh || true
+          go build -o zen-current .
+
+      - name: Build baseline binary (${{ github.event.inputs.baseline_ref || '3b944fa' }})
+        run: |
+          set -euo pipefail
+          git worktree add --detach _baseline "$BASELINE_REF"
+          ( cd _baseline && go build -o zen-baseline . )
+          ls -l _baseline/zen-baseline
+
+      - name: Run A — baseline accuracy
+        run: |
+          set -uo pipefail
+          PORT=18081 ./_baseline/zen-baseline > _e2e_base.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS -m 3 http://127.0.0.1:18081/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          set +e
+          python3 tools/tool_accuracy.py --base http://127.0.0.1:18081 \
+            --out result-before.json --trials "$TRIALS" --only "$ONLY_TASKS"
+          echo "BEFORE_RC=$?" >> "$GITHUB_ENV"
+          set -e
+          pkill -f zen-baseline || true
+          sleep 1
+
+      - name: Reconnect WARP to rotate egress IP
+        run: |
+          set -uo pipefail
+          prev=$(cat "$GITHUB_WORKSPACE/.warp_ip_a" 2>/dev/null || echo unknown)
+          sudo warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+          sleep 3
+          sudo warp-cli --accept-tos connect >/dev/null 2>&1 || true
+          for i in $(seq 1 30); do
+            ip=$(curl -s -m 10 https://api.ipify.org || true)
+            if [ -n "$ip" ] && [ "$ip" != "$prev" ]; then
+              echo "egress IP rotated: $prev -> $ip"
+              break
+            fi
+            sleep 2
+          done
+          final=$(curl -s -m 10 https://api.ipify.org || echo unknown)
+          echo "egress IP for run B: $final"
+          if [ "$final" = "$prev" ]; then
+            echo "::warning::WARP 没换到新 IP（$prev），B 侧可能撞额度"
+          fi
+
+      - name: Run B — current accuracy
+        run: |
+          set -uo pipefail
+          PORT=18082 ./zen-current > _e2e_cur.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS -m 3 http://127.0.0.1:18082/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          set +e
+          python3 tools/tool_accuracy.py --base http://127.0.0.1:18082 \
+            --out result-after.json --trials "$TRIALS" --only "$ONLY_TASKS"
+          echo "AFTER_RC=$?" >> "$GITHUB_ENV"
+          set -e
+          curl -fsS -m 5 http://127.0.0.1:18082/health | python3 -c 'import json,sys; d=json.load(sys.stdin); print("tool_shape:", json.dumps(d.get("tool_shape"), ensure_ascii=False))' || true
+          pkill -f zen-current || true
+          sleep 1
+
+      - name: Compare and summarise
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "### 工具调用准确率 A/B"
+            echo ""
+            echo "- baseline: \`$BASELINE_REF\`（改前）"
+            echo "- current: \`${GITHUB_SHA::7}\`（P0 可读名 + P1 描述覆盖）"
+            echo "- trials/task: \`$TRIALS\`"
+            echo ""
+            python3 - <<'PY' || true
+          import json, os
+
+          def load(p):
+              if not os.path.exists(p):
+                  return None
+              try:
+                  return json.load(open(p, encoding="utf-8"))
+              except Exception:
+                  return None
+
+          before, after = load("result-before.json"), load("result-after.json")
+          print("| | baseline | current |")
+          print("|---|---|---|")
+          for key, label in (("hit_rate", "hit_rate"), ("hits", "hit"),
+                             ("confusions", "confusion"), ("misses", "miss"),
+                             ("quota", "quota"), ("judged", "有效样本")):
+              a = (before or {}).get(key)
+              b = (after or {}).get(key)
+              print(f"| {label} | {a} | {b} |")
+          print()
+          for name, d in (("baseline", before), ("current", after)):
+              if not d:
+                  continue
+              print(f"**{name}**")
+              print()
+              print("| 任务 | 判定 | 实际调了 |")
+              print("|---|---|---|")
+              for r in d.get("results", []):
+                  print(f"| `{r['task']}` #{r['trial']} | {r['verdict']} | "
+                        f"{','.join(r.get('called') or []) or '—'} |")
+              print()
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 额度不够就不下结论
+          q = python3 - <<'PY'
+          import json, os
+          t = 0
+          for p in ("result-before.json", "result-after.json"):
+              if os.path.exists(p):
+                  t += json.load(open(p)).get("quota", 0)
+          print(t)
+          PY
+          if [ "${q:-0}" -gt 0 ]; then
+            echo "::warning::本轮有 $q 次撞额度，结论不可用；换个时间或用 --tasks 缩小任务集重跑"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tool-accuracy-${{ github.run_id }}
+          path: |
+            result-before.json
+            result-after.json
+            _e2e_base.log
+            _e2e_cur.log
+          retention-days: 7
+          if-no-files-found: warn

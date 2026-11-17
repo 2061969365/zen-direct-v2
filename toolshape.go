@@ -267,7 +267,21 @@ var clientToolPrefixOnce = sync.OnceValue(func() string {
 // ClientToolPrefix 返回当前生效的客户端工具线上名前缀。
 func ClientToolPrefix() string { return clientToolPrefixOnce() }
 
+// clientToolDigestLength 是**旧版**纯 digest 上线名的长度（sha256 前 12 位 hex）。
+// 新格式不再用它生成名字，只用于识别历史消息/旧响应里残留的旧形状。
 const clientToolDigestLength = 12
+
+// clientToolDigestTailLength 是超长名字被截断时追加的 digest 位数。
+const clientToolDigestTailLength = 8
+
+// clientToolNameSeparator 是前缀与名字主体之间的分隔符。默认前缀 mcp_ 加上
+// 它就是 mcp__<name>，与官方客户端 MCP 工具名（mcp__<server>__<tool>）同形，
+// 上游对这种形状的放行逻辑与旧版 mcp_<digest> 一致。
+const clientToolNameSeparator = "_"
+
+// clientToolNameFallback 是归一化后为空的名字兜底主体。
+const clientToolNameFallback = "tool"
+
 const toolWireNameLimit = 64
 
 type ToolRenames struct {
@@ -481,7 +495,7 @@ func (r *ToolRenames) Resolve(wire string) (string, bool) {
 		return client, client != wire
 	}
 	client := wire
-	if rest, ok := strings.CutPrefix(wire, ClientToolPrefix()); ok && rest != "" {
+	if rest, ok := splitClientToolWireName(wire); ok {
 		client = rest
 	}
 	if _, declared := r.toWire[client]; declared {
@@ -497,8 +511,60 @@ func (r *ToolRenames) Resolve(wire string) (string, bool) {
 	if match, ok := r.byShape[foldToolName(client)]; ok && match != "" {
 		return match, match != wire
 	}
+	// 旧形状兜底：mcp_<hex> 是映射表里没有的旧版名字。剥前缀只会把 hex 当成
+	// 客户端工具名回给客户端（它从没声明过这个名字），所以原样透传 + 一条 warn。
+	if legacyClientToolWireName(wire) {
+		warnLegacyClientToolWire(wire)
+		return wire, false
+	}
 	return client, client != wire
 }
+
+// splitClientToolWireName 拆一个线上名：去掉 ClientToolPrefix 与紧随其后的
+// 分隔符，返回名字主体。
+//
+// 新格式 mcp__read → read；旧格式 mcp_<hex> 没有分隔符（TrimLeft 无效）→ hex。
+// 名字主体永远不含前导下划线（归一化保证），所以宽松地吃掉多余的分隔符是安全的
+// ——模型偶尔会把 mcp__read 写成 mcp___read。
+func splitClientToolWireName(wire string) (string, bool) {
+	rest, ok := strings.CutPrefix(wire, ClientToolPrefix())
+	if !ok {
+		return "", false
+	}
+	rest = strings.TrimLeft(rest, clientToolNameSeparator)
+	if rest == "" {
+		return "", false
+	}
+	return rest, true
+}
+
+// legacyClientToolWireName 报告 wire 是否是旧版"纯 digest"上线名
+// （前缀 + 12/16 位小写 hex，分隔符可有可无）。
+//
+// 旧版 ClientToolWireName 用 sha256 截断当名字，模型看到的名字不携带语义。
+// 升级后仍有历史会话/客户端缓存带着这种名字进来：能通过映射表还原就还原，
+// 还原不了就原样透传，别把 hex 当成客户端工具名传下去。
+func legacyClientToolWireName(wire string) bool {
+	body, ok := splitClientToolWireName(wire)
+	if !ok || len(body) < clientToolDigestLength || len(body) > 2*clientToolDigestLength+4 {
+		return false
+	}
+	for _, char := range body {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// warnLegacyClientToolWire 每个进程只记一次旧形状告警，避免逐帧刷日志。
+func warnLegacyClientToolWire(wire string) {
+	legacyWireWarnOnce.Do(func() {
+		log.Printf("warn: legacy client tool wire name %q has no rename entry; passing it through unchanged", wire)
+	})
+}
+
+var legacyWireWarnOnce sync.Once
 
 func (r *ToolRenames) Restore(wire string) string {
 	client, _ := r.Resolve(wire)
@@ -519,7 +585,7 @@ func (r *ToolRenames) ResolveFuzzy(wire string) (string, bool) {
 		return client, true
 	}
 	candidate := wire
-	if rest, ok := strings.CutPrefix(wire, ClientToolPrefix()); ok && rest != "" {
+	if rest, ok := splitClientToolWireName(wire); ok {
 		candidate = rest
 	}
 	if _, declared := r.toWire[candidate]; declared {
@@ -530,6 +596,12 @@ func (r *ToolRenames) ResolveFuzzy(wire string) (string, bool) {
 	}
 	if match, ok := r.byShape[foldToolName(candidate)]; ok && match != "" {
 		return match, true
+	}
+	// 旧形状（mcp_<hex>）不参与编辑距离修复：它和可读名差得远，硬修只会把
+	// 一个语义未知的名字猜成别的工具。原样透传 + 一条 warn。
+	if legacyClientToolWireName(wire) {
+		warnLegacyClientToolWire(wire)
+		return wire, false
 	}
 	if !strings.HasPrefix(wire, ClientToolPrefix()) {
 		return wire, false
@@ -588,26 +660,60 @@ func editDistanceAtMostOne(a, b string) bool {
 	return edits <= 1
 }
 
+// ClientToolWireName 生成一个客户端工具的线上名：
+//
+//	read              → mcp__read
+//	github_create_issue → mcp__github_create_issue
+//	My Tool!          → mcp__my_tool        （非法字符归一成 _）
+//	<超长名>           → mcp__<截断>_<8hex>  （截断 + digest 尾巴，仍唯一）
+//	重名（归一后撞车）  → mcp__read_2 / _3 …
+//
+// 旧实现用 sha256 截断当名字（mcp_<12hex>），模型看到的是一串无语义的哈希，
+// 只能靠描述猜工具——这是工具调用准确率的最大损失源。现在名字自己是可读的，
+// 但**还原不依赖可读性**：归一化是有损的（My Tool! 与 my_tool 同名），唯一
+// 还原路径始终是 ToolRenames 的双向映射表。
+//
+// used 由调用方按请求持有（renameAndCompleteTools 里一个请求一份），保持
+// "先到先占、后来者加 _2/_3"的语义；并发安全边界与旧实现一致。
 func ClientToolWireName(name string, used map[string]bool) string {
 	if used == nil {
 		used = map[string]bool{}
 	}
-	digest := sha256.Sum256([]byte(name))
-	clean := hex.EncodeToString(digest[:])[:clientToolDigestLength]
-	max := toolWireNameLimit - len(ClientToolPrefix())
-	if len(clean) > max {
-		clean = clean[:max]
+	prefix := ClientToolPrefix() + clientToolNameSeparator
+	budget := toolWireNameLimit - len(prefix)
+	if budget <= 0 {
+		// ZEN_TOOL_PREFIX 被设成超长串：前缀已经吃光长度预算，退回纯 digest
+		// 形态。长度可能超限，但唯一性与可逆性（映射表）不受影响。
+		return claimClientToolWireName(prefix+toolNameDigest(name, clientToolDigestLength), used)
 	}
-	base := ClientToolPrefix() + clean
+	clean := normalizeClientToolWireName(name)
+	if len(clean) > budget {
+		tag := clientToolNameSeparator + toolNameDigest(name, clientToolDigestTailLength)
+		if len(tag) >= budget {
+			clean = toolNameDigest(name, budget)
+		} else {
+			// clean 归一化后只剩 ASCII，按字节截断不会切坏多字节字符。
+			clean = clean[:budget-len(tag)] + tag
+		}
+	}
+	return claimClientToolWireName(prefix+clean, used)
+}
+
+// claimClientToolWireName 占用 base；被占时按 _2/_3… 追加后缀（并截断 base
+// 把长度让给后缀），与旧实现的撞车策略一致。
+func claimClientToolWireName(base string, used map[string]bool) string {
 	if !used[base] {
 		used[base] = true
 		return base
 	}
 	for suffix := 2; ; suffix++ {
-		tag := "_" + strconv.Itoa(suffix)
+		tag := clientToolNameSeparator + strconv.Itoa(suffix)
 		cut := toolWireNameLimit - len(tag)
 		if cut > len(base) {
 			cut = len(base)
+		}
+		if cut < 0 {
+			cut = 0
 		}
 		candidate := base[:cut] + tag
 		if !used[candidate] {
@@ -615,6 +721,46 @@ func ClientToolWireName(name string, used map[string]bool) string {
 			return candidate
 		}
 	}
+}
+
+// normalizeClientToolWireName 归一化工具名主体：小写；非 [a-z0-9_] 一律换成
+// _（中文等非 ASCII 字符逐个换，随后被压成一个）；连续 _ 压成一个；首尾 _
+// 去掉；空结果回退成 tool。
+func normalizeClientToolWireName(name string) string {
+	var builder strings.Builder
+	builder.Grow(len(name))
+	lastSeparator := false
+	for _, char := range strings.ToLower(name) {
+		switch {
+		case char >= 'a' && char <= 'z', char >= '0' && char <= '9':
+			builder.WriteRune(char)
+			lastSeparator = false
+		default:
+			if lastSeparator {
+				continue
+			}
+			lastSeparator = true
+			builder.WriteByte('_')
+		}
+	}
+	clean := strings.Trim(builder.String(), clientToolNameSeparator)
+	if clean == "" {
+		return clientToolNameFallback
+	}
+	return clean
+}
+
+// toolNameDigest 返回 sha256(name) 的前 n 位 hex。
+func toolNameDigest(name string, n int) string {
+	digest := sha256.Sum256([]byte(name))
+	encoded := hex.EncodeToString(digest[:])
+	if n > len(encoded) {
+		n = len(encoded)
+	}
+	if n < 0 {
+		n = 0
+	}
+	return encoded[:n]
 }
 
 // OfficialToolCandidates returns client tool names equivalent to an official
@@ -796,6 +942,12 @@ func historyToolWireName(name string, declared map[string]string, renames *ToolR
 	if wireName, ok := declared[client]; ok {
 		return wireName, true
 	}
+	// 旧形状兜底：历史里带着升级前的 mcp_<hex>，映射表里没有对应项。原样透传
+	// （而不是丢弃这条 tool_call），并把告警留给 legacy 检测统一记一次。
+	if legacyClientToolWireName(name) {
+		warnLegacyClientToolWire(name)
+		return name, true
+	}
 	return "", false
 }
 
@@ -883,7 +1035,7 @@ const (
 	shapeModePassthrough = "passthrough"
 	// shapeModeChannel：ZEN_TOOL_CHANNEL 生效，客户端工具收成官方通道桩。
 	shapeModeChannel = "channel"
-	// shapeModeRenameComplete：客户端工具改名成 mcp_<digest> 并补官方集。
+	// shapeModeRenameComplete：客户端工具改名成 mcp__<name> 并补官方集。
 	shapeModeRenameComplete = "rename_complete"
 	// shapeModeNone：没有可供整形的客户端工具（只补了官方桩）。
 	shapeModeNone = "none"
@@ -924,7 +1076,7 @@ func toolCount(payload map[string]any) int {
 }
 
 // clientToolNames 摘出客户端声明的工具名（保持声明顺序，跳过无名条目）。
-// 必须在改名之前取：改名是就地改 map，改完再读就只能读到 mcp_<digest> 上线名。
+// 必须在改名之前取：改名是就地改 map，改完再读就只能读到 mcp__<name> 上线名。
 func clientToolNames(ranked []map[string]any, protocol Format) []string {
 	names := make([]string, 0, len(ranked))
 	for _, entry := range ranked {
@@ -1097,7 +1249,8 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	}
 	declaredNames := make([]string, 0, len(items))
 	shaped := make([]any, 0, len(items)+len(v2OfficialToolOrder))
-	// 不裁剪也不重排：客户端工具按原顺序出站。工具名会被改成 clint_<digest>，
+	// 不裁剪也不重排：客户端工具按原顺序出站。工具名会被改成可读的
+	// mcp__<name>（见 ClientToolWireName），
 	// 顺序对上游没有意义，保持原序让出站 body 与客户端请求一一对应，便于排障。
 	ranked := make([]map[string]any, 0, len(items))
 	passThrough := make([]any, 0)
@@ -1143,7 +1296,7 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	//
 	// 为什么必须这样：官方 CLI 发出的 tools 名称就是 edit/read/shell…，
 	// 上游按“工具名集合是否官方原样”判定客户端身份。把它们改名成
-	// clint_<digest> 再补一份官方集，出站变成 26 个工具、顺序也与原版不同，
+	// mcp__<name> 再补一份官方集，出站变成 26 个工具、顺序也与原版不同，
 	// 实测同一份 body 从 200 直接掉到 429 FreeUsageLimitError；不整形则 200，
 	// 且 upBytes 与原请求字节数一致。
 	//
@@ -1289,7 +1442,7 @@ func rewriteToolReferences(payload map[string]any, protocol Format, renames *Too
 
 var nameFieldPattern = regexp.MustCompile(`"name"\s*:\s*"([^"]+)"`)
 
-// RenameResponseTool replaces wire names (clint_...) in raw JSON/SSE bytes back to client names.
+// RenameResponseTool replaces wire names (mcp__<name>) in raw JSON/SSE bytes back to client names.
 func RenameResponseTool(line []byte, renames *ToolRenames) []byte {
 	if renames == nil || renames.Empty() || len(line) == 0 {
 		return line

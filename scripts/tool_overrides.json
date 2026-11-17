@@ -1,0 +1,210 @@
+{
+  "version": 1,
+  "note": "对官方抓包定义的本地改写：只改 description 与 parameters 的约束，不改工具名、不改 required 集合、不改 type、不改 properties 的键集合。",
+  "tools": {
+    "edit": {
+      "description": "Replace exact text inside one existing file.\n\nUse when: you have read a file and need to change part of it.\nDon't use for: creating or replacing a whole file (write), or one change across several files (patch).\n\n- oldString must match exactly once unless replaceAll is true; add surrounding lines to disambiguate.\n- Copy text from the file itself, never from read output: strip the `NNN: ` line prefix.\n- Matching retries ignoring curly quotes, en/em dashes and trailing whitespace, then fails when nothing matches.\n- Line endings are preserved; to rewrite them, make oldString and newString differ only in `\\r`.\n- newString must differ from oldString; pass \"\" to delete the matched text.",
+      "parameters": {
+        "properties": {
+          "path": {
+            "description": "File to edit. Relative paths resolve against the session working directory."
+          },
+          "oldString": {
+            "description": "Exact text to find. Must match the file as it is on disk; include neighbouring lines when it is ambiguous."
+          },
+          "newString": {
+            "description": "Replacement text; must differ from oldString. Empty string deletes the match."
+          },
+          "replaceAll": {
+            "description": "Replace every occurrence instead of requiring exactly one match. Default: false."
+          }
+        }
+      }
+    },
+    "execute": {
+      "description": "Run JavaScript in a confined Code Mode runtime to script and compose tool calls.\n\nUse when: one step needs many tool calls, concurrency, or the output of one call feeding the next.\nDon't use for: a single command (shell) or a single file read or write (read/write).\n\n- Only tools in this Code Mode catalog, or ones returned by `search`, are callable inside `{ code }`.\n- Call them as `tools.ns[\"tool-name\"]({...})`; keep the exact path, never rename or normalize it.\n- `fetch` does HTTP; imports, filesystem access and timers do not exist.\n- End with `return <value>`: the last top-level expression becomes the result.\n- Await every call that matters; run independent calls with `Promise.allSettled`.",
+      "parameters": {
+        "properties": {
+          "code": {
+            "description": "JavaScript body of the script. Top-level await is allowed; the last evaluated expression becomes the result."
+          }
+        }
+      }
+    },
+    "glob": {
+      "description": "Find files by path glob and return the matching paths.\n\nUse when: you know part of a name or path and need the files it matches.\nDon't use for: text inside files (grep) or reading contents (read).\n\n- `**/*.ts` matches at any depth; a bare `*.ts` also searches the whole tree.\n- `path` picks the root (default: working directory); `hidden` includes dotfiles; `limit` caps results (default 100).",
+      "parameters": {
+        "properties": {
+          "pattern": {
+            "description": "Glob pattern such as `**/*.ts` or `src/**/*.tsx`; it matches file paths, not directories."
+          },
+          "path": {
+            "description": "Directory to search under. Default: the session working directory."
+          },
+          "hidden": {
+            "description": "Include dotfiles and hidden directories. Default: false."
+          },
+          "limit": {
+            "description": "Maximum number of paths returned. Default: 100."
+          }
+        }
+      }
+    },
+    "grep": {
+      "description": "Search file contents by regex or literal text; returns matching lines.\n\nUse when: you need where a symbol, string or pattern occurs in code.\nDon't use for: finding files by name (glob) or reading a whole file (read).\n\n- `pattern` is a ripgrep regex unless `literal` is true.\n- Narrow with `path` (file or dir) and `include` (glob); `caseSensitive` default true.\n- `limit` caps returned matches (default 100).",
+      "parameters": {
+        "properties": {
+          "pattern": {
+            "description": "Ripgrep regular expression, or plain text when literal is true. Must be non-empty."
+          },
+          "path": {
+            "description": "File or directory to search. Default: the session working directory."
+          },
+          "include": {
+            "description": "Glob filter on file names, e.g. `*.js` or `*.{ts,tsx}`. Optional."
+          },
+          "literal": {
+            "description": "Treat pattern as plain text instead of a regex. Default: false."
+          },
+          "caseSensitive": {
+            "description": "Case-sensitive matching. Default: true."
+          },
+          "limit": {
+            "description": "Maximum matching lines returned. Default: 100."
+          }
+        }
+      }
+    },
+    "question": {
+      "description": "Ask the user to pick an option or supply a missing value; the turn waits for the answer.\n\nUse when: a decision belongs to the user, or a required input cannot be inferred.\nDon't use for: anything you can check in the repo or in the tools, or that has a safe default.\n\n- Give concrete options; a free-form \"type your own answer\" choice is added automatically.\n- Put the recommended option first and end its label with \"(Recommended)\".\n- `multiple: true` lets the user pick several options.\n- `header` is at most 30 characters; each `label` is 1-5 words.",
+      "parameters": {
+        "properties": {
+          "questions": {
+            "description": "Questions to ask in this turn; at least one."
+          }
+        }
+      }
+    },
+    "read": {
+      "description": "Read a file or directory; text lines come back numbered from 1.\n\nUse when: you need the exact text of a file or a directory listing.\nDon't use for: changing files (edit/write), finding files (glob) or searching text (grep).\n\n- `offset` is the 1-based first line, `limit` the maximum lines; page long files instead of reading all.\n- Directory entries come back one per line.\n- Images and PDFs are returned to the model directly.\n- To reuse text in edit, strip the `NNN: ` prefix first.",
+      "parameters": {
+        "properties": {
+          "path": {
+            "description": "File or directory to read."
+          },
+          "offset": {
+            "description": "1-based index of the first line or directory entry to return. Default: 1.",
+            "minimum": 1
+          },
+          "limit": {
+            "description": "Maximum lines or directory entries returned, capped at 2000. Default: 2000.",
+            "minimum": 1
+          }
+        }
+      }
+    },
+    "shell": {
+      "description": "Run a shell command and return its stdout and stderr.\n\nUse when: you need git, build, test or OS commands in the workspace.\nDon't use for: file reads, writes or edits (read/write/edit), searching (glob/grep), or scripting tool calls (execute).\n\n- One fresh shell per call: pass `workdir` instead of chaining `cd`.\n- Long output is truncated in the reply while the full text is saved to a file.\n- `timeout` is milliseconds (default 120000); a `background` job returns at once and notifies you.",
+      "parameters": {
+        "properties": {
+          "command": {
+            "description": "Command line to run. Quoting and interpolation follow the shell in use."
+          },
+          "workdir": {
+            "description": "Directory to run in. Default: the session working directory."
+          },
+          "timeout": {
+            "description": "Timeout in milliseconds; 0 disables it. Default: 120000 for foreground calls."
+          },
+          "background": {
+            "description": "Run detached and return immediately; you are notified on completion. Default: false."
+          }
+        }
+      }
+    },
+    "skill": {
+      "description": "Load a skill's full instructions into this conversation.\n\nUse when: the task matches a skill in the available skills list, or the user names one.\nDon't use for: one-step work the current tools already cover.\n\n- `id` must be the exact skill name from the list; a near miss loads nothing.\n- Follow the loaded instructions before acting on the task.",
+      "parameters": {
+        "properties": {
+          "id": {
+            "description": "Exact skill id from the available skills list."
+          }
+        }
+      }
+    },
+    "subagent": {
+      "description": "Delegate a self-contained task to a subagent that works in its own context.\n\nUse when: a chunk of work is independent and would flood this conversation with detail.\nDon't use for: one or two local calls, or fan-out over many items (use execute).\n\n- New children start with a fresh context: restate every fact they cannot infer.\n- `sessionID` resumes that child's earlier conversation; omitting it starts a new one.\n- `background: true` returns at once and notifies you later; use it only for independent work.\n- The child returns its result, not its tool transcript; relay what matters to the user.\n\nAgents: `explore` (fast read-only codebase search), `general` (multi-step work).",
+      "parameters": {
+        "properties": {
+          "agent": {
+            "description": "Agent to run: `explore` for fast read-only search, `general` for multi-step work."
+          },
+          "description": {
+            "description": "Short 3-5 word label shown to the user."
+          },
+          "prompt": {
+            "description": "Complete self-contained task for the child, including all context it needs."
+          },
+          "background": {
+            "description": "Run in the background and return immediately; you are notified on completion. Default: false."
+          },
+          "sessionID": {
+            "description": "Resume this child's conversation (id starts with `ses`). Omit to start a new one."
+          },
+          "model": {
+            "description": "Leave unset unless the user asks for a specific model; format `provider/model` or `provider/model#variant`."
+          }
+        }
+      }
+    },
+    "webfetch": {
+      "description": "Fetch one HTTP(S) URL and return its content as text, markdown or HTML.\n\nUse when: you already have the URL and need the page itself.\nDon't use for: discovering sources or current facts (websearch).\n\n- Read-only: it makes no state changes.\n- `format` defaults to markdown; `timeout` is seconds, greater than 0 and at most 120.\n- Large pages return a preview; the full text is kept in managed storage.",
+      "parameters": {
+        "properties": {
+          "url": {
+            "description": "Absolute http:// or https:// URL to fetch."
+          },
+          "format": {
+            "description": "Output format: `text`, `markdown` or `html`. Default: markdown."
+          },
+          "timeout": {
+            "description": "Request timeout in seconds, greater than 0 and at most 120."
+          }
+        }
+      }
+    },
+    "websearch": {
+      "description": "Search the web and return an answer summary with source links.\n\nUse when: the answer depends on current events, releases or docs newer than the model cutoff.\nDon't use for: pages you already have a URL for (webfetch) or code in this repo (grep).\n\n- The current year is 2026; name it when searching recent events.\n- Read a hit in full with webfetch.",
+      "parameters": {
+        "properties": {
+          "query": {
+            "description": "Search query, ideally carrying the product, version or year that pins the result."
+          }
+        }
+      }
+    },
+    "write": {
+      "description": "Create or overwrite a whole file, creating parent directories as needed.\n\nUse when: writing a new file or replacing one entirely.\nDon't use for: partial changes (edit) or multi-file diffs (patch).\n\n- Content is written verbatim; no trailing newline is added.\n- Overwrites silently, with no backup.",
+      "parameters": {
+        "properties": {
+          "path": {
+            "description": "File to write. Relative paths resolve against the session working directory."
+          },
+          "content": {
+            "description": "Full file contents, UTF-8, written exactly as given."
+          }
+        }
+      }
+    },
+    "patch": {
+      "description": "Apply a multi-file diff in a stripped-down patch format.\n\nUse when: one change spans several files, or whole-file writes would fight exact text matching.\nDon't use for: a single small edit (edit) or creating one file (write).\n\nThe patch language is a file-oriented diff. One envelope, then one or more file sections:\n\n*** Begin Patch\n*** Add File: <path>\n+<line of initial content>\n*** Update File: <path>\n*** Move to: <new path>\n@@ <anchor line>\n-<removed line>\n+<added line>\n*** Delete File: <path>\n*** End Patch\n\n- Start with `*** Begin Patch` and end with `*** End Patch`; every section needs its `***` header.\n- Add and update lines start with `+`, removed lines with `-`; `*** Move to:` follows its `*** Update File:`.\n- `@@ <anchor>` selects where the hunk applies inside the file.",
+      "parameters": {
+        "properties": {
+          "patchText": {
+            "description": "Complete patch: the Begin/End envelope plus one or more Add/Update/Delete sections."
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,23 +1,23 @@
 {
   "edit": {
-    "description": "Edit the contents of a file by finding and replacing exact text. When editing text from Read output, preserve the exact indentation (tabs or spaces) and omit the line-number prefix, such as `1: `. Never include the prefix in oldString or newString. Write line breaks as \\n; the file's existing CRLF or LF line endings are matched and preserved. To change line endings themselves, make oldString and newString differ only in \\r; that edit applies to the exact bytes. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line. The edit fails if oldString is not found. By default, oldString must identify a UNIQUE location. Multiple matches FAIL unless replaceAll is true. Add more surrounding context to disambiguate, or set replaceAll to true to replace every occurrence. Use replaceAll when the change should apply to every occurrence, such as renaming a variable.",
+    "description": "Replace exact text inside one existing file.\n\nUse when: you have read a file and need to change part of it.\nDon't use for: creating or replacing a whole file (write), or one change across several files (patch).\n\n- oldString must match exactly once unless replaceAll is true; add surrounding lines to disambiguate.\n- Copy text from the file itself, never from read output: strip the `NNN: ` line prefix.\n- Matching retries ignoring curly quotes, en/em dashes and trailing whitespace, then fails when nothing matches.\n- Line endings are preserved; to rewrite them, make oldString and newString differ only in `\\r`.\n- newString must differ from oldString; pass \"\" to delete the matched text.",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "newString": {
-          "description": "Text to replace oldString with (must differ from oldString)",
+          "description": "Replacement text; must differ from oldString. Empty string deletes the match.",
           "type": "string"
         },
         "oldString": {
-          "description": "Exact text to find and replace",
+          "description": "Exact text to find. Must match the file as it is on disk; include neighbouring lines when it is ambiguous.",
           "type": "string"
         },
         "path": {
-          "description": "File to edit",
+          "description": "File to edit. Relative paths resolve against the session working directory.",
           "type": "string"
         },
         "replaceAll": {
-          "description": "Whether to replace every occurrence of oldString. When false, oldString must match exactly once. Defaults to false.",
+          "description": "Replace every occurrence instead of requiring exactly one match. Default: false.",
           "type": "boolean"
         }
       },
@@ -26,25 +26,25 @@
     }
   },
   "glob": {
-    "description": "Search file paths using a glob pattern (examples: \"**/*.ts\", \"src/**/*.tsx\").",
+    "description": "Find files by path glob and return the matching paths.\n\nUse when: you know part of a name or path and need the files it matches.\nDon't use for: text inside files (grep) or reading contents (read).\n\n- `**/*.ts` matches at any depth; a bare `*.ts` also searches the whole tree.\n- `path` picks the root (default: working directory); `hidden` includes dotfiles; `limit` caps results (default 100).",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "hidden": {
-          "description": "Include hidden files and directories (default: false).",
+          "description": "Include dotfiles and hidden directories. Default: false.",
           "type": "boolean"
         },
         "limit": {
-          "description": "Maximum number of matching files to return (default: 100)",
+          "description": "Maximum number of paths returned. Default: 100.",
           "exclusiveMinimum": 0,
           "type": "integer"
         },
         "path": {
-          "description": "Directory to search. Defaults to the current working directory.",
+          "description": "Directory to search under. Default: the session working directory.",
           "type": "string"
         },
         "pattern": {
-          "description": "Glob pattern to match files against",
+          "description": "Glob pattern such as `**/*.ts` or `src/**/*.tsx`; it matches file paths, not directories.",
           "type": "string"
         }
       },
@@ -53,33 +53,33 @@
     }
   },
   "grep": {
-    "description": "Search file contents using ripgrep's regular expression syntax or literal text matching. Use it to locate specific code, symbols, or text patterns, and narrow searches with `path` or `include`. Returns matching file paths, line numbers, and line previews.",
+    "description": "Search file contents by regex or literal text; returns matching lines.\n\nUse when: you need where a symbol, string or pattern occurs in code.\nDon't use for: finding files by name (glob) or reading a whole file (read).\n\n- `pattern` is a ripgrep regex unless `literal` is true.\n- Narrow with `path` (file or dir) and `include` (glob); `caseSensitive` default true.\n- `limit` caps returned matches (default 100).",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "caseSensitive": {
-          "description": "Use case-sensitive matching (default: true).",
+          "description": "Case-sensitive matching. Default: true.",
           "type": "boolean"
         },
         "include": {
-          "description": "Glob pattern to filter files (for example, \"*.js\" or \"*.{ts,tsx}\")",
+          "description": "Glob filter on file names, e.g. `*.js` or `*.{ts,tsx}`. Optional.",
           "type": "string"
         },
         "limit": {
-          "description": "Maximum number of matching lines to return (default: 100)",
+          "description": "Maximum matching lines returned. Default: 100.",
           "exclusiveMinimum": 0,
           "type": "integer"
         },
         "literal": {
-          "description": "Treat `pattern` as exact text instead of a regular expression (default: false).",
+          "description": "Treat pattern as plain text instead of a regex. Default: false.",
           "type": "boolean"
         },
         "path": {
-          "description": "File or directory to search. Defaults to the current working directory.",
+          "description": "File or directory to search. Default: the session working directory.",
           "type": "string"
         },
         "pattern": {
-          "description": "Regular expression or literal text to match in file contents.",
+          "description": "Ripgrep regular expression, or plain text when literal is true. Must be non-empty.",
           "minLength": 1,
           "type": "string"
         }
@@ -89,12 +89,12 @@
     }
   },
   "question": {
-    "description": "Use this tool when you need to ask the user questions during execution. This allows you to:\n1. Gather user preferences or requirements\n2. Clarify ambiguous instructions\n3. Get decisions on implementation choices as you work\n4. Offer choices to the user about what direction to take.\n\nUsage notes:\n- A \"Type your own answer\" option is added automatically; don't include a separate option for free form answers\n- Set `multiple: true` to allow selecting more than one option\n- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label",
+    "description": "Ask the user to pick an option or supply a missing value; the turn waits for the answer.\n\nUse when: a decision belongs to the user, or a required input cannot be inferred.\nDon't use for: anything you can check in the repo or in the tools, or that has a safe default.\n\n- Give concrete options; a free-form \"type your own answer\" choice is added automatically.\n- Put the recommended option first and end its label with \"(Recommended)\".\n- `multiple: true` lets the user pick several options.\n- `header` is at most 30 characters; each `label` is 1-5 words.",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "questions": {
-          "description": "Questions to ask",
+          "description": "Questions to ask in this turn; at least one.",
           "items": {
             "additionalProperties": false,
             "properties": {
@@ -141,22 +141,22 @@
     }
   },
   "read": {
-    "description": "Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.",
+    "description": "Read a file or directory; text lines come back numbered from 1.\n\nUse when: you need the exact text of a file or a directory listing.\nDon't use for: changing files (edit/write), finding files (glob) or searching text (grep).\n\n- `offset` is the 1-based first line, `limit` the maximum lines; page long files instead of reading all.\n- Directory entries come back one per line.\n- Images and PDFs are returned to the model directly.\n- To reuse text in edit, strip the `NNN: ` prefix first.",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "limit": {
-          "description": "The maximum number of lines or directory entries to read (defaults to and capped at 2000)",
-          "minimum": 0,
+          "description": "Maximum lines or directory entries returned, capped at 2000. Default: 2000.",
+          "minimum": 1,
           "type": "integer"
         },
         "offset": {
-          "description": "The line or directory entry to start reading from (1-based)",
-          "minimum": 0,
+          "description": "1-based index of the first line or directory entry to return. Default: 1.",
+          "minimum": 1,
           "type": "integer"
         },
         "path": {
-          "description": "File or directory to read",
+          "description": "File or directory to read.",
           "type": "string"
         }
       },
@@ -165,25 +165,25 @@
     }
   },
   "shell": {
-    "description": "Execute a shell command and return its output. Commands run on Linux using bash. Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete.",
+    "description": "Run a shell command and return its stdout and stderr.\n\nUse when: you need git, build, test or OS commands in the workspace.\nDon't use for: file reads, writes or edits (read/write/edit), searching (glob/grep), or scripting tool calls (execute).\n\n- One fresh shell per call: pass `workdir` instead of chaining `cd`.\n- Long output is truncated in the reply while the full text is saved to a file.\n- `timeout` is milliseconds (default 120000); a `background` job returns at once and notifies you.",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "background": {
-          "description": "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion.",
+          "description": "Run detached and return immediately; you are notified on completion. Default: false.",
           "type": "boolean"
         },
         "command": {
-          "description": "Shell command string to execute",
+          "description": "Command line to run. Quoting and interpolation follow the shell in use.",
           "type": "string"
         },
         "timeout": {
-          "description": "Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default.",
+          "description": "Timeout in milliseconds; 0 disables it. Default: 120000 for foreground calls.",
           "minimum": 0,
           "type": "integer"
         },
         "workdir": {
-          "description": "Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead.",
+          "description": "Directory to run in. Default: the session working directory.",
           "type": "string"
         }
       },
@@ -192,12 +192,12 @@
     }
   },
   "skill": {
-    "description": "Load a specialized skill's instructions and resources into the current conversation when the task at hand matches its description.\n\nThe skill ID must match an available skill or a skill explicitly referenced by the user.",
+    "description": "Load a skill's full instructions into this conversation.\n\nUse when: the task matches a skill in the available skills list, or the user names one.\nDon't use for: one-step work the current tools already cover.\n\n- `id` must be the exact skill name from the list; a near miss loads nothing.\n- Follow the loaded instructions before acting on the task.",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "id": {
-          "description": "The ID of an available skill or a skill explicitly referenced by the user",
+          "description": "Exact skill id from the available skills list.",
           "type": "string"
         }
       },
@@ -206,32 +206,32 @@
     }
   },
   "subagent": {
-    "description": "Spawns an agent in a child session to work on the specified task.\nThe output includes a sessionID you can pass back later to continue that specific conversation with the subagent.\nNew child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.\nForeground (default) runs the subagent to completion and returns its final response.\nBackground mode (background=true) launches it asynchronously and returns immediately; you are notified when it finishes.\nUse background only for independent work that can run while you continue elsewhere.\n\nAvailable subagents:\n- explore: Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. \"src/components/**/*.tsx\"), search code for keywords (eg. \"API endpoints\"), or answer questions about the codebase (eg. \"how do API endpoints work?\"). When calling this agent, specify the desired thoroughness level: \"quick\" for basic searches, \"medium\" for moderate exploration, or \"very thorough\" for comprehensive analysis across multiple locations and naming conventions.\n- general: General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel.",
+    "description": "Delegate a self-contained task to a subagent that works in its own context.\n\nUse when: a chunk of work is independent and would flood this conversation with detail.\nDon't use for: one or two local calls, or fan-out over many items (use execute).\n\n- New children start with a fresh context: restate every fact they cannot infer.\n- `sessionID` resumes that child's earlier conversation; omitting it starts a new one.\n- `background: true` returns at once and notifies you later; use it only for independent work.\n- The child returns its result, not its tool transcript; relay what matters to the user.\n\nAgents: `explore` (fast read-only codebase search), `general` (multi-step work).",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "agent": {
-          "description": "The type of specialized agent to use for this task. If the user asks for a subagent by a name that is not one of the available subagents, they most likely mean a model: pick a suitable agent and pass the name through the model parameter instead.",
+          "description": "Agent to run: `explore` for fast read-only search, `general` for multi-step work.",
           "type": "string"
         },
         "background": {
-          "description": "Run the subagent in the background and return immediately. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress.",
+          "description": "Run in the background and return immediately; you are notified on completion. Default: false.",
           "type": "boolean"
         },
         "description": {
-          "description": "A short 3-5 word label for the task, displayed to the user",
+          "description": "Short 3-5 word label shown to the user.",
           "type": "string"
         },
         "model": {
-          "description": "NEVER set this unless the user explicitly asks for a particular model or variant. The value is written as \"providerID/modelID\", or \"providerID/modelID#variant\" to include a variant. Do not guess the ID: look the model up with the models tool, filtering to your own provider first.",
+          "description": "Leave unset unless the user asks for a specific model; format `provider/model` or `provider/model#variant`.",
           "type": "string"
         },
         "prompt": {
-          "description": "The task for the subagent to perform",
+          "description": "Complete self-contained task for the child, including all context it needs.",
           "type": "string"
         },
         "sessionID": {
-          "description": "Continue a specific previous subagent conversation by passing its sessionID. Calls without a sessionID start a new conversation.",
+          "description": "Resume this child's conversation (id starts with `ses`). Omit to start a new one.",
           "pattern": "^ses",
           "type": "string"
         }
@@ -241,23 +241,23 @@
     }
   },
   "webfetch": {
-    "description": "Fetch content from an HTTP or HTTPS URL and return it as text, markdown, or HTML. Markdown is the default.\n\nUse a more targeted tool when one is available. This tool is read-only. Large text results may be replaced with a preview while the complete output is retained in managed storage.",
+    "description": "Fetch one HTTP(S) URL and return its content as text, markdown or HTML.\n\nUse when: you already have the URL and need the page itself.\nDon't use for: discovering sources or current facts (websearch).\n\n- Read-only: it makes no state changes.\n- `format` defaults to markdown; `timeout` is seconds, greater than 0 and at most 120.\n- Large pages return a preview; the full text is kept in managed storage.",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "format": {
-          "description": "The format to return the content in. Defaults to markdown.",
+          "description": "Output format: `text`, `markdown` or `html`. Default: markdown.",
           "enum": ["text", "markdown", "html"],
           "type": "string"
         },
         "timeout": {
-          "description": "Optional timeout in seconds (maximum: 120)",
+          "description": "Request timeout in seconds, greater than 0 and at most 120.",
           "exclusiveMinimum": 0,
           "maximum": 120,
           "type": "number"
         },
         "url": {
-          "description": "The HTTP or HTTPS URL to fetch content from",
+          "description": "Absolute http:// or https:// URL to fetch.",
           "type": "string"
         }
       },
@@ -266,12 +266,12 @@
     }
   },
   "websearch": {
-    "description": "Search the web using the user's selected search integration. Use this for current information beyond knowledge cutoff.\n\nThe current year is 2026. Use this year when searching for recent information or current events.",
+    "description": "Search the web and return an answer summary with source links.\n\nUse when: the answer depends on current events, releases or docs newer than the model cutoff.\nDon't use for: pages you already have a URL for (webfetch) or code in this repo (grep).\n\n- The current year is 2026; name it when searching recent events.\n- Read a hit in full with webfetch.",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "query": {
-          "description": "Websearch query",
+          "description": "Search query, ideally carrying the product, version or year that pins the result.",
           "type": "string"
         }
       },
@@ -280,16 +280,16 @@
     }
   },
   "write": {
-    "description": "Writes a file to the local filesystem, overwriting if one exists.\n\nMissing parent directories are created automatically.\n\nUse this tool to create new files or overwrite existing files. For partial changes, use the edit tool instead.",
+    "description": "Create or overwrite a whole file, creating parent directories as needed.\n\nUse when: writing a new file or replacing one entirely.\nDon't use for: partial changes (edit) or multi-file diffs (patch).\n\n- Content is written verbatim; no trailing newline is added.\n- Overwrites silently, with no backup.",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "content": {
-          "description": "Content to write to the file",
+          "description": "Full file contents, UTF-8, written exactly as given.",
           "type": "string"
         },
         "path": {
-          "description": "Path to the file to write to",
+          "description": "File to write. Relative paths resolve against the session working directory.",
           "type": "string"
         }
       },
@@ -298,12 +298,13 @@
     }
   },
   "execute": {
-    "description": "Run JavaScript in a confined Code Mode runtime to script tool calls and HTTP requests and compose their results.\n`fetch` is available for HTTP requests. Imports, direct filesystem access, and timers are unavailable; all other external access goes through `tools`.\nWithin `{ code }`, the only callable tools are those explicitly listed in the Code Mode catalog instructions or returned by the `search` function. Inside `{ code }`, ignore tools shown outside the Code Mode catalog. They are not available in the Code Mode runtime.\nCall tools through `tools` using only exact paths and signatures from the catalog. Do not infer or normalize tool names; preserve bracket notation such as `tools.<namespace>[\"tool-name\"](input)`.\nPrefer an explicit `return`; if omitted, the final top-level expression becomes the result.\nAwait every call whose completion matters; pending calls are interrupted when execution ends. Run independent calls concurrently with `Promise.allSettled`.",
+    "description": "Run JavaScript in a confined Code Mode runtime to script and compose tool calls.\n\nUse when: one step needs many tool calls, concurrency, or the output of one call feeding the next.\nDon't use for: a single command (shell) or a single file read or write (read/write).\n\n- Only tools in this Code Mode catalog, or ones returned by `search`, are callable inside `{ code }`.\n- Call them as `tools.ns[\"tool-name\"]({...})`; keep the exact path, never rename or normalize it.\n- `fetch` does HTTP; imports, filesystem access and timers do not exist.\n- End with `return <value>`: the last top-level expression becomes the result.\n- Await every call that matters; run independent calls with `Promise.allSettled`.",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "code": {
-          "type": "string"
+          "type": "string",
+          "description": "JavaScript body of the script. Top-level await is allowed; the last evaluated expression becomes the result."
         }
       },
       "required": ["code"],
@@ -311,12 +312,12 @@
     }
   },
   "patch": {
-    "description": "Use the `patch` tool to edit files. Your patch language is a stripped‑down, file‑oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high‑level envelope:\n\n*** Begin Patch\n[ one or more file sections ]\n*** End Patch\n\nWithin that envelope, you get a sequence of file operations.\nYou MUST include a header to specify the action you are taking.\nEach operation starts with one of three headers:\n\n*** Add File: <path> - create a new file. Every following line is a + line (the initial contents).\n*** Delete File: <path> - remove an existing file. Nothing follows.\n*** Update File: <path> - patch an existing file in place (optionally with a rename).\n\nExample patch:\n\n```\n*** Begin Patch\n*** Add File: hello.txt\n+Hello world\n*** Update File: src/app.py\n*** Move to: src/main.py\n@@ def greet():\n-print(\"Hi\")\n+print(\"Hello, world!\")\n*** Delete File: obsolete.txt\n*** End Patch\n```\n\nIt is important to remember:\n\n- You must include a header with your intended action (Add/Delete/Update)\n- You must prefix new lines with `+` even when creating a new file",
+    "description": "Apply a multi-file diff in a stripped-down patch format.\n\nUse when: one change spans several files, or whole-file writes would fight exact text matching.\nDon't use for: a single small edit (edit) or creating one file (write).\n\nThe patch language is a file-oriented diff. One envelope, then one or more file sections:\n\n*** Begin Patch\n*** Add File: <path>\n+<line of initial content>\n*** Update File: <path>\n*** Move to: <new path>\n@@ <anchor line>\n-<removed line>\n+<added line>\n*** Delete File: <path>\n*** End Patch\n\n- Start with `*** Begin Patch` and end with `*** End Patch`; every section needs its `***` header.\n- Add and update lines start with `+`, removed lines with `-`; `*** Move to:` follows its `*** Update File:`.\n- `@@ <anchor>` selects where the hunk applies inside the file.",
     "parameters": {
       "additionalProperties": false,
       "properties": {
         "patchText": {
-          "description": "The full patch text describing add, update, and delete operations",
+          "description": "Complete patch: the Begin/End envelope plus one or more Add/Update/Delete sections.",
           "type": "string"
         }
       },

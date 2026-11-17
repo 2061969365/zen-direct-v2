@@ -5,18 +5,27 @@ import (
 	"testing"
 )
 
-func TestToolWireNameIsOpaque(t *testing.T) {
+// TestToolWireNameIsReadable 钉住新契约（2026-11-17 起）：线上名必须可读。
+//
+// 旧契约是"不透明"（mcp_<12hex>），模型只能靠描述猜工具，这是工具调用
+// 准确率的最大损失源，所以名字改成 mcp__<归一化原名>。不透明性不再是
+// 返回值，可逆性改由 ToolRenames 的映射表承担（见 toolshape_wirename_test.go）。
+func TestToolWireNameIsReadable(t *testing.T) {
 	used := map[string]bool{}
 	for _, client := range []string{"ScheduleWakeup", "ReportFindings", "Read", "Bash", "subagent_fork", "ops_bash"} {
 		wireName := ClientToolWireName(client, used)
 		if !strings.HasPrefix(wireName, ClientToolPrefix()) {
 			t.Errorf("wire name %q does not carry the client prefix", wireName)
 		}
+		if !strings.HasPrefix(wireName, ClientToolPrefix()+"_") {
+			t.Errorf("wire name %q is missing the mcp__ separator (want %q)", wireName, ClientToolPrefix()+"_"+normalizeClientToolWireName(client))
+		}
 		if len(wireName) > toolWireNameLimit {
 			t.Errorf("wire name %q is longer than %d bytes", wireName, toolWireNameLimit)
 		}
-		if strings.Contains(strings.ToLower(wireName), strings.ToLower(client)) {
-			t.Errorf("wire name %q still spells the client name %q", wireName, client)
+		want := ClientToolPrefix() + "_" + normalizeClientToolWireName(client)
+		if wireName != want {
+			t.Errorf("wire name %q != %q (readable form expected)", wireName, want)
 		}
 	}
 }

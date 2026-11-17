@@ -9,7 +9,7 @@ sha256 is delegated to python in both versions on purpose: re-implementing canon
 contract the asset repo verifies.
 
 Usage:
-  powershell -ExecutionPolicy Bypass -File scripts\sync_assets.ps1 [-Check] [-Offline] [-Url URL] [-Dest PATH]
+  powershell -ExecutionPolicy Bypass -File scripts\sync_assets.ps1 [-Check] [-Offline] [-Url URL] [-Dest PATH] [-Overrides PATH]
 
   (no switch)  download, validate, back up, inject           -> 0 / 2 / 3
   -Check       download + validate, write nothing
@@ -20,9 +20,11 @@ Usage:
                  0 = ok, 2 = missing/invalid
   -Url URL     override the asset URL
   -Dest PATH   override the target file (relative paths resolve from the repo root)
+  -Overrides P override the overlay file (default: scripts\tool_overrides.json)
 
 Exit codes: 0 ok, 1 -Check mismatch, 2 validation or environment failure (including a
-missing python interpreter), 3 network/download failure.
+missing python interpreter, or an overlay file that breaks the structural rules), 3
+network/download failure.
 
 Shape conversion: the asset repo stores
   {cli_version, captured_at, source:{workflow,run_url,sha256}, order:[...], tools:{...}}
@@ -33,6 +35,12 @@ map[string]opencodeToolDefinition. The injection writes that flat map, in the as
 `strict` is dropped: the Go struct has no such field and the outbound builder hardcodes
 "strict": false (toolshape.go:224).
 
+Overlay: scripts\tool_overrides.json, merged into the projection before the sha256 is
+computed (so -Check compares the same bytes the write path produces). Rules enforced by
+the helper: only `description` and `parameters` per tool, no tool renames, objects merge
+recursively, scalars and arrays replace wholesale, `type` may not change, and no new key
+may appear under any `properties` object. Absent file -> `overrides: none`.
+
 The python helper embedded below is a copy of the one embedded in scripts/sync_assets.sh
 (mode for mode, line for line). Each script has to be self-contained; keep them in step.
 #>
@@ -41,7 +49,8 @@ param(
     [switch]$Check,
     [switch]$Offline,
     [string]$Url = '',
-    [string]$Dest = ''
+    [string]$Dest = '',
+    [string]$Overrides = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -59,6 +68,11 @@ if (-not $Dest) {
     $Dest = Join-Path $RepoRoot 'tools\opencode_tools.json'
 } elseif (-not [System.IO.Path]::IsPathRooted($Dest)) {
     $Dest = Join-Path $RepoRoot $Dest
+}
+if (-not $Overrides) {
+    $Overrides = Join-Path $RepoRoot 'scripts\tool_overrides.json'
+} elseif (-not [System.IO.Path]::IsPathRooted($Overrides)) {
+    $Overrides = Join-Path $RepoRoot $Overrides
 }
 
 function Resolve-PythonCommand {
@@ -123,12 +137,13 @@ scripts/sync_assets.ps1 (PowerShell calls python for the contract sha256 instead
 re-implementing canonical JSON); keep the two copies in step.
 
 Modes:
-  fetch <url> <out-path>                          download (urllib, 2 attempts)
-  asset <remote.json> <dest-path> <emit-path|->   validate + project (+ render)
-  local <dest-path>                               validate the gateway-shaped file
+  fetch <url> <out-path>                                  download (urllib, 2 attempts)
+  asset <remote.json> <dest-path> <emit-path|-> <overlay|-> validate + project + merge (+ render)
+  local <dest-path> [<overlay|->]                         validate the gateway-shaped file
 
 Exit: 0 ok, 1 --check mismatch, 2 validation/environment failure, 3 download failure.
 """
+import copy
 import hashlib
 import json
 import os
@@ -210,6 +225,116 @@ def project(order, tools, keys):
                 extra_fields.add(key)
         result[name] = entry
     return result, leftovers, sorted(extra_fields)
+
+
+# --- overlay -----------------------------------------------------------------------------
+#
+# scripts/tool_overrides.json is the only place a local definition rewrite may live: the
+# asset repo owns the wire shape, and tools/opencode_tools.json is a build product, so an
+# edit made directly to either would be lost on the next sync (or build).
+OVERRIDE_TOOL_KEYS = ("description", "parameters")
+ABSENT = object()
+
+
+def show(value):
+    if value is ABSENT:
+        return "<absent>"
+    if isinstance(value, str):
+        return "%d bytes" % len(value.encode("utf-8"))
+    return json.dumps(value, ensure_ascii=False)
+
+
+def deep_merge(node, patch, path):
+    """Merge patch into node in place; return [(path, before, after)] for every change.
+
+    Objects merge key by key. Scalars and arrays replace wholesale: merging arrays would
+    append to `required`/`enum` on every run and make the result grow without bound.
+    Two guards keep the merged schema structurally identical to the asset's:
+      - `type` may not change value;
+      - no new key may appear under any `properties` object (the property set is fixed).
+    """
+    if not isinstance(node, dict):
+        die("overrides: FAIL %s is not an object in the asset, cannot merge into it" % path)
+    changes = []
+    for key, value in patch.items():
+        where = path + "." + key
+        if key == "properties":
+            if not isinstance(value, dict):
+                die("overrides: FAIL %s must be an object" % where)
+            base = node.get(key)
+            if not isinstance(base, dict):
+                die("overrides: FAIL %s has no base object to merge into" % where)
+            unknown = sorted(set(value) - set(base))
+            if unknown:
+                die("overrides: FAIL %s may not add propert%s %s; the property set is fixed"
+                    % (where, "y" if len(unknown) == 1 else "ies", ", ".join(unknown)))
+            changes.extend(deep_merge(base, value, where))
+            continue
+        if key == "type" and isinstance(node.get(key), str) and node[key] != value:
+            die("overrides: FAIL %s may not change type (%s -> %s)"
+                % (where, node[key], json.dumps(value, ensure_ascii=False)))
+        current = node.get(key, ABSENT)
+        if isinstance(current, dict) and isinstance(value, dict):
+            changes.extend(deep_merge(current, value, where))
+            continue
+        if current == value:
+            continue
+        changes.append((where, current, value))
+        node[key] = copy.deepcopy(value)
+    return changes
+
+
+def apply_overrides(projected, overlay):
+    """Deep-merge the local overlay into the projection; returns the changed tool names."""
+    if not overlay or overlay == "-":
+        say("overrides: none")
+        return []
+    if not os.path.isfile(overlay):
+        # The driver already printed the resolved path, so one line is enough here.
+        say("overrides: none")
+        return []
+    data = read_json(overlay)
+    if not isinstance(data, dict):
+        die("overrides: FAIL %s root is not a JSON object" % overlay)
+    if data.get("version") != 1:
+        die("overrides: FAIL %s version must be 1, got %r" % (overlay, data.get("version")))
+    tools = data.get("tools")
+    if not isinstance(tools, dict) or not tools:
+        die("overrides: FAIL %s tools must be a non-empty object" % overlay)
+    unknown = sorted(name for name in tools if name not in projected)
+    if unknown:
+        die("overrides: FAIL %s names tool(s) the asset does not define: %s"
+            % (overlay, ", ".join(unknown)))
+
+    changed = []
+    for name in projected:
+        if name not in tools:
+            continue
+        spec = tools[name]
+        if not isinstance(spec, dict) or not spec:
+            die("overrides: FAIL tools.%s must be a non-empty object" % name)
+        extra = sorted(set(spec) - set(OVERRIDE_TOOL_KEYS))
+        if extra:
+            die("overrides: FAIL tools.%s may only override %s, found: %s"
+                % (name, "/".join(OVERRIDE_TOOL_KEYS), ", ".join(extra)))
+        if "description" in spec and (not isinstance(spec["description"], str)
+                                      or not spec["description"].strip()):
+            die("overrides: FAIL tools.%s.description must be a non-empty string" % name)
+        if "parameters" in spec and not isinstance(spec["parameters"], dict):
+            die("overrides: FAIL tools.%s.parameters must be an object" % name)
+        tool_changes = deep_merge(projected[name], copy.deepcopy(spec), name)
+        if tool_changes:
+            changed.append((name, tool_changes))
+
+    if not changed:
+        say("overrides: file present at %s but it changes nothing" % overlay)
+        return []
+    say("overrides: applied to %d tool(s): %s"
+        % (len(changed), ", ".join(name for name, _ in changed)))
+    for _, tool_changes in changed:
+        for where, before, after in tool_changes:
+            say("overrides: %s: %s -> %s" % (where, show(before), show(after)))
+    return [name for name, _ in changed]
 
 
 def render(value, indent=0):
@@ -305,7 +430,7 @@ def mode_fetch(url, out):
     return 3
 
 
-def mode_asset(remote, dest, emit):
+def mode_asset(remote, dest, emit, overlay):
     order, tools, declared = validate_asset(read_json(remote))
     say("validate: structure ok order=%d tools=%d" % (len(order), len(tools)))
     recomputed = canonical_tools_sha256(tools)
@@ -318,8 +443,6 @@ def mode_asset(remote, dest, emit):
 
     keys = gateway_tool_keys(dest)
     projected, leftovers, extra_fields = project(order, tools, keys)
-    projected_sha = canonical_tools_sha256(projected)
-    say("%-40s = %s" % ("remote sha256 (gateway projection)", projected_sha))
     say("project: %d tool(s) in order, tool keys kept: %s"
         % (len(projected), ",".join(keys)))
     if leftovers:
@@ -328,6 +451,13 @@ def mode_asset(remote, dest, emit):
     if extra_fields:
         say("project: asset fields not carried by the gateway shape: %s"
             % ",".join(extra_fields))
+
+    # Overlay before the sha256: --check and the write path must compare the same bytes,
+    # otherwise a repo with an overlay would report MISMATCH forever.
+    apply_overrides(projected, overlay)
+
+    projected_sha = canonical_tools_sha256(projected)
+    say("%-40s = %s" % ("remote sha256 (gateway projection)", projected_sha))
 
     verdict = "MISMATCH"
     if os.path.isfile(dest):
@@ -353,7 +483,7 @@ def mode_asset(remote, dest, emit):
     return 0 if verdict == "MATCH" else 1
 
 
-def mode_local(dest):
+def mode_local(dest, overlay):
     if not os.path.isfile(dest):
         die("offline: FAIL %s does not exist" % dest)
     data = read_json(dest)
@@ -368,6 +498,16 @@ def mode_local(dest):
             die("offline: FAIL %s.parameters is not an object" % name)
     say("offline: structure ok tools=%d" % len(data))
     say("%-40s = %s" % ("local sha256 (canonical, gateway format)", canonical_tools_sha256(data)))
+    # No asset copy offline, so the overlay cannot be merged; still fail fast on a broken
+    # overlay file rather than discovering it on the next online run.
+    if overlay and overlay != "-" and os.path.isfile(overlay):
+        declared = read_json(overlay)
+        count = len(declared.get("tools") or {}) if isinstance(declared, dict) else 0
+        if not isinstance(declared, dict) or declared.get("version") != 1 or not count:
+            die("overrides: FAIL %s must be {version:1, tools:{...}}" % overlay)
+        say("overrides: %d tool(s) declared, not applied in offline mode" % count)
+    else:
+        say("overrides: none")
     return 0
 
 
@@ -380,11 +520,13 @@ def main(argv):
             die("error: fetch mode needs <url> <out>")
         return mode_fetch(argv[2], argv[3])
     if mode == "asset":
-        if len(argv) != 5:
-            die("error: asset mode needs <remote> <dest> <emit|->")
-        return mode_asset(argv[2], argv[3], argv[4])
+        if len(argv) != 6:
+            die("error: asset mode needs <remote> <dest> <emit|-> <overlay|->")
+        return mode_asset(argv[2], argv[3], argv[4], argv[5])
     if mode == "local":
-        return mode_local(argv[2])
+        if len(argv) not in (3, 4):
+            die("error: local mode needs <dest> [<overlay|->]")
+        return mode_local(argv[2], argv[3] if len(argv) == 4 else "-")
     die("error: unknown helper mode %r" % mode)
 
 
@@ -400,13 +542,14 @@ try {
     if ($Offline) {
         Say 'offline: no network, checking the local file only'
         Say ('dest: ' + $Dest)
-        Invoke-Py @($Helper, 'local', $Dest)
+        Invoke-Py @($Helper, 'local', $Dest, $Overrides)
         $rc = $script:LastExit
         if ($rc -eq 0) { Say 'done: local snapshot is usable' }
         $ExitCode = $rc
     } else {
         Say ('source url: ' + $Url)
         Say ('dest file:  ' + $Dest)
+        Say ('overrides:  ' + $Overrides)
         $remote = Join-Path $TempDir 'remote.json'
         Invoke-Py @($Helper, 'fetch', $Url, $remote)
         $rc = $script:LastExit
@@ -416,12 +559,12 @@ try {
             $ExitCode = 3
         } elseif ($Check) {
             Say 'check: validating the downloaded asset, nothing will be written'
-            Invoke-Py @($Helper, 'asset', $remote, $Dest, '-')
+            Invoke-Py @($Helper, 'asset', $remote, $Dest, '-', $Overrides)
             $ExitCode = $script:LastExit
         } else {
             Say 'write: validating and projecting the downloaded asset'
             $injected = Join-Path $TempDir 'injected.json'
-            Invoke-Py @($Helper, 'asset', $remote, $Dest, $injected)
+            Invoke-Py @($Helper, 'asset', $remote, $Dest, $injected, $Overrides)
             $rc = $script:LastExit
             if ($rc -ne 0) {
                 $ExitCode = $rc

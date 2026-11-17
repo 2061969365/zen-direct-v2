@@ -1086,18 +1086,21 @@ func allOfficialToolNames(ranked []map[string]any, protocol Format) bool {
 
 // verbatimDescMode 报告是否逐字出站客户端描述（跳过短语黑名单）。
 //
-// 对照 opencode2api v1.4.8：他们的 mcp_ 模式对客户端描述零触碰（唯一的
-// 描述改写只针对他们自己追加的官方 shell/bash 主机替换），线上跑通。
-// 2026-11-17 同出口 A/B 实测（A=真实 DSH 描述含封禁短语，B=中性描述）：
-// A 与 B 结果一致，说明描述文本不是 429 的变量——此前"描述指纹"的因果
-// 判断是出口波动造成的假相关。
+// 2026-11-17 生产 A/B 实测（同一节点、同一请求，只改脱敏开关）：
 //
-// 因此默认逐字出站（保留客户端对模型的完整语义），黑名单降级为
-// ZEN_DESC_SANITIZE=1 显式开启的后备手段。
+//	real-multi-stream（真实 DSH 描述 + stream）
+//	  v0.9.34/35 脱敏开启 → 200
+//	  v0.9.36   脱敏关闭 → 429（双节点一致）
+//
+// 而 45multi / turn3（非流 + 占位描述）两种模式都 200。
+//
+// 结论：**描述脱敏是承重的**，至少在"真实描述 + 流式"这一形态上。此前
+// 同出口 A/B 显示"A/B 都 429"是出口被烧期间的无效样本，不能据此否定脱敏。
+// 因此默认保持脱敏开启；ZEN_DESC_VERBATIM=1 仅供对照实验。
 func verbatimDescMode() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("ZEN_DESC_SANITIZE"))) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ZEN_DESC_VERBATIM"))) {
 	case "1", "on", "true", "yes":
-		return false
+		return true
 	}
-	return true
+	return false
 }

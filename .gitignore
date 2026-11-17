@@ -40,3 +40,6 @@ last_*UpBody.json
 incoming/
 last_incoming_req.json
 last_429_*.json
+
+# 资产注入时留的原文件备份（scripts/sync_assets.sh）
+tools/*.json.orig

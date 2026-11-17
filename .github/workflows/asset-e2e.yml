@@ -1,0 +1,569 @@
+name: asset-e2e
+
+# 资产闭环：资产定义 → 构建 →（可选 WARP）出口 IP → 起网关 → 真实免费模型探针 → 判定。
+#
+# 只调用两个由别人维护的接口，本文件不实现、不修改它们：
+#   scripts/sync_assets.sh --check   只比对不写文件：0=一致 1=不一致 2=校验失败 3=网络失败
+#   scripts/sync_assets.sh           下载并注入 tools/opencode_tools.json
+#   python3 tools/asset_probe.py --base --model --out --timeout   0=全部通过 1=有失败
+#
+# egress 默认 direct（不依赖 WARP）；warp 走公开仓库已验证过的 Cloudflare WARP 片段。
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "被测模型（免费层）"
+        required: false
+        default: "deepseek-v4.1-flash-free"
+      scenario:
+        description: "只关注某个 scenario 的结论（all = 全部）"
+        required: false
+        default: "all"
+      egress:
+        description: "出口：direct = runner 直连；warp = Cloudflare WARP"
+        required: false
+        type: choice
+        options:
+          - direct
+          - warp
+        default: "direct"
+  schedule:
+    # 每天一次；避开 UTC 03:00（资产抓包窗口）
+    - cron: "23 7 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  asset-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MODEL: ${{ github.event.inputs.model || 'deepseek-v4.1-flash-free' }}
+      SCENARIO: ${{ github.event.inputs.scenario || 'all' }}
+      EGRESS: ${{ github.event.inputs.egress || 'direct' }}
+      WORK: ${{ github.workspace }}/_e2e
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go (version from go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Baseline egress (pre-WARP, direct)
+        run: |
+          set -uo pipefail
+          mkdir -p "$WORK"
+          base=$(curl -s -m 20 https://api.ipify.org 2>/dev/null || true)
+          base=${base:-unknown}
+          echo "BASELINE_IP=$base" >> "$GITHUB_ENV"
+          printf '%s' "$base" > "$WORK/ip_direct.txt"
+          echo "baseline direct egress: $base"
+          {
+            echo "### 直连基线出口（WARP 前）"
+            echo "- egress mode: \`$EGRESS\`"
+            echo "- direct IP: \`$base\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- WARP 片段：原样搬自 xia35480/zen-1102-1225 .github/workflows/warp-official-cli-test.yml ----
+      - name: Install WARP (egress=warp)
+        if: env.EGRESS == 'warp'
+        run: |
+          set -euo pipefail
+          trap 'echo "::error::WARP 安装/连接失败"; sudo warp-cli --accept-tos status || true; sudo systemctl status warp-svc --no-pager || true; sudo journalctl -u warp-svc -n 50 --no-pager || true' ERR
+          echo "下载 cloudflare-warp 独立包..."
+          curl -fsSL --retry 3 --retry-delay 1 \
+            -o /tmp/cloudflare-warp.deb \
+            https://pkg.cloudflareclient.com/pool/noble/main/c/cloudflare-warp/cloudflare-warp_2026.8.2115.0_amd64.deb
+          sudo apt-get -o Acquire::Retries=3 update -y
+          if ! sudo dpkg -i /tmp/cloudflare-warp.deb; then
+            echo "cloudflare-warp 依赖未满足，安装缺失依赖..."
+            sudo apt-get -o Acquire::Retries=3 install -f -y --fix-missing
+            sudo dpkg -i /tmp/cloudflare-warp.deb
+          fi
+          sudo systemctl enable warp-svc >/dev/null 2>&1 || true
+          sudo systemctl start warp-svc >/dev/null 2>&1 || sudo service warp-svc start >/dev/null 2>&1 || true
+          ready=0
+          for i in $(seq 1 30); do
+            if sudo systemctl is-active --quiet warp-svc; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != "1" ]; then
+            echo "::error::cloudflare-warp daemon 未就绪"
+            sudo systemctl status warp-svc --no-pager || true
+            exit 1
+          fi
+          sleep 1
+          sudo warp-cli --accept-tos registration new
+          sudo warp-cli --accept-tos mode warp+doh
+          sudo warp-cli --accept-tos connect
+          sleep 2
+          sudo warp-cli --accept-tos status || true
+
+      - name: Fix DNS (egress=warp)
+        if: env.EGRESS == 'warp'
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo systemctl disable systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          printf '%s\n' 'nameserver 1.1.1.1' 'nameserver 2606:4700:4700::1111' 'nameserver 8.8.8.8' | sudo tee /etc/resolv.conf
+
+      - name: Confirm egress IP
+        run: |
+          set -uo pipefail
+          mkdir -p "$WORK"
+          ip=$(curl -s -m 20 https://api.ipify.org 2>/dev/null || true)
+          ip=${ip:-}
+          printf '%s' "$ip" > "$WORK/ip_egress.txt"
+          echo "EGRESS_IP=$ip" >> "$GITHUB_ENV"
+          curl -s -m 20 https://www.cloudflare.com/cdn-cgi/trace > "$WORK/cf_trace.txt" 2>/dev/null || true
+          trace=$(grep -E '^(ip|warp|loc|colo)=' "$WORK/cf_trace.txt" 2>/dev/null | tr '\n' ' ' || true)
+          echo "egress IP: ${ip:-<empty>}"
+          echo "cf trace: ${trace:-<none>}"
+          {
+            echo ""
+            echo "### 实测出口"
+            echo "- egress mode: \`$EGRESS\`"
+            echo "- egress IP: \`${ip:-<empty>}\`"
+            echo "- cf trace: \`${trace:-<none>}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$ip" ]; then
+            echo "::error::取不到出口 IP（api.ipify.org 失败）"
+            exit 1
+          fi
+          if [ "$EGRESS" = "warp" ]; then
+            base=$(cat "$WORK/ip_direct.txt" 2>/dev/null || echo "")
+            if [ -n "$base" ] && [ "$ip" = "$base" ]; then
+              echo "::error::WARP 模式出口 IP 与直连相同（$ip），WARP 没连上"
+              sudo warp-cli --accept-tos status || true
+              sudo systemctl status warp-svc --no-pager || true
+              exit 1
+            fi
+            echo "WARP 出口已切换：direct=$base → warp=$ip"
+          fi
+
+      # ---- 资产注入：gate ----
+      - name: Inject assets (scripts/sync_assets.sh)
+        run: |
+          set -uo pipefail
+          mkdir -p "$WORK"
+          : > "$WORK/sync_assets.log"
+          : > "$WORK/sync_check.log"
+
+          set +e
+          bash scripts/sync_assets.sh --check > "$WORK/sync_check.log" 2>&1
+          check_rc=$?
+          set -e
+          echo "sync_assets.sh --check rc=$check_rc（0=一致 1=不一致 2=校验失败 3=网络失败）"
+          tail -20 "$WORK/sync_check.log" || true
+
+          set +e
+          bash scripts/sync_assets.sh > "$WORK/sync_assets.log" 2>&1
+          rc=$?
+          set -e
+          cat "$WORK/sync_assets.log" || true
+          echo "sync_assets.sh rc=$rc"
+          {
+            echo ""
+            echo "### 资产注入"
+            echo "- \`--check\` rc: \`$check_rc\`（0=一致 1=不一致 2=校验失败 3=网络失败）"
+            echo "- \`sync_assets.sh\` rc: \`$rc\`"
+            echo ""
+            echo "<details><summary>sync_assets.sh 输出（尾部 40 行）</summary>"
+            echo ""
+            echo '```'
+            tail -40 "$WORK/sync_assets.log" 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "SYNC_CHECK_RC=$check_rc" >> "$GITHUB_ENV"
+
+          if [ "$rc" != "0" ]; then
+            echo "::error::资产注入失败（rc=$rc），gate 不通过"
+            tail -50 "$WORK/sync_assets.log" || true
+            exit 1
+          fi
+
+      - name: Record injected tools
+        run: |
+          set -uo pipefail
+          mkdir -p "$WORK"
+          python3 <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os, sys
+
+          work = os.environ["WORK"]
+          path = "tools/opencode_tools.json"
+          names = None
+          err = ""
+
+          def from_obj(obj):
+              if isinstance(obj, dict):
+                  if isinstance(obj.get("tools"), list):
+                      out = []
+                      for it in obj["tools"]:
+                          if not isinstance(it, dict):
+                              continue
+                          fn = it.get("function") if isinstance(it.get("function"), dict) else it
+                          nm = fn.get("name") or it.get("name")
+                          if nm:
+                              out.append(str(nm))
+                      return out
+                  vals = list(obj.values())
+                  if vals and all(isinstance(v, dict) for v in vals):
+                      return [str(k) for k in obj.keys()]
+              if isinstance(obj, list):
+                  out = []
+                  for it in obj:
+                      if not isinstance(it, dict):
+                          continue
+                      fn = it.get("function") if isinstance(it.get("function"), dict) else it
+                      nm = fn.get("name") or it.get("name")
+                      if nm:
+                          out.append(str(nm))
+                  return out
+              return None
+
+          try:
+              with open(path, encoding="utf-8", errors="replace") as f:
+                  obj = json.load(f)
+              names = from_obj(obj)
+              if names is None:
+                  err = "无法识别的工具资产结构：%s" % type(obj).__name__
+          except Exception as e:
+              err = "%s: %s" % (type(e).__name__, e)
+
+          raw_text = ""
+          try:
+              with open(path, "rb") as f:
+                  raw_text = f.read(4096).decode("utf-8", "replace")
+          except Exception:
+              pass
+
+          if names is None:
+              names = []
+          uniq = sorted(set(names))
+          with open(os.path.join(work, "tool_names.txt"), "w", encoding="utf-8") as f:
+              f.write("\n".join(uniq) + ("\n" if uniq else ""))
+          with open(os.path.join(work, "tool_count.txt"), "w", encoding="utf-8") as f:
+              f.write(str(len(uniq)))
+
+          print("")
+          print("### 注入后的工具（tools/opencode_tools.json）")
+          print("- 数量: **%d**" % len(uniq))
+          if err:
+              print("- 解析提示: %s" % err)
+              print("- 原始头部: `%s`" % raw_text[:300].replace("\n", " ").replace("`", "'"))
+          if uniq:
+              print("- 工具名: " + ", ".join("`%s`" % n for n in uniq))
+          else:
+              print("- 工具名: <空>")
+          PY
+
+          count=$(cat "$WORK/tool_count.txt" 2>/dev/null || echo 0)
+          echo "injected tool count=${count:-0}"
+          if [ "${count:-0}" = "0" ]; then
+            echo "::warning::注入后的工具集合为空或结构未识别（见 step summary 的解析提示）"
+          fi
+
+      - name: Build gateway binary
+        run: |
+          set -uo pipefail
+          mkdir -p "$WORK"
+          set +e
+          go build -o zen-direct . > "$WORK/build.log" 2>&1
+          rc=$?
+          set -e
+          tail -20 "$WORK/build.log" || true
+          if [ "$rc" != "0" ]; then
+            echo "::error::go build 失败（rc=$rc）"
+            tail -50 "$WORK/build.log" || true
+            exit 1
+          fi
+          sha=$(sha256sum zen-direct | cut -d' ' -f1)
+          size=$(stat -c%s zen-direct)
+          echo "BIN_SHA=$sha" >> "$GITHUB_ENV"
+          echo "BIN_SIZE=$size" >> "$GITHUB_ENV"
+          echo "binary sha256=$sha size=$size bytes"
+          {
+            echo ""
+            echo "### 构建"
+            echo "- \`go build -o zen-direct .\` OK"
+            echo "- sha256: \`$sha\`"
+            echo "- size: \`$size\` bytes"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Start gateway (PORT=8081)
+        run: |
+          set -uo pipefail
+          mkdir -p "$WORK"
+          : > "$WORK/gateway.log"
+          PORT=8081 OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1 ./zen-direct > "$WORK/gateway.log" 2>&1 &
+          echo $! > "$WORK/gateway.pid"
+          echo "gateway pid=$(cat "$WORK/gateway.pid")"
+
+          ok=0
+          for i in $(seq 1 30); do
+            code=$(curl -s -m 2 -o "$WORK/health.json" -w '%{http_code}' http://127.0.0.1:8081/health 2>/dev/null || true)
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            if ! kill -0 "$(cat "$WORK/gateway.pid")" 2>/dev/null; then
+              echo "::error::网关进程已退出"
+              tail -50 "$WORK/gateway.log" || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::/health 未在 30s 内返回 200"
+            tail -50 "$WORK/gateway.log" || true
+            exit 1
+          fi
+          if ! kill -0 "$(cat "$WORK/gateway.pid")" 2>/dev/null; then
+            echo "::error::/health 返回 200 但网关进程已退出（端口可能被别的进程占用）"
+            tail -50 "$WORK/gateway.log" || true
+            exit 1
+          fi
+          echo "health: $(cat "$WORK/health.json")"
+          if ! grep -q '"status":"ok"' "$WORK/health.json"; then
+            echo "::error::/health 返回非 ok"
+            tail -50 "$WORK/gateway.log" || true
+            exit 1
+          fi
+
+      - name: Run asset probe
+        run: |
+          set -uo pipefail
+          mkdir -p "$WORK"
+          set +e
+          python3 tools/asset_probe.py \
+            --base http://127.0.0.1:8081 \
+            --model "$MODEL" \
+            --out "$WORK/verdict.json" \
+            --timeout 120 2>&1 | tee "$WORK/probe.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "PROBE_RC=$rc" >> "$GITHUB_ENV"
+          echo "asset_probe rc=$rc"
+          if [ "$rc" != "0" ]; then
+            echo "::error::asset_probe 判定失败（rc=$rc）"
+            tail -50 "$WORK/probe.log" || true
+            echo "=== gateway.log tail ==="
+            tail -50 "$WORK/gateway.log" || true
+          fi
+
+      - name: Verdict + step summary
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p "$WORK"
+          curl -s -m 5 http://127.0.0.1:8081/health > "$WORK/health_end.json" 2>/dev/null || true
+
+          python3 <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+
+          work = os.environ.get("WORK", "_e2e")
+          model = os.environ.get("MODEL", "?")
+          scenario = os.environ.get("SCENARIO", "all")
+          egress = os.environ.get("EGRESS", "?")
+          probe_rc = os.environ.get("PROBE_RC", "")
+
+          def load(name):
+              try:
+                  with open(os.path.join(work, name), encoding="utf-8", errors="replace") as f:
+                      return json.load(f)
+              except Exception as e:
+                  return {"_error": "%s: %s" % (type(e).__name__, e)}
+
+          health = load("health_end.json")
+          if not health or health.get("_error"):
+              health = load("health.json")
+          verdict = load("verdict.json")
+
+          def rd(name, default=""):
+              try:
+                  with open(os.path.join(work, name), encoding="utf-8", errors="replace") as f:
+                      return f.read().strip()
+              except Exception:
+                  return default
+
+          ip = rd("ip_egress.txt") or os.environ.get("EGRESS_IP", "") or "?"
+          base_ip = rd("ip_direct.txt") or os.environ.get("BASELINE_IP", "") or "?"
+          steps_stats = health.get("stats") if isinstance(health, dict) else None
+          if not isinstance(steps_stats, dict):
+              steps_stats = {}
+          if not steps_stats and isinstance(verdict, dict):
+              ha = verdict.get("health_after")
+              if isinstance(ha, dict) and isinstance(ha.get("stats"), dict):
+                  steps_stats = ha["stats"]
+          tools = [n for n in rd("tool_names.txt").splitlines() if n.strip()]
+
+          print("")
+          print("### 判定汇总")
+          print("- run: egress=`%s` model=`%s` scenario=`%s`" % (egress, model, scenario))
+          print("- 出口 IP: `%s`（直连基线 `%s`）" % (ip, base_ip))
+          print("- 二进制 sha256: `%s` size=`%s`" % (
+              os.environ.get("BIN_SHA", "?"), os.environ.get("BIN_SIZE", "?")))
+          print("- 注入工具数: **%d** %s" % (
+              len(tools), (", ".join("`%s`" % t for t in tools) if tools else "")))
+          print("- /health stats: reqs=`%s` up429=`%s` up4xx=`%s` up5xx=`%s` transport_retry=`%s` circuit_open=`%s`" % (
+              steps_stats.get("reqs", "?"), steps_stats.get("up429", "?"),
+              steps_stats.get("up4xx", "?"), steps_stats.get("up5xx", "?"),
+              steps_stats.get("transport_retry", "?"), steps_stats.get("circuit_open", "?")))
+          print("- /health egress_ip: `%s` version=`%s`" % (
+              health.get("egress_ip", "?"), health.get("version", "?")))
+
+          rows = []
+
+          def detail(item):
+              parts = []
+              if item.get("http") is not None:
+                  parts.append("http=%s" % item.get("http"))
+              if item.get("finish_reason"):
+                  parts.append("finish=%s" % item.get("finish_reason"))
+              tn = item.get("tool_names")
+              if isinstance(tn, list) and tn:
+                  parts.append("tools=" + ",".join(str(t) for t in tn))
+              hd = item.get("health_delta")
+              if isinstance(hd, dict) and hd.get("up429"):
+                  parts.append("up429+%s" % hd.get("up429"))
+              if item.get("error"):
+                  parts.append("error=%s" % str(item.get("error"))[:160].replace("|", "/"))
+              return "; ".join(parts)
+
+          def push(name, item):
+              if not isinstance(item, dict):
+                  rows.append((str(name), item, ""))
+                  return
+              ok = item.get("ok")
+              if ok is None:
+                  ok = item.get("pass")
+              if ok is None:
+                  ok = item.get("passed")
+              status = (item.get("status") or item.get("verdict") or item.get("result")
+                        or detail(item))
+              rows.append((str(name), ok, str(status)))
+
+          if isinstance(verdict, dict) and "_error" not in verdict:
+              for key in ("scenarios", "results", "cases", "checks", "scenario_results"):
+                  val = verdict.get(key)
+                  if isinstance(val, list):
+                      for it in val:
+                          if isinstance(it, dict):
+                              push(it.get("scenario") or it.get("name") or it.get("id") or "?", it)
+                          else:
+                              push("?", it)
+                      break
+                  if isinstance(val, dict):
+                      for nm, it in val.items():
+                          push(nm, it)
+                      break
+
+          print("")
+          if rows:
+              if scenario and scenario != "all":
+                  sel = [r for r in rows if scenario.lower() in r[0].lower()]
+                  if sel:
+                      rows = sel
+                  else:
+                      print("（verdict.json 里没有匹配 `%s` 的 scenario，以下为全部）" % scenario)
+              print("| scenario | 结论 | 备注 |")
+              print("| --- | --- | --- |")
+              for name, ok, status in rows:
+                  if ok is True:
+                      mark = "PASS"
+                  elif ok is False:
+                      mark = "FAIL"
+                  elif isinstance(ok, str):
+                      mark = ok
+                  else:
+                      mark = "?"
+                  print("| `%s` | %s | %s |" % (name, mark, status))
+          elif isinstance(verdict, dict) and "_error" in verdict:
+              print("- verdict.json 不可读: %s" % verdict["_error"])
+          else:
+              raw = json.dumps(verdict, ensure_ascii=False)
+              print("- verdict.json（未识别结构，前 800 字符）: `%s`" % raw[:800].replace("`", "'"))
+
+          print("")
+          print("### 结论")
+          if isinstance(verdict, dict) and "_error" not in verdict:
+              print("- 探针自报: ok=`%s` passed=`%s` failed=`%s`" % (
+                  verdict.get("ok", "?"), verdict.get("passed", "?"), verdict.get("failed", "?")))
+              leaked = verdict.get("leaked_wire_names")
+              if isinstance(leaked, list) and leaked:
+                  print("- 线上工具名泄漏: %s" % ", ".join("`%s`" % str(x) for x in leaked))
+              ha = verdict.get("health_after")
+              if isinstance(ha, dict) and isinstance(ha.get("stats"), dict):
+                  hs = ha["stats"]
+                  print("- 探针 health_after: reqs=`%s` up429=`%s` up4xx=`%s` up5xx=`%s`" % (
+                      hs.get("reqs", "?"), hs.get("up429", "?"),
+                      hs.get("up4xx", "?"), hs.get("up5xx", "?")))
+          vok = verdict.get("ok") if isinstance(verdict, dict) else None
+          if probe_rc and probe_rc != "0":
+              print("- **FAIL**：探针 rc=%s（见 artifact 里的 verdict.json / gateway.log）" % probe_rc)
+          elif vok is True:
+              print("- **PASS**：探针全绿（200 + 工具调用）")
+          elif vok is False:
+              print("- **FAIL**：verdict.json 判定 ok=false（passed=`%s` failed=`%s`）"
+                    % (verdict.get("passed", "?"), verdict.get("failed", "?")))
+          else:
+              print("- **UNKNOWN**：探针未产出 rc / verdict（前序步骤已失败）")
+          print("- 429 计数（上游 429）: `%s`" % steps_stats.get("up429", "?"))
+          try:
+              with open(os.path.join(work, "verdict_ok.txt"), "w", encoding="utf-8") as f:
+                  f.write("1" if (isinstance(verdict, dict) and verdict.get("ok") is True) else "0")
+          except Exception:
+              pass
+          PY
+
+          echo "=== /health stats ==="
+          python3 - "$WORK" <<'PY'
+          import json, os, sys
+          p = os.path.join(sys.argv[1], "health_end.json")
+          try:
+              with open(p, encoding="utf-8", errors="replace") as f:
+                  h = json.load(f)
+          except Exception:
+              p = os.path.join(sys.argv[1], "health.json")
+              try:
+                  with open(p, encoding="utf-8", errors="replace") as f:
+                      h = json.load(f)
+              except Exception as e:
+                  print("health 不可读: %s" % e)
+                  raise SystemExit(0)
+          print(json.dumps(h.get("stats", {}), ensure_ascii=False, sort_keys=True))
+          print("egress_ip=%s version=%s" % (h.get("egress_ip"), h.get("version")))
+          PY
+
+          if [ -s "$WORK/gateway.pid" ]; then
+            kill "$(cat "$WORK/gateway.pid")" 2>/dev/null || true
+            sleep 1
+          fi
+
+          echo "--- gateway.log tail ---"
+          tail -20 "$WORK/gateway.log" 2>/dev/null || true
+
+          verdict_ok=$(cat "$WORK/verdict_ok.txt" 2>/dev/null || echo "0")
+          echo "probe rc=${PROBE_RC:-none} verdict.ok=$verdict_ok"
+          if [ "${PROBE_RC:-}" != "0" ] || [ "$verdict_ok" != "1" ]; then
+            echo "::error::资产闭环判定失败（probe rc=${PROBE_RC:-none} verdict.ok=$verdict_ok）"
+            tail -50 "$WORK/gateway.log" 2>/dev/null || true
+            tail -20 "$WORK/probe.log" 2>/dev/null || true
+            exit 1
+          fi
+          echo "资产闭环判定通过"
+
+      - name: Upload verdict + gateway log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asset-e2e-${{ github.run_id }}
+          path: |
+            _e2e/verdict.json
+            _e2e/gateway.log
+          retention-days: 7
+          if-no-files-found: warn

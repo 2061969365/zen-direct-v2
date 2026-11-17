@@ -179,6 +179,13 @@ func sanitizeToolDescription(_ string, description string) (string, bool) {
 	if description == "" {
 		return description, false
 	}
+	// ZEN_DESC_VERBATIM：客户端描述逐字出站（对齐 opencode2api v1.4.8——
+	// 他们的 mcp_ 模式对客户端描述零触碰且线上跑通）。短语黑名单是
+	// clint_/官方名时代的校准；mcp_ 不透明名下描述是否仍被指纹待实测，
+	// 实测通过后此模式转默认，黑名单降级为 ZEN_DESC_VERBATIM=0 的后备。
+	if verbatimDescMode() {
+		return description, false
+	}
 	// requires 按原始描述判断，不受前一条替换的影响：read 的
 	// "UTF-8 text file" 会先被换成 "text file"，之后再判断 "UTF-8" 就失效了。
 	original := foldDescription(description)
@@ -1076,4 +1083,13 @@ func allOfficialToolNames(ranked []map[string]any, protocol Format) bool {
 		}
 	}
 	return true
+}
+
+// verbatimDescMode 报告是否逐字出站客户端描述（跳过短语黑名单）。
+func verbatimDescMode() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ZEN_DESC_VERBATIM"))) {
+	case "1", "on", "true", "yes":
+		return true
+	}
+	return false
 }

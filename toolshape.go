@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"reflect"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -60,6 +61,30 @@ func entryToolName(entry map[string]any, protocol Format) string {
 	}
 	name, _ := entry["name"].(string)
 	return name
+}
+
+// entryToolDescription / entryToolParameters 与 entryToolName 同源：
+// chat 协议把两者藏在 function 里，responses/messages 放在顶层。
+func entryToolDescription(entry map[string]any, protocol Format) string {
+	if protocol == FmtChat {
+		if fn, ok := entry["function"].(map[string]any); ok {
+			desc, _ := fn["description"].(string)
+			return desc
+		}
+		return ""
+	}
+	desc, _ := entry["description"].(string)
+	return desc
+}
+
+func entryToolParameters(entry map[string]any, protocol Format) any {
+	if protocol == FmtChat {
+		if fn, ok := entry["function"].(map[string]any); ok {
+			return fn["parameters"]
+		}
+		return nil
+	}
+	return entry["parameters"]
 }
 
 // describeDroppedTools 汇总被裁掉的工具名，用于日志。裁剪是有损的——被裁掉的
@@ -1308,10 +1333,10 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	// 上游判定“自称官方但 schema 不是官方原文”，zen 0/8 全 429，
 	// 而把同一份 body 交给改名路径的 opencode2api 8/8 全 200。
 	// 所以透传必须要求集合**完整**，子集一律走改名+补全。
-	if len(ranked) > 0 && completeOfficialToolset(ranked, protocol) {
+	if len(ranked) > 0 && shapePassThrough(ranked, protocol) {
 		recordShapeDecision(summarizeShapeDecision(
 			shapeModePassthrough, len(items), clientToolNames(ranked, protocol), toolCount(payload),
-			"client declared the complete official tool set; passed through verbatim"))
+			"passthrough ("+shapeMode()+"): "+shapeReason(ranked, protocol)))
 		return renames, false
 	}
 	for _, entry := range ranked {
@@ -1500,6 +1525,99 @@ func allOfficialToolNames(ranked []map[string]any, protocol Format) bool {
 // 这是"原样透传"的唯一入口条件。只看 allOfficialToolNames 是不够的——
 // 它对 {read} 这种官方名子集也为真，而子集透传会被上游当成
 // "自称官方、schema 却不是官方原文"而 429（2026-11-17 多出口实测）。
+// shapeMode 返回透传判据的档位，由 ZEN_SHAPE_MODE 控制。
+//
+//	exact   （默认）客户端的工具名集合必须与官方集合完全相等
+//	subset  客户端的工具名只要都属于官方集合就算过（不管缺哪个）
+//	content subset 之上再要求每个工具的定义与官方逐字一致
+//
+// 为什么要有这两档：官方 CLI 现在发的集合不稳定（12 或 13，差在
+// experimental_image_generate），exact 判据永远为假，每个请求都走
+// 「改名 + 补 14 个官方桩」，出站从 12 涨到 26 —— 同一批能力出现两次，
+// 模型的选择面凭空翻倍。subset/content 是两条候选出路，用 ZEN_SHAPE_MODE
+// 切换后拿真实请求比对上游接受度，验完再决定默认值。
+func shapeMode() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ZEN_SHAPE_MODE"))) {
+	case "subset":
+		return "subset"
+	case "content":
+		return "content"
+	}
+	return "exact"
+}
+
+// officialSubset 报告客户端声明的工具名是否**全部**落在官方集合内。
+func officialSubset(ranked []map[string]any, protocol Format) bool {
+	if len(ranked) == 0 {
+		return false
+	}
+	set := officialToolNameSet()
+	for _, entry := range ranked {
+		name := entryToolName(entry, protocol)
+		if name == "" || !set[name] {
+			return false
+		}
+	}
+	return true
+}
+
+// officialContentMatches 报告客户端每个工具的定义是否与网关会发出的官方定义
+// 完全一致（描述 + 参数整棵子树）。
+//
+// 为什么只比这两个字段：上游判的是「自称官方，schema 是不是官方原文」，
+// 而 2026-11-17 的 A/B 已经点名了参数级描述（"Path to edit, resolved by
+// the filesystem backend"）就是指纹本身。名字对但文本不对，一样 429。
+func officialContentMatches(ranked []map[string]any, protocol Format) bool {
+	official := map[string]map[string]any{}
+	for _, item := range officialToolset(protocol) {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if name := entryToolName(entry, protocol); name != "" {
+			official[name] = entry
+		}
+	}
+	for _, entry := range ranked {
+		name := entryToolName(entry, protocol)
+		want, ok := official[name]
+		if !ok {
+			return false
+		}
+		gotDesc := entryToolDescription(entry, protocol)
+		wantDesc := entryToolDescription(want, protocol)
+		if gotDesc != wantDesc {
+			return false
+		}
+		if !reflect.DeepEqual(entryToolParameters(entry, protocol), entryToolParameters(want, protocol)) {
+			return false
+		}
+	}
+	return true
+}
+
+// shapeReason 给 /health 和日志用的一句话判定理由。
+func shapeReason(ranked []map[string]any, protocol Format) string {
+	switch shapeMode() {
+	case "subset":
+		return "client declared a subset of the official tool set; passed through verbatim"
+	case "content":
+		return "client tool names and definitions match the official set; passed through verbatim"
+	}
+	return "client declared the complete official tool set; passed through verbatim"
+}
+
+// shapePassThrough 按当前档位判断这次请求能否整份透传。
+func shapePassThrough(ranked []map[string]any, protocol Format) bool {
+	switch shapeMode() {
+	case "subset":
+		return officialSubset(ranked, protocol)
+	case "content":
+		return officialSubset(ranked, protocol) && officialContentMatches(ranked, protocol)
+	}
+	return completeOfficialToolset(ranked, protocol)
+}
+
 func completeOfficialToolset(ranked []map[string]any, protocol Format) bool {
 	if len(ranked) == 0 {
 		return false

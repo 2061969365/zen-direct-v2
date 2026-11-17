@@ -84,7 +84,8 @@ MODEL = "deepseek-v4.1-flash-free"
 ASSET_URL = "https://raw.githubusercontent.com/2061969365/zen-assets-runner/main/assets/official_tools.json"
 
 VALID_MODES = ("exact", "subset", "content")
-VALID_SCENARIOS = ("s12_pristine", "s13_pristine", "s14_pristine", "s12_rewritten", "s12_dsh")
+VALID_SCENARIOS = ("s12_pristine", "s13_pristine", "s14_pristine", "s12_rewritten",
+                   "s12_dsh", "s12_banned")
 
 # 额度指纹：命中即认为「这份样本作废」，不能算成「上游拒绝了判据」。
 QUOTA_KEYS = ("freeusagelimit", "usage limit", "quota", "rate limit")
@@ -229,9 +230,32 @@ def apply_dsh_text(tools):
     return tools
 
 
+#: s12_banned 用的工具级描述：直接抄 toolshape.go 注释里二分定位出来的原句。
+#: 这是「官方名 + 被判过的文本」的组合，用来验 subset（只看名字）会不会放行它。
+#: 已知历史结论：这个形态 429；如果今天复现不出来，说明上游判定变了。
+DSH_TOOL_DESCRIPTIONS = {
+    "read": "Read a UTF-8 text file and return line-numbered content.",
+    "skill": "Load the requested skill from the session skill catalog.",
+    "write": "Write a UTF-8 text file to the local filesystem.",
+}
+
+
+def apply_banned_tool_text(tools):
+    """把工具级描述换成当年实测被判 429 的原句（名字和参数保持官方原文）。"""
+    hit = 0
+    for entry in tools:
+        fn = entry.get("function") or {}
+        name = fn.get("name")
+        text = DSH_TOOL_DESCRIPTIONS.get(name)
+        if text:
+            fn["description"] = text
+            hit += 1
+    return tools, hit
+
+
 def scenario_names(scenario):
     """场景 → 工具名列表（顺序跟官方集一致）。"""
-    if scenario in ("s12_pristine", "s12_rewritten", "s12_dsh"):
+    if scenario in ("s12_pristine", "s12_rewritten", "s12_dsh", "s12_banned"):
         return list(CORE_NAMES)
     if scenario == "s13_pristine":
         return list(CORE_NAMES) + ["experimental_image_generate"]
@@ -277,6 +301,8 @@ def scenario_tools(scenario, pristine_defs, rewritten_defs):
     tools = build_tools(scenario_names(scenario), defs)
     if scenario == "s12_dsh":
         apply_dsh_text(tools)
+    if scenario == "s12_banned":
+        apply_banned_tool_text(tools)
     return tools
 
 
@@ -433,6 +459,20 @@ def judgement(records):
             lines.append("subset/s12_dsh 也 200 → 文本校验不是必需的（与历史结论相反，需复核）")
         else:
             lines.append("subset/s12_dsh http=%s" % http)
+
+    banned_rows = [r for r in records if r.get("mode") == "subset" and r.get("scenario") == "s12_banned"]
+    for row in banned_rows:
+        if row.get("skipped"):
+            lines.append("subset/s12_banned 未测（额度）")
+            continue
+        http = row.get("http")
+        if row.get("quota_suspected") or http == 429:
+            lines.append("subset/s12_banned 被拒（http=%s）→ 只看名字不够，必须加文本校验"
+                         % http)
+        elif http == 200:
+            lines.append("subset/s12_banned 也 200 → 描述指纹今天复现不出来，subset 可单独用")
+        else:
+            lines.append("subset/s12_banned http=%s" % http)
 
     content_rows = [r for r in records if r.get("mode") == "content"]
     for scenario in ("s14_pristine", "s12_rewritten", "s12_pristine", "s13_pristine"):

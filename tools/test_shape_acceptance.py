@@ -150,6 +150,33 @@ class ExpectedBranchTest(unittest.TestCase):
     def test_empty_tools_is_none(self):
         self.assertEqual(sa.expected_branch("subset", [], self.official), "none")
 
+    def test_name_only_criterion_accepts_client_text_but_content_rejects_it(self):
+        """核心假设：只看名字会放行「官方名 + 客户端自有参数文本」，配文本校验才会拦下。
+
+        这正是 s12_dsh 场景想验的那件事（2026-11-17 实测：官方名 + DSH 的参数级描述
+        → 429）。上游接不接受是另一回事，判据本身必须能把它区分出来。
+        """
+        if not hasattr(sa, "apply_dsh_text"):
+            self.skipTest("当前版本没有 apply_dsh_text（场景被移除）")
+        base = {
+            "description": "Read a file",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string", "description": "官方原文"}}},
+        }
+        official = {"read": json.loads(json.dumps(base))}
+        tools = [sa.chat_tool("read", json.loads(json.dumps(base)))]
+        tools = sa.apply_dsh_text(tools)
+        self.assertEqual(sa.expected_branch("subset", tools, official), "passthrough")
+        self.assertEqual(sa.expected_branch("content", tools, official), "rename_complete")
+
+    def test_registered_scenarios_all_build(self):
+        # VALID_SCENARIOS 是唯一事实来源：往里加场景就必须能构造出 tools
+        for scenario in sa.VALID_SCENARIOS:
+            tools = sa.scenario_tools(scenario, self.pristine, self.rewritten)
+            self.assertTrue(tools, scenario)
+            for entry in tools:
+                self.assertTrue(entry["function"]["name"], scenario)
+
     def test_windows_shell_description_rewrite(self):
         defs = {"shell": {"description": "Run a command on Linux using bash", "parameters": {"type": "object"}}}
         official = sa.gateway_official_defs(defs)

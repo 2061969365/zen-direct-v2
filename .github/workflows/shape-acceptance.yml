@@ -34,9 +34,11 @@ name: shape-acceptance
         required: false
         default: "subset,content"
       scenarios:
-        description: "只跑指定场景，逗号分隔（留空 = 四个全跑）"
+        description: "只跑指定场景，逗号分隔（默认四个：s12/s13/s14_pristine + s12_rewritten；s12_dsh 另算 +2 发）"
         required: false
-        default: ""
+        # 默认只跑任务约定的四个场景 = 8 发，正好压在「一次 6~8 发」的额度预算内。
+        # s12_dsh（官方名 + DSH 参数文本的反证场景）要显式加进这个输入才会跑。
+        default: "s12_pristine,s13_pristine,s14_pristine,s12_rewritten"
 
 permissions:
   contents: read

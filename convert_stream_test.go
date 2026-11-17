@@ -419,8 +419,6 @@ func TestChatToResponsesReasoningIndexStable(t *testing.T) {
 	}
 }
 
-
-
 // messages 上游的多个并行 tool_use 块必须各自独立累积参数。
 //
 // 2026-11-16 实测回归：参数曾用单个 strings.Builder + 单个 itemID 保存，两个
@@ -502,7 +500,6 @@ func TestMessagesToResponsesSingleToolComplete(t *testing.T) {
 	}
 }
 
-
 // 上游不发 arguments（无参工具）时，function_call.arguments 必须给 "{}"。
 // 空串会让部分客户端 JSON 解析失败。
 func TestChatToResponsesEmptyArgumentsBecomeObject(t *testing.T) {
@@ -529,10 +526,10 @@ func TestChatToResponsesEmptyArgumentsBecomeObject(t *testing.T) {
 // 否则客户端在流式过程中看不到这个工具，只能从最终 output 里发现，已错过调用时机。
 func TestChatToResponsesMissingNameOrIDStillEmits(t *testing.T) {
 	cases := []struct {
-		name      string
-		up        string
-		wantName  string
-		wantCall  string
+		name     string
+		up       string
+		wantName string
+		wantCall string
 	}{
 		{
 			name:     "缺 name",
@@ -565,4 +562,3 @@ func TestChatToResponsesMissingNameOrIDStillEmits(t *testing.T) {
 		}
 	}
 }
-

@@ -53,7 +53,7 @@ func TestStreamRenameSplitName(t *testing.T) {
 		chatDeltaFrame(t, map[string]any{}) +
 		"data: [DONE]\n\n"
 	out := readRenamed(t, input, FmtChat, renames)
-	if strings.Contains(out, "clint_") {
+	if strings.Contains(out, ClientToolPrefix()) {
 		t.Fatalf("wire 名泄漏: %s", out)
 	}
 	if !strings.Contains(out, `"name":"read"`) {
@@ -74,7 +74,7 @@ func TestStreamRenameHoldsArgumentsUntilNameCompletes(t *testing.T) {
 	out := readRenamed(t, input, FmtChat, renames)
 	t.Logf("input=%q", input)
 	t.Logf("out=%q", out)
-	if strings.Contains(out, "clint_") {
+	if strings.Contains(out, ClientToolPrefix()) {
 		t.Fatalf("wire 名泄漏: %s", out)
 	}
 	if !strings.Contains(out, `"name":"read"`) {
@@ -140,26 +140,26 @@ func TestStreamRenameConcurrentDifferentMaps(t *testing.T) {
 func TestResolveFuzzyTypo(t *testing.T) {
 	wire := ClientToolWireName("read", nil)
 	renames := testRenames("read", wire)
-	typo := "clint_f" + strings.TrimPrefix(wire, "clint_")
+	typo := ClientToolPrefix() + "f" + strings.TrimPrefix(wire, ClientToolPrefix())
 	client, ok := renames.ResolveFuzzy(typo)
 	if !ok || client != "read" {
 		t.Fatalf("编辑距离 1 未修复: %q %v", client, ok)
 	}
-	if _, ok := renames.ResolveFuzzy("clint_deadbeef0000"); ok {
-		t.Fatal("不相关的 clint_ 名字不应被模糊匹配")
+	if _, ok := renames.ResolveFuzzy(ClientToolPrefix() + "deadbeef0000"); ok {
+		t.Fatal("不相关前缀名字不应被模糊匹配")
 	}
 	if _, ok := renames.ResolveFuzzy("unknown_plain"); ok {
-		t.Fatal("非 clint_ 明文不应被模糊匹配")
+		t.Fatal("非前缀明文不应被模糊匹配")
 	}
 }
 
 func TestRenameResponseToolFuzzy(t *testing.T) {
 	wire := ClientToolWireName("read", nil)
 	renames := testRenames("read", wire)
-	typo := "clint_f" + strings.TrimPrefix(wire, "clint_")
+	typo := ClientToolPrefix() + "f" + strings.TrimPrefix(wire, ClientToolPrefix())
 	line := []byte(`{"name":"` + typo + `","arguments":"{}"}`)
 	got := string(RenameResponseTool(line, renames))
-	if !strings.Contains(got, `"name":"read"`) || strings.Contains(got, "clint_") {
+	if !strings.Contains(got, `"name":"read"`) || strings.Contains(got, ClientToolPrefix()) {
 		t.Fatalf("响应模糊还原失败: %s", got)
 	}
 }
@@ -167,11 +167,11 @@ func TestRenameResponseToolFuzzy(t *testing.T) {
 func TestStreamRenameFuzzy(t *testing.T) {
 	wire := ClientToolWireName("read", nil)
 	renames := testRenames("read", wire)
-	typo := "clint_f" + strings.TrimPrefix(wire, "clint_")
+	typo := ClientToolPrefix() + "f" + strings.TrimPrefix(wire, ClientToolPrefix())
 	input := toolCallDelta(t, map[string]any{"name": typo, "arguments": `{}`}) +
 		"data: [DONE]\n\n"
 	out := readRenamed(t, input, FmtChat, renames)
-	if !strings.Contains(out, `"name":"read"`) || strings.Contains(out, "clint_") {
+	if !strings.Contains(out, `"name":"read"`) || strings.Contains(out, ClientToolPrefix()) {
 		t.Fatalf("流式模糊还原失败: %s", out)
 	}
 }
@@ -182,7 +182,7 @@ func TestStreamRenameResponsesExact(t *testing.T) {
 	frame, _ := json.Marshal(map[string]any{"name": wire})
 	input := fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", frame)
 	out := readRenamed(t, input, FmtResponses, renames)
-	if !strings.Contains(out, `"name":"read"`) || strings.Contains(out, "clint_") {
+	if !strings.Contains(out, `"name":"read"`) || strings.Contains(out, ClientToolPrefix()) {
 		t.Fatalf("Responses 精确还原失败: %s", out)
 	}
 }

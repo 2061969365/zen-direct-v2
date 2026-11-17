@@ -5,7 +5,8 @@
 // 与这些 preset 都不同。第二轮按抓到的字节手工拼 spec（bun-h1 / bun-h2）。
 //
 // 用法：
-//   utls_probe <official_system_prompt.txt> [variant]
+//
+//	utls_probe <official_system_prompt.txt> [variant]
 //
 // 变体：bun-h2 / bun-h1 / chrome-h1 / chrome-h2 / firefox-h1 / safari-h1
 package main

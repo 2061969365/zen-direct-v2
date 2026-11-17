@@ -125,7 +125,7 @@ func TestAliasEndToEnd(t *testing.T) {
 	// 客户端工具（myedit，非官方名）应改名成 clint_<digest>，官方集同时在场。
 	var editWire string
 	for n := range names {
-		if strings.HasPrefix(n, ClientToolPrefix) {
+		if strings.HasPrefix(n, ClientToolPrefix()) {
 			editWire = n
 		}
 	}

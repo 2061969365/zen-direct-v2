@@ -415,9 +415,6 @@ func TestCrossPathMessagesToChatParallelTools(t *testing.T) {
 	assertToolCallInvariants(t, "messages→chat", facts, []string{"pwsh", "read"})
 }
 
-
-
-
 // 上游不发 index、或多个工具共用同一个 index 时，不能互相覆盖。
 //
 // 2026-11-16 实测回归：idx 直接取 int(toFloat(tm["index"]))，缺 index 时得到 0，

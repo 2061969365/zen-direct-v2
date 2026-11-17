@@ -235,7 +235,31 @@ func officialToolset(protocol Format) []any {
 	return tools
 }
 
-const ClientToolPrefix = "clint_"
+// ClientToolPrefix 是客户端工具的线上名前缀。
+//
+// 上游已学会拒绝字面量 clint_（大小写不敏感）——那是旧版网关的标记，
+// opencode2api #182 实测确认。mcp_ 前缀是官方客户端 MCP 工具
+// （mcp__<server>__<tool>）的合法形态，拒绝它会拒绝合法 MCP 流量，
+// 所以上游放行。可用 ZEN_TOOL_PREFIX 覆盖；当 429 只出现在带工具的
+// 请求时轮换此值（猫鼠游戏，参考 opencode2api tools.go 同款注释）。
+var clientToolPrefixOnce = sync.OnceValue(func() string {
+	if v := strings.TrimSpace(os.Getenv("ZEN_TOOL_PREFIX")); v != "" {
+		cleaned := strings.Map(func(r rune) rune {
+			if r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' {
+				return r
+			}
+			return -1
+		}, v)
+		if cleaned != "" {
+			return cleaned
+		}
+	}
+	return "mcp_"
+})
+
+// ClientToolPrefix 返回当前生效的客户端工具线上名前缀。
+func ClientToolPrefix() string { return clientToolPrefixOnce() }
+
 const clientToolDigestLength = 12
 const toolWireNameLimit = 64
 
@@ -450,7 +474,7 @@ func (r *ToolRenames) Resolve(wire string) (string, bool) {
 		return client, client != wire
 	}
 	client := wire
-	if rest, ok := strings.CutPrefix(wire, ClientToolPrefix); ok && rest != "" {
+	if rest, ok := strings.CutPrefix(wire, ClientToolPrefix()); ok && rest != "" {
 		client = rest
 	}
 	if _, declared := r.toWire[client]; declared {
@@ -488,7 +512,7 @@ func (r *ToolRenames) ResolveFuzzy(wire string) (string, bool) {
 		return client, true
 	}
 	candidate := wire
-	if rest, ok := strings.CutPrefix(wire, ClientToolPrefix); ok && rest != "" {
+	if rest, ok := strings.CutPrefix(wire, ClientToolPrefix()); ok && rest != "" {
 		candidate = rest
 	}
 	if _, declared := r.toWire[candidate]; declared {
@@ -500,7 +524,7 @@ func (r *ToolRenames) ResolveFuzzy(wire string) (string, bool) {
 	if match, ok := r.byShape[foldToolName(candidate)]; ok && match != "" {
 		return match, true
 	}
-	if !strings.HasPrefix(wire, ClientToolPrefix) {
+	if !strings.HasPrefix(wire, ClientToolPrefix()) {
 		return wire, false
 	}
 	match := ""
@@ -563,11 +587,11 @@ func ClientToolWireName(name string, used map[string]bool) string {
 	}
 	digest := sha256.Sum256([]byte(name))
 	clean := hex.EncodeToString(digest[:])[:clientToolDigestLength]
-	max := toolWireNameLimit - len(ClientToolPrefix)
+	max := toolWireNameLimit - len(ClientToolPrefix())
 	if len(clean) > max {
 		clean = clean[:max]
 	}
-	base := ClientToolPrefix + clean
+	base := ClientToolPrefix() + clean
 	if !used[base] {
 		used[base] = true
 		return base
@@ -1007,14 +1031,14 @@ func RenameResponseTool(line []byte, renames *ToolRenames) []byte {
 	if renames == nil || renames.Empty() || len(line) == 0 {
 		return line
 	}
-	if !bytes.Contains(line, []byte(ClientToolPrefix)) {
+	if !bytes.Contains(line, []byte(ClientToolPrefix())) {
 		return line
 	}
 	for client, wire := range renames.toWire {
 		line = bytes.ReplaceAll(line, []byte(`"name":"`+wire+`"`), []byte(`"name":"`+client+`"`))
 		line = bytes.ReplaceAll(line, []byte(`"name": "`+wire+`"`), []byte(`"name": "`+client+`"`))
 	}
-	if !bytes.Contains(line, []byte(ClientToolPrefix)) {
+	if !bytes.Contains(line, []byte(ClientToolPrefix())) {
 		return line
 	}
 	return nameFieldPattern.ReplaceAllFunc(line, func(match []byte) []byte {
@@ -1023,7 +1047,7 @@ func RenameResponseTool(line []byte, renames *ToolRenames) []byte {
 			return match
 		}
 		wire := string(sub[1])
-		if !strings.HasPrefix(wire, ClientToolPrefix) {
+		if !strings.HasPrefix(wire, ClientToolPrefix()) {
 			return match
 		}
 		client, ok := renames.ResolveFuzzy(wire)

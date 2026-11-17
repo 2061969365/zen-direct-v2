@@ -9,7 +9,7 @@ func TestToolWireNameIsOpaque(t *testing.T) {
 	used := map[string]bool{}
 	for _, client := range []string{"ScheduleWakeup", "ReportFindings", "Read", "Bash", "subagent_fork", "ops_bash"} {
 		wireName := ClientToolWireName(client, used)
-		if !strings.HasPrefix(wireName, ClientToolPrefix) {
+		if !strings.HasPrefix(wireName, ClientToolPrefix()) {
 			t.Errorf("wire name %q does not carry the client prefix", wireName)
 		}
 		if len(wireName) > toolWireNameLimit {

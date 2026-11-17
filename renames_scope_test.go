@@ -7,16 +7,21 @@ import (
 	"testing"
 )
 
+// wireA/wireB 用动态前缀构造：ClientToolPrefix 可轮换（clint_→mcp_→…），
+// 测试不能钉死任何具体前缀。
+func wireA() string { return ClientToolPrefix() + "3316348dbadf" }
+func wireB() string { return ClientToolPrefix() + "278a1a850e5c" }
+
 // 响应还原必须使用“本请求”的 renames；旧实现放在全局，并发请求会互相覆盖，
-// 把 wire 名漏给客户端（unknown tool clint_xxx）。
+// 把 wire 名漏给客户端（unknown tool xxx）。
 func TestRestoreAliasNamesUsesRequestMap(t *testing.T) {
 	a := NewToolRenames()
-	a.Add("read", "clint_3316348dbadf")
+	a.Add("read", wireA())
 	b := NewToolRenames()
-	b.Add("pwsh", "clint_278a1a850e5c")
+	b.Add("pwsh", wireB())
 
-	lineA := []byte(`{"tool_calls":[{"function":{"name":"clint_3316348dbadf"}}]}`)
-	lineB := []byte(`{"tool_calls":[{"function":{"name":"clint_278a1a850e5c"}}]}`)
+	lineA := []byte(`{"tool_calls":[{"function":{"name":"` + wireA() + `"}}]}`)
+	lineB := []byte(`{"tool_calls":[{"function":{"name":"` + wireB() + `"}}]}`)
 
 	if got := string(restoreAliasNames(lineA, a)); !strings.Contains(got, `"name":"read"`) {
 		t.Fatalf("A map did not restore read: %s", got)
@@ -31,23 +36,23 @@ func TestRestoreAliasNamesUsesRequestMap(t *testing.T) {
 
 func TestConcurrentRestoreKeepsOwnMapping(t *testing.T) {
 	a := NewToolRenames()
-	a.Add("read", "clint_3316348dbadf")
+	a.Add("read", wireA())
 	b := NewToolRenames()
-	b.Add("pwsh", "clint_278a1a850e5c")
+	b.Add("pwsh", wireB())
 
 	var wg sync.WaitGroup
 	for i := 0; i < 200; i++ {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			got := string(restoreAliasNames([]byte(`"name":"clint_3316348dbadf"`), a))
+			got := string(restoreAliasNames([]byte(`"name":"`+wireA()+`"`), a))
 			if !strings.Contains(got, `"read"`) {
 				t.Errorf("A cross-talk: %s", got)
 			}
 		}()
 		go func() {
 			defer wg.Done()
-			got := string(restoreAliasNames([]byte(`"name":"clint_278a1a850e5c"`), b))
+			got := string(restoreAliasNames([]byte(`"name":"`+wireB()+`"`), b))
 			if !strings.Contains(got, `"pwsh"`) {
 				t.Errorf("B cross-talk: %s", got)
 			}
@@ -58,11 +63,11 @@ func TestConcurrentRestoreKeepsOwnMapping(t *testing.T) {
 
 func TestPipeSSERestoresWireName(t *testing.T) {
 	r := NewToolRenames()
-	r.Add("pwsh", "clint_278a1a850e5c")
+	r.Add("pwsh", wireB())
 	rec := httptest.NewRecorder()
-	pipeSSE(rec, strings.NewReader("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"clint_278a1a850e5c\",\"arguments\":\"\"}}]}}]}\n\n"), "req", "m", 0, r)
+	pipeSSE(rec, strings.NewReader("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\""+wireB()+"\",\"arguments\":\"\"}}]}}]}\n\n"), "req", "m", 0, r)
 	body := rec.Body.String()
-	if strings.Contains(body, "clint_278a1a850e5c") || !strings.Contains(body, `"name":"pwsh"`) {
+	if strings.Contains(body, wireB()) || !strings.Contains(body, `"name":"pwsh"`) {
 		t.Fatalf("pipeSSE did not restore: %s", body)
 	}
 }

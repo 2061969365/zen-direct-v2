@@ -16,9 +16,20 @@ on:
         required: false
         default: "deepseek-v4.1-flash-free"
       scenario:
-        description: "只关注某个 scenario 的结论（all = 全部）"
+        description: "只跑某个 scenario（all = 全部四个）"
         required: false
+        type: choice
+        options:
+          - all
+          - plain
+          - single-tool
+          - multi-tool
+          - many-tools
         default: "all"
+      asset_ref:
+        description: "要注入的资产分支（留空 = 资产仓库 main；填 asset-drift/latest = 验证漂移 PR 的内容）"
+        required: false
+        default: ""
       egress:
         description: "出口：direct = runner 直连；warp = Cloudflare WARP；vpngate = VPN Gate 节点 + sing-box"
         required: false
@@ -43,6 +54,8 @@ jobs:
       MODEL: ${{ github.event.inputs.model || 'deepseek-v4.1-flash-free' }}
       SCENARIO: ${{ github.event.inputs.scenario || 'all' }}
       EGRESS: ${{ github.event.inputs.egress || 'direct' }}
+      # 留空 = 资产仓库 main；填 asset-drift/latest 可验证漂移 PR 里那份资产
+      ASSET_REF: ${{ github.event.inputs.asset_ref || '' }}
       WORK: ${{ github.workspace }}/_e2e
     steps:
       - name: Checkout
@@ -75,16 +88,16 @@ jobs:
         run: |
           set -euo pipefail
           trap 'echo "::error::WARP 安装/连接失败"; sudo warp-cli --accept-tos status || true; sudo systemctl status warp-svc --no-pager || true; sudo journalctl -u warp-svc -n 50 --no-pager || true' ERR
-          echo "下载 cloudflare-warp 独立包..."
-          curl -fsSL --retry 3 --retry-delay 1 \
-            -o /tmp/cloudflare-warp.deb \
-            https://pkg.cloudflareclient.com/pool/noble/main/c/cloudflare-warp/cloudflare-warp_2026.8.2115.0_amd64.deb
+          echo "配置 Cloudflare 官方 apt 源（不写死版本号，避免 deb 过期 404）..."
+          sudo mkdir -p /usr/share/keyrings
+          curl -fsSL --retry 3 --retry-delay 1 https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
           sudo apt-get -o Acquire::Retries=3 update -y
-          if ! sudo dpkg -i /tmp/cloudflare-warp.deb; then
-            echo "cloudflare-warp 依赖未满足，安装缺失依赖..."
-            sudo apt-get -o Acquire::Retries=3 install -f -y --fix-missing
-            sudo dpkg -i /tmp/cloudflare-warp.deb
-          fi
+          # 让 apt 自己解析最新版本；历史上写死 cloudflare-warp_2026.8.2115.0_amd64.deb，
+          # 版本下架就会 404（和 sing-box 1.10.7 那次同类问题）。
+          sudo apt-get -o Acquire::Retries=3 install -y cloudflare-warp
           sudo systemctl enable warp-svc >/dev/null 2>&1 || true
           sudo systemctl start warp-svc >/dev/null 2>&1 || sudo service warp-svc start >/dev/null 2>&1 || true
           ready=0
@@ -155,15 +168,25 @@ jobs:
           : > "$WORK/sync_assets.log"
           : > "$WORK/sync_check.log"
 
+          # ASSET_REF 非空时注入指定分支（用于验证 asset-drift/latest 这个漂移 PR 的内容）
+          sync_args=()
+          if [ -n "${ASSET_REF:-}" ]; then
+            url="https://raw.githubusercontent.com/2061969365/zen-assets-runner/${ASSET_REF}/assets/official_tools.json"
+            sync_args=(--url "$url")
+            echo "注入来源：$url"
+          else
+            echo "注入来源：资产仓库 main（默认）"
+          fi
+
           set +e
-          bash scripts/sync_assets.sh --check > "$WORK/sync_check.log" 2>&1
+          bash scripts/sync_assets.sh --check "${sync_args[@]}" > "$WORK/sync_check.log" 2>&1
           check_rc=$?
           set -e
           echo "sync_assets.sh --check rc=$check_rc（0=一致 1=不一致 2=校验失败 3=网络失败）"
           tail -20 "$WORK/sync_check.log" || true
 
           set +e
-          bash scripts/sync_assets.sh > "$WORK/sync_assets.log" 2>&1
+          bash scripts/sync_assets.sh "${sync_args[@]}" > "$WORK/sync_assets.log" 2>&1
           rc=$?
           set -e
           cat "$WORK/sync_assets.log" || true
@@ -438,11 +461,17 @@ jobs:
           set -uo pipefail
           mkdir -p "$WORK"
           set +e
+          # scenario 选了具体值时只跑那一条（否则四个全跑）
+          only_args=()
+          if [ -n "${SCENARIO:-}" ] && [ "${SCENARIO}" != "all" ]; then
+            only_args=(--only "$SCENARIO")
+            echo "只跑 scenario: $SCENARIO"
+          fi
           python3 tools/asset_probe.py \
             --base http://127.0.0.1:8081 \
             --model "$MODEL" \
             --out "$WORK/verdict.json" \
-            --timeout 120 2>&1 | tee "$WORK/probe.log"
+            --timeout 120 "${only_args[@]}" 2>&1 | tee "$WORK/probe.log"
           rc=${PIPESTATUS[0]}
           set -e
           echo "PROBE_RC=$rc" >> "$GITHUB_ENV"

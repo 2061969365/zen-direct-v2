@@ -78,7 +78,11 @@ func TestShapeDecisionEmptyStateIsSafe(t *testing.T) {
 
 // 12 个官方名是官方 CLI 现在的实际形态（patch 已经不在），必须被记为
 // rename_complete 且出站 26 个。
+// TestShapeDecisionOfficialSubsetTwelve 锁的是 exact 档的契约：
+// 集合不齐时必须走改名+补全，出站 12 -> 26。默认档改成 subset 之后，
+// 这条行为仍然要能通过 ZEN_SHAPE_MODE=exact 复现（回退路径不能烂）。
 func TestShapeDecisionOfficialSubsetTwelve(t *testing.T) {
+	t.Setenv("ZEN_SHAPE_MODE", "exact")
 	resetShapeState(t)
 	clientNames := v2OfficialToolOrder[:12]
 	payload := shapeTestPayload(clientNames)
@@ -244,7 +248,10 @@ func TestShapeDecisionMissingCapFallsBack(t *testing.T) {
 // 每条读到的快照必须自洽（mode 与 client/outbound 数量互相匹配），计次总和
 // 必须等于落盘次数。真机上有编译器时再跑一次
 // `CGO_ENABLED=1 go test -race ./...` 收口。
+// TestShapeDecisionConcurrentRecording 只验并发安全，不验某一档的判定结果。
+// 显式钉成 exact，让两条分支的断言前提保持稳定（默认档变化不该让这条测试变义）。
 func TestShapeDecisionConcurrentRecording(t *testing.T) {
+	t.Setenv("ZEN_SHAPE_MODE", "exact")
 	resetShapeState(t)
 	var wg sync.WaitGroup
 	const workers = 64

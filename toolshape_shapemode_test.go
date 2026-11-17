@@ -152,14 +152,46 @@ func TestShapeModeExactUnchanged(t *testing.T) {
 	}
 }
 
-func TestShapeModeDefaultsToExact(t *testing.T) {
+func TestShapeModeDefaultsToSubset(t *testing.T) {
 	t.Setenv("ZEN_SHAPE_MODE", "")
-	if got := shapeMode(); got != "exact" {
-		t.Errorf("未设置时应当回落到 exact，得到 %q", got)
+	if got := shapeMode(); got != "subset" {
+		t.Errorf("未设置时默认应当是 subset，得到 %q", got)
 	}
 	t.Setenv("ZEN_SHAPE_MODE", "SUBSET")
 	if got := shapeMode(); got != "subset" {
 		t.Errorf("应当大小写不敏感，得到 %q", got)
+	}
+	// 回退路径必须仍然可用
+	t.Setenv("ZEN_SHAPE_MODE", "exact")
+	if got := shapeMode(); got != "exact" {
+		t.Errorf("ZEN_SHAPE_MODE=exact 应当生效，得到 %q", got)
+	}
+}
+
+// 默认档下，官方名子集必须整份透传（12 进 12 出），这是本次优化的核心收益。
+func TestDefaultModePassesOfficialSubsetThrough(t *testing.T) {
+	t.Setenv("ZEN_SHAPE_MODE", "")
+	names := officialNamesWithout("patch", "experimental_image_generate")
+	var sb strings.Builder
+	sb.WriteString(`{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}],"tools":[`)
+	for i, name := range names {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(`{"type":"function","function":{"name":"` + name + `","description":"Tool ` + name + `","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}`)
+	}
+	sb.WriteString(`]}`)
+
+	in := mustJSON(t, sb.String())
+	up, renames, err := buildUpstream(FmtChat, FmtChat, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renames.Count() != 0 {
+		t.Fatalf("默认档下不该改名，实际改了 %d 个", renames.Count())
+	}
+	if got := len(asArr(up["tools"])); got != len(names) {
+		t.Fatalf("默认档下出站应当是 %d 个（不追加官方集），实际 %d", len(names), got)
 	}
 }
 

@@ -1540,23 +1540,32 @@ func allOfficialToolNames(ranked []map[string]any, protocol Format) bool {
 // "自称官方、schema 却不是官方原文"而 429（2026-11-17 多出口实测）。
 // shapeMode 返回透传判据的档位，由 ZEN_SHAPE_MODE 控制。
 //
-//	exact   （默认）客户端的工具名集合必须与官方集合完全相等
-//	subset  客户端的工具名只要都属于官方集合就算过（不管缺哪个）
+//	subset  （默认）客户端的工具名只要都属于官方集合就算过（不管缺哪个）
+//	exact   集合必须与官方集合完全相等（旧行为，可用环境变量回退）
 //	content subset 之上再要求每个工具的定义与官方逐字一致
 //
-// 为什么要有这两档：官方 CLI 现在发的集合不稳定（12 或 13，差在
+// 为什么默认改成 subset：官方 CLI 现在发的集合不稳定（12 或 13，差在
 // experimental_image_generate），exact 判据永远为假，每个请求都走
 // 「改名 + 补 14 个官方桩」，出站从 12 涨到 26 —— 同一批能力出现两次，
-// 模型的选择面凭空翻倍。subset/content 是两条候选出路，用 ZEN_SHAPE_MODE
-// 切换后拿真实请求比对上游接受度，验完再决定默认值。
+// 模型的选择面凭空翻倍。
+//
+// 真实上游验收（shape-acceptance run 44130648925，vpngate 单节点）：
+//
+//	subset × {12 原始定义, 13, 14, 12 改写, 12 参数级 DSH 文本, 12 工具级被判原句}
+//	→ 6/6 全 200，quota=0
+//
+// 其中「工具级被判原句」这一发在**没有脱敏**时是 429（run 44129660858），
+// 所以透传分支必须配合 sanitizeRankedTools 一起用，不能只放宽判据。
+//
+// 回退方式：ZEN_SHAPE_MODE=exact 即恢复旧行为，代码路径未删。
 func shapeMode() string {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("ZEN_SHAPE_MODE"))) {
-	case "subset":
-		return "subset"
+	case "exact":
+		return "exact"
 	case "content":
 		return "content"
 	}
-	return "exact"
+	return "subset"
 }
 
 // officialSubset 报告客户端声明的工具名是否**全部**落在官方集合内。

@@ -85,7 +85,11 @@ func reverseStrings(in []string) []string {
 	return out
 }
 
+// TestOfficialSubsetFallsThroughToRename 锁 exact 档的行为：官方名子集必须
+// 改名+补全（2026-11-17 实测「官方名 + 非官方文本」整份透传会 429）。
+// 默认档改成 subset 之后这条仍要能通过 ZEN_SHAPE_MODE=exact 复现。
 func TestOfficialSubsetFallsThroughToRename(t *testing.T) {
+	t.Setenv("ZEN_SHAPE_MODE", "exact")
 	for _, subset := range [][]string{{"read"}, {"read", "edit"}, {"read", "edit", "write", "patch"}} {
 		payload := officialSubsetPayload(t, subset)
 		_, shaped := renameAndCompleteTools(payload, FmtChat)

@@ -466,11 +466,14 @@ def judgement(records):
             lines.append("subset/s12_banned 未测（额度）")
             continue
         http = row.get("http")
+        reason = str(row.get("gateway_reason") or "")
+        sanitized = "sanitized" in reason
         if row.get("quota_suspected") or http == 429:
-            lines.append("subset/s12_banned 被拒（http=%s）→ 只看名字不够，必须加文本校验"
-                         % http)
+            lines.append("subset/s12_banned 被拒（http=%s）→ 只看名字不够，透传前必须脱敏" % http)
+        elif http == 200 and sanitized:
+            lines.append("subset/s12_banned 200 且网关记录了脱敏（%s）→ 指纹已被洗掉" % reason[:80])
         elif http == 200:
-            lines.append("subset/s12_banned 也 200 → 描述指纹今天复现不出来，subset 可单独用")
+            lines.append("subset/s12_banned 200 但没有脱敏记录 → 指纹今天可能真的不触发，需复核")
         else:
             lines.append("subset/s12_banned http=%s" % http)
 
@@ -539,14 +542,19 @@ def health(opener, port, timeout=HEALTH_TIMEOUT):
         return False, None
 
 
-def health_branch(opener, port):
-    """取 tool_shape.last.mode（没发生过整形时返回 None）。"""
+def health_last(opener, port):
+    """取 tool_shape.last（整块；没发生过整形时返回空 dict）。"""
     ok, payload = health(opener, port)
     if not ok or not isinstance(payload, dict):
-        return None
+        return {}
     shape = payload.get("tool_shape") or {}
     last = shape.get("last") or {}
-    return last.get("mode") or None
+    return last if isinstance(last, dict) else {}
+
+
+def health_branch(opener, port):
+    """取 tool_shape.last.mode（没发生过整形时返回 None）。"""
+    return health_last(opener, port).get("mode") or None
 
 
 def wait_health(opener, port, process, timeout, what):
@@ -719,10 +727,14 @@ def probe_mode(args, binary, mode, scenarios, pristine_defs, rewritten_defs, off
             status, text = post_chat(opener, port, request_body(tools), args.http_timeout)
             latency = int((time.time() - started) * 1000)
             after = health_branch(opener, port)
+            after_last = health_last(opener, port)
 
             record["gateway_branch_before"] = before
             record["gateway_branch_after"] = after
             record["gateway_branch"] = after or before
+            # reason 里带 "sanitized N tool description(s)" 时，说明网关在透传前
+            # 洗掉了指纹短语——判词要能把「洗过」和「本来就没有」分开。
+            record["gateway_reason"] = after_last.get("reason") or ""
             record["http"] = status
             record["body_head"] = body_head(text)
             record["latency_ms"] = latency

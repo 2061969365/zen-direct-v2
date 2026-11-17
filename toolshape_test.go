@@ -55,7 +55,12 @@ func TestToolRenamesRestoreOpaqueNames(t *testing.T) {
 // 2026-11-17 修正：透传条件从 allOfficialToolNames（官方名子集也算真）收紧为
 // completeOfficialToolset。子集透传实测 0/8 全 429，见
 // toolshape_official_subset_test.go 与 docs/head2head-zen-vs-opencode2api.md。
+//
+// 2026-11-18 补充：默认档已改成 subset（见 shapeMode 注释里的 6/6 验收），
+// 非 exact 档会在透传前洗掉工具级指纹短语。这条测试锁的是 **exact 档**的
+// 「逐字透传」契约，所以显式钉住档位。
 func TestOfficialToolsetPassesThroughVerbatim(t *testing.T) {
+	t.Setenv("ZEN_SHAPE_MODE", "exact")
 	names := v2OfficialToolOrder
 	var sb strings.Builder
 	sb.WriteString(`{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}],"tools":[`)

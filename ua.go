@@ -25,9 +25,13 @@ import (
 )
 
 const (
-	// uaDefaultVersion 是实测能过门禁的版本。不要随便降：2.0.29 已被拒，2.1.1 在
-	// npm 发布 2.2.0（2026-10-27 08:59Z）之后也被拒。宁可高一点。
-	uaDefaultVersion = "2.2.0"
+	// uaDefaultVersion 是实测能过门禁的版本，也是 npm 刷新失败时的兜底。不要随便降：
+	// 2.0.29 已被拒，2.1.1 在 npm 发布 2.2.0（2026-10-27 08:59Z）之后也被拒。
+	// 2026-11-17 02:17~02:28Z 之间门禁又抬了一档：opencode2api v1.4.8 硬编码
+	// 2.1.1，同一二进制只把版本号改成 2.3.0 就 8/8 全 200、原版 8/8 全 429
+	// （24 个 GitHub Actions 出口，含首槽位对照）。所以兜底跟着抬到 2.3.0，
+	// 宁可高一点——高了不会被拒，低了直接全灭。
+	uaDefaultVersion = "2.3.0"
 	uaRefreshEvery   = 6 * time.Hour
 	uaRefreshTimeout = 8 * time.Second
 )

@@ -17,9 +17,15 @@ func TestDefaultUAVersionPassesGate(t *testing.T) {
 }
 
 // 起手必须同步拿到版本：云端第一条请求只给几秒，异步刷新来不及。
+// 注意 prime 只升不降——注册表给的版本比兜底旧时必须保持兜底，
+// 所以这里给一个明确高于 uaDefaultVersion 的版本。
 func TestPrimeUAVersionUsesRegistry(t *testing.T) {
+	const published = "2.4.0"
+	if !newerSameMajor(uaDefaultVersion, published) {
+		t.Fatalf("测试前提失效：%q 不高于兜底 %q", published, uaDefaultVersion)
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"version":"2.2.1"}`)
+		_, _ = io.WriteString(w, `{"version":"`+published+`"}`)
 	}))
 	defer srv.Close()
 
@@ -28,13 +34,30 @@ func TestPrimeUAVersionUsesRegistry(t *testing.T) {
 	defer func() { uaRefreshURL = oldURL; zenUAVersion.Store(oldVer) }()
 
 	if !primeUAVersion(2 * time.Second) {
-		t.Fatal("primeUAVersion 应同步升级到 2.2.1")
+		t.Fatal("primeUAVersion 应同步升级到 " + published)
 	}
-	if got := uaVersion(); got != "2.2.1" {
-		t.Fatalf("uaVersion = %q, want 2.2.1", got)
+	if got := uaVersion(); got != published {
+		t.Fatalf("uaVersion = %q, want %q", got, published)
 	}
-	if got := uaString(); got != "opencode/latest/2.2.1/cli" {
+	if got := uaString(); got != "opencode/latest/"+published+"/cli" {
 		t.Fatalf("uaString = %q", got)
+	}
+}
+
+// 注册表版本比兜底旧时不能降级：降回去等于主动踩已经被拒的旧版本。
+func TestPrimeUAVersionNeverDowngrades(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"version":"2.1.1"}`)
+	}))
+	defer srv.Close()
+
+	oldURL, oldVer := uaRefreshURL, uaVersion()
+	uaRefreshURL = srv.URL
+	defer func() { uaRefreshURL = oldURL; zenUAVersion.Store(oldVer) }()
+
+	primeUAVersion(2 * time.Second)
+	if got := uaVersion(); got != uaDefaultVersion {
+		t.Fatalf("uaVersion = %q，旧版本不该覆盖兜底 %q", got, uaDefaultVersion)
 	}
 }
 

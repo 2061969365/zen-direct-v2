@@ -37,40 +37,57 @@ func TestToolRenamesRestoreOpaqueNames(t *testing.T) {
 }
 
 // TestOfficialToolsetPassesThroughVerbatim 钉住 2026-11-16 抓包得出的结论：
-// 客户端（官方 CLI）已经自带官方工具集时，出站必须与原请求逐项一致——
+// 客户端（官方 CLI）已经自带**完整**官方工具集时，出站必须与原请求逐项一致——
 // 不改名、不追加、不脱敏描述。
 //
 // 反例代价：改名+追加会让出站变成 26 个工具，同一份 body 从 200 掉到 429
 // FreeUsageLimitError。所以这条一旦回归，网关会整体不可用。
+//
+// 2026-11-17 修正：透传条件从 allOfficialToolNames（官方名子集也算真）收紧为
+// completeOfficialToolset。子集透传实测 0/8 全 429，见
+// toolshape_official_subset_test.go 与 docs/head2head-zen-vs-opencode2api.md。
 func TestOfficialToolsetPassesThroughVerbatim(t *testing.T) {
-	in := mustJSON(t, `{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}],
-		"tools":[
-			{"type":"function","function":{"name":"read","description":"Read a UTF-8 text file and return line-numbered content.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}},
-			{"type":"function","function":{"name":"edit","description":"Edit it.","parameters":{"type":"object"}}},
-			{"type":"function","function":{"name":"experimental_image_generate","description":"Gen.","parameters":{"type":"object"}}}
-		]}`)
+	names := v2OfficialToolOrder
+	var sb strings.Builder
+	sb.WriteString(`{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}],"tools":[`)
+	for i, name := range names {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		desc := "Tool " + name + "."
+		if name == "read" {
+			// 官方原文里可能含“封禁短语”，但那是官方口径，透传时不能改。
+			desc = "Read a UTF-8 text file and return line-numbered content."
+		}
+		sb.WriteString(`{"type":"function","function":{"name":"` + name + `","description":"` + desc + `","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}`)
+	}
+	sb.WriteString(`]}`)
+	in := mustJSON(t, sb.String())
 	up, renames, err := buildUpstream(FmtChat, FmtChat, in)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if renames.Count() != 0 {
-		t.Fatalf("官方工具集不应改名，实际改了 %d 个: %v", renames.Count(), renames.toWire)
+		t.Fatalf("完整官方工具集不应改名，实际改了 %d 个: %v", renames.Count(), renames.toWire)
 	}
 	entries := asArr(up["tools"])
-	if len(entries) != 3 {
-		t.Fatalf("官方工具集不应追加，出站 %d 个（应为 3）", len(entries))
+	if len(entries) != len(names) {
+		t.Fatalf("完整官方工具集不应追加，出站 %d 个（应为 %d）", len(entries), len(names))
 	}
-	want := []string{"read", "edit", "experimental_image_generate"}
-	for i, name := range want {
+	for i, name := range names {
 		got := asStr(asMap(asMap(entries[i])["function"])["name"])
 		if got != name {
 			t.Fatalf("第 %d 个工具名被改动: got %q want %q", i, got, name)
 		}
 	}
-	// 描述也要原样保留（官方原文可能含“封禁短语”，但那是官方口径，不能改）。
-	desc := asStr(asMap(asMap(entries[0])["function"])["description"])
-	if !strings.Contains(desc, "line-numbered content") {
-		t.Fatalf("官方描述被脱敏了: %q", desc)
+	for _, raw := range entries {
+		fn := asMap(asMap(raw)["function"])
+		if asStr(fn["name"]) == "read" {
+			desc := asStr(fn["description"])
+			if !strings.Contains(desc, "line-numbered content") {
+				t.Fatalf("官方描述被脱敏了: %q", desc)
+			}
+		}
 	}
 }
 

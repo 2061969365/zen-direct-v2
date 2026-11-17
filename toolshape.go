@@ -887,7 +887,7 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	}
 	// 通道模式：把客户端工具按语义归到 12 个官方桩名，靠参数里的 _tool 选择器
 	// 区分真实工具。出站只出现官方工具名，专为"只放行官方名"的上游设计。
-	if os.Getenv("ZEN_TOOL_CHANNEL") != "" && len(ranked) > 0 && !allOfficialToolNames(ranked, protocol) {
+	if os.Getenv("ZEN_TOOL_CHANNEL") != "" && len(ranked) > 0 && !completeOfficialToolset(ranked, protocol) {
 		payload["tools"] = buildChannelTools(protocol, items)
 		// 记录本次声明的客户端工具名：响应还原时区分"模型回显通道名"
 		// （需兜底映射）与"客户端真名"（如 subagent，不能误映射）。
@@ -905,7 +905,7 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	}
 
 	official := officialToolset(protocol)
-	// 客户端已经自带官方工具集（官方 CLI / 官方 SDK 就是这种形态）时，
+	// 客户端自带**完整**官方工具集（官方 CLI / 官方 SDK 就是这种形态）时，
 	// 整份原样透传：不改名、不追加、不脱敏描述。
 	//
 	// 为什么必须这样：官方 CLI 发出的 tools 名称就是 edit/read/shell…，
@@ -913,7 +913,16 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	// clint_<digest> 再补一份官方集，出站变成 26 个工具、顺序也与原版不同，
 	// 实测同一份 body 从 200 直接掉到 429 FreeUsageLimitError；不整形则 200，
 	// 且 upBytes 与原请求字节数一致。
-	if len(ranked) > 0 && allOfficialToolNames(ranked, protocol) {
+	//
+	// 2026-11-17 GitHub Actions 多出口实测（24 IP / 48 发，见
+	// docs/head2head-zen-vs-opencode2api.md）：透传条件曾经是
+	// allOfficialToolNames，它对**官方名子集**也为真，于是只声明 read/edit
+	// 这类子集的请求被整份透传，官方名下带着 DSH 的参数级描述
+	// （"Path to edit, resolved by the filesystem backend"）出站，
+	// 上游判定“自称官方但 schema 不是官方原文”，zen 0/8 全 429，
+	// 而把同一份 body 交给改名路径的 opencode2api 8/8 全 200。
+	// 所以透传必须要求集合**完整**，子集一律走改名+补全。
+	if len(ranked) > 0 && completeOfficialToolset(ranked, protocol) {
 		return renames, false
 	}
 	for _, entry := range ranked {
@@ -1078,6 +1087,33 @@ func allOfficialToolNames(ranked []map[string]any, protocol Format) bool {
 	for _, entry := range ranked {
 		name := entryToolName(entry, protocol)
 		if name == "" || !set[name] {
+			return false
+		}
+	}
+	return true
+}
+
+// completeOfficialToolset 报告客户端 tools 是否**恰好**是完整官方集：
+// 每个名字都是官方名，且官方集里的每个名字都出现了。
+//
+// 这是"原样透传"的唯一入口条件。只看 allOfficialToolNames 是不够的——
+// 它对 {read} 这种官方名子集也为真，而子集透传会被上游当成
+// "自称官方、schema 却不是官方原文"而 429（2026-11-17 多出口实测）。
+func completeOfficialToolset(ranked []map[string]any, protocol Format) bool {
+	if len(ranked) == 0 {
+		return false
+	}
+	set := officialToolNameSet()
+	seen := make(map[string]bool, len(set))
+	for _, entry := range ranked {
+		name := entryToolName(entry, protocol)
+		if name == "" || !set[name] {
+			return false
+		}
+		seen[name] = true
+	}
+	for name := range set {
+		if !seen[name] {
 			return false
 		}
 	}

@@ -56,6 +56,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime
 import json
 import os
@@ -83,7 +84,7 @@ MODEL = "deepseek-v4.1-flash-free"
 ASSET_URL = "https://raw.githubusercontent.com/2061969365/zen-assets-runner/main/assets/official_tools.json"
 
 VALID_MODES = ("exact", "subset", "content")
-VALID_SCENARIOS = ("s12_pristine", "s13_pristine", "s14_pristine", "s12_rewritten")
+VALID_SCENARIOS = ("s12_pristine", "s13_pristine", "s14_pristine", "s12_rewritten", "s12_dsh")
 
 # 额度指纹：命中即认为「这份样本作废」，不能算成「上游拒绝了判据」。
 QUOTA_KEYS = ("freeusagelimit", "usage limit", "quota", "rate limit")
@@ -202,9 +203,35 @@ def resolve_pristine(args, workdir):
         }
 
 
+#: s12_dsh 用的参数级描述：2026-11-17 实测被判过的正是这一类文本
+#: （官方工具名 + 客户端自有 schema 文本 → 上游判「自称官方但 schema 不是原文」）。
+#: 这是 A 判据（只看名字）的反证场景：subset 会放行它，但上游应当 429。
+DSH_PARAM_DESCRIPTIONS = {
+    "path": "Path to edit, resolved by the filesystem backend",
+    "oldString": "Exact text to replace, taken from the numbered read output",
+    "newString": "Replacement text; strip the line-number prefix first",
+    "content": "Full contents to write as a utf-8 text file",
+    "pattern": "Glob pattern matched against paths exposed by the filesystem backend",
+}
+
+
+def apply_dsh_text(tools):
+    """把参数级描述换成 DSH 风格，模拟「官方名 + 自有 schema 文本」。"""
+    for entry in tools:
+        fn = entry.get("function") or {}
+        params = fn.get("parameters") or {}
+        props = params.get("properties")
+        if not isinstance(props, dict):
+            continue
+        for pname, prop in props.items():
+            if isinstance(prop, dict) and pname in DSH_PARAM_DESCRIPTIONS:
+                prop["description"] = DSH_PARAM_DESCRIPTIONS[pname]
+    return tools
+
+
 def scenario_names(scenario):
     """场景 → 工具名列表（顺序跟官方集一致）。"""
-    if scenario == "s12_pristine" or scenario == "s12_rewritten":
+    if scenario in ("s12_pristine", "s12_rewritten", "s12_dsh"):
         return list(CORE_NAMES)
     if scenario == "s13_pristine":
         return list(CORE_NAMES) + ["experimental_image_generate"]
@@ -214,14 +241,18 @@ def scenario_names(scenario):
 
 
 def definition_for(name, defs):
-    """取一份定义；缺失时用网关同款兜底形状（experimental_image_generate 就是这种）。"""
+    """取一份定义；缺失时用网关同款兜底形状（experimental_image_generate 就是这种）。
+
+    返回深拷贝：场景之间共享同一份参数子树的话，任何就地改写都会污染下一发请求
+    （也污染「网关官方定义」那份参考对象），测出来的分支就不可信了。
+    """
     found = defs.get(name)
     if found:
-        return {
+        return copy.deepcopy({
             "description": found.get("description") or "",
             "parameters": found.get("parameters") if isinstance(found.get("parameters"), dict)
             else dict(STUB_PARAMETERS),
-        }
+        })
     return {"description": STUB_DESCRIPTION % name, "parameters": dict(STUB_PARAMETERS)}
 
 
@@ -243,7 +274,10 @@ def build_tools(names, defs):
 def scenario_tools(scenario, pristine_defs, rewritten_defs):
     """场景 → chat 形态的 tools 数组。"""
     defs = rewritten_defs if scenario == "s12_rewritten" else pristine_defs
-    return build_tools(scenario_names(scenario), defs)
+    tools = build_tools(scenario_names(scenario), defs)
+    if scenario == "s12_dsh":
+        apply_dsh_text(tools)
+    return tools
 
 
 def gateway_official_defs(repo_defs):
@@ -385,6 +419,20 @@ def judgement(records):
             lines.append("subset 可用")
         else:
             lines.append("subset 未能确认（http=%s）" % row.get("http"))
+
+    dsh_rows = [r for r in records if r.get("mode") == "subset" and r.get("scenario") == "s12_dsh"]
+    for row in dsh_rows:
+        if row.get("skipped"):
+            lines.append("subset/s12_dsh 未测（额度）")
+            continue
+        http = row.get("http")
+        if row.get("quota_suspected") or http == 429:
+            lines.append("subset/s12_dsh 被上游拒（http=%s）→ 只看名字不够，必须配文本校验"
+                         % http)
+        elif http == 200:
+            lines.append("subset/s12_dsh 也 200 → 文本校验不是必需的（与历史结论相反，需复核）")
+        else:
+            lines.append("subset/s12_dsh http=%s" % http)
 
     content_rows = [r for r in records if r.get("mode") == "content"]
     for scenario in ("s14_pristine", "s12_rewritten", "s12_pristine", "s13_pristine"):
@@ -740,6 +788,10 @@ def run(args):
     lines = judgement(records)
     for line in lines:
         print("[判词] %s" % line)
+
+    # 每条记录自带归类，报告与 CI 汇总表都用同一个判定，不在别处重算。
+    for record in records:
+        record["verdict"] = verdict(record)
 
     report = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),

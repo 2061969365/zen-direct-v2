@@ -1,78 +1,333 @@
 name: shape-acceptance
+
+# 验「更宽松的透传判据」到底会不会被真上游接受：subset / content 两种档位下，
+# 官方名 12/13/14 个（原始定义或仓库改写定义）发过去是 200 还是 429。
+#
+# 为什么要放 CI：免费层按**出口 IP** 计量，每个 IP 的额度都很小；本地跑 8 发就
+# 可能把干净出口烧掉。CI 里先用 VPN Gate 拿一个干净节点（sing-box 18080），
+# 整个测量只走这一个出口，一共 6~8 发。
+#
+# vpngate 的取节点步骤照搬 .github/workflows/tool-accuracy.yml 里已经跑通的单节点
+# 路径（fetch toolbox → pick node → pin_sb.py → start sing-box），不另发明：
+#   - 节点来源 https://www.vpngate.net/api/iphone/ ，末列是 base64 的 OpenVPN 配置
+#   - sing-box 必须 1.11+（1.10.x 报 unknown field "endpoints"）
+#   - 探测脚本两个文件必须同目录（probe 里 import vpngate_to_singbox）
+#   - mixed inbound 必须写 host：--mixed 127.0.0.1:18080
+#   - 配置钉成「唯一 endpoint + route.final 直指它」（urltest 组对 openvpn endpoint
+#     永远 "endpoint is not ready yet"）
+#
+# 额度撞了不失败（::warning::，结论标注不可用）；拿不到节点才硬失败。
+
 'on':
   workflow_dispatch:
     inputs:
+      egress:
+        description: "出口：vpngate = 一个 VPN Gate 节点（默认）；direct = runner 直连"
+        required: false
+        type: choice
+        options:
+          - vpngate
+          - direct
+        default: "vpngate"
       modes:
-        description: 判据档位，逗号分隔
+        description: "判据档位，逗号分隔（subset,content,exact）"
         required: false
-        default: subset,content
+        default: "subset,content"
       scenarios:
-        description: 场景，逗号分隔
+        description: "只跑指定场景，逗号分隔（留空 = 四个全跑）"
         required: false
-        default: s12_pristine,s13_pristine,s14_pristine,s12_rewritten
+        default: ""
+
 permissions:
   contents: read
+
 jobs:
   acceptance:
     runs-on: ubuntu-latest
+    # 30 分钟：选节点最坏 3 次 ×（12 候选 × 8 并发真实发包）+ 两个 mode 各起一次网关
     timeout-minutes: 30
     env:
-      EGRESS: vpngate
+      EGRESS: ${{ github.event.inputs.egress || 'vpngate' }}
+      MODES: ${{ github.event.inputs.modes || 'subset,content' }}
+      SCENARIOS: ${{ github.event.inputs.scenarios || '' }}
       WORK: ${{ github.workspace }}/_vpn
-      VPMAX: '12'
+      # 单次选节点最多探测的候选数（每个候选是一个新 IP，会消耗一份免费额度）
+      VPMAX: "12"
+
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-    - name: Setup Go (version from go.mod)
-      uses: actions/setup-go@v5
-      with:
-        go-version-file: go.mod
-        cache: true
-    - name: Build current binary
-      run: 'set -euo pipefail
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-        bash scripts/sync_assets.sh || true
+      - name: Setup Go (version from go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
 
-        go build -o zen-current .
+      - name: Build current binary
+        run: |
+          set -euo pipefail
+          bash scripts/sync_assets.sh || true
+          go build -o zen-current .
+          ls -l zen-current
 
-        ls -l zen-current
+      # ---------- egress=vpngate：工具箱 ----------
+      - name: "Egress vpngate: fetch toolbox (egress=vpngate)"
+        if: env.EGRESS == 'vpngate'
+        run: |
+          set -uo pipefail
+          VD="$WORK/vpngate"
+          mkdir -p "$VD"
+          cd "$VD"
 
-        '
-    - name: 'Egress vpngate: fetch toolbox (egress=vpngate)'
-      run: "set -uo pipefail\nVD=\"$WORK/vpngate\"\nmkdir -p \"$VD\"\ncd \"$VD\"\n\necho \"--- 1. VPN Gate 官方快照（CSV，末列是 base64 OpenVPN 配置）\"\ncurl -fsSL --retry 3 --retry-delay 1 -o nodes.csv \"https://www.vpngate.net/api/iphone/\" || {\n  echo \"::error::取不到 VPN Gate 快照（vpngate.net 不可达）\"; exit 1; }\necho \"nodes.csv 行数=$(wc -l < nodes.csv)\"\n\necho \"--- 2. sing-box（linux-amd64，动态取最新版；必须 1.11+）\"\n# 必须 1.11+：配置里带 endpoints 字段，1.10.x 报 unknown field \"endpoints\"\nsb_tag=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest \\\n  | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"tag_name\"])' 2>/dev/null || echo v1.12.0)\nsb_ver=${sb_tag#v}\necho \"sing-box tag=$sb_tag\"\ncurl -fsSL --retry 3 --retry-delay 1 -o sing-box.tar.gz \\\n  \"https://github.com/SagerNet/sing-box/releases/download/${sb_tag}/sing-box-${sb_ver}-linux-amd64.tar.gz\" || {\n  echo \"::error::下载 sing-box ${sb_tag} 失败\"; exit 1; }\ntar -xzf sing-box.tar.gz\ninstall -m 0755 \"sing-box-${sb_ver}-linux-amd64/sing-box\"\
-        \ ./sing-box\n./sing-box version | head -3 || true\nver=$(./sing-box version | awk 'NR==1{print $NF}')\necho \"sing-box version=$ver\"\nif [ \"$(printf '%s\\n1.11.0\\n' \"$ver\" | sort -V | head -1)\" != \"1.11.0\" ]; then\n  echo \"::error::sing-box $ver < 1.11，endpoints 字段不认（换 tag）\"\n  exit 1\nfi\n\necho \"--- 3. 探测脚本（必须同目录：probe 里 import vpngate_to_singbox）\"\ncurl -fsSL --retry 3 -o probe_and_select_vpngate.py \\\n  \"https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/probe_and_select_vpngate.py\" || {\n  echo \"::error::取 probe_and_select_vpngate.py 失败\"; exit 1; }\ncurl -fsSL --retry 3 -o vpngate_to_singbox.py \\\n  \"https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/vpngate_to_singbox.py\" || {\n  echo \"::error::取 vpngate_to_singbox.py 失败\"; exit 1; }\nwc -l probe_and_select_vpngate.py vpngate_to_singbox.py\n\necho \"--- 4. 配置钉扎脚本\"\n# 探测脚本用 v2s.build_singbox_config() 默认 final=\"auto\"（urltest 组），\n# 对单个 openvpn\
-        \ endpoint 会永远 \"endpoint is not ready yet\"。\n# 这里统一改成「唯一 endpoint + route.final 直指它」。\n# 同时挡掉脚本的兜底分支：没验到 200 时会塞 3 个存活节点，那不是我们要的。\ncat > pin_sb.py <<'PY'\nimport json\nimport sys\n\npath = sys.argv[1]\ncfg = json.load(open(path, encoding=\"utf-8\"))\neps = cfg.get(\"endpoints\") or []\nif len(eps) != 1:\n    print(f\"UNUSABLE endpoints={len(eps)}（要唯一节点；多了说明脚本走了兜底）\", flush=True)\n    sys.exit(2)\nep = eps[0]\ntag = ep.get(\"tag\") or \"vpngate-0\"\nep[\"tag\"] = tag\ncfg[\"endpoints\"] = [ep]\ncfg[\"outbounds\"] = [{\"type\": \"direct\", \"tag\": \"direct\"}]\ncfg.setdefault(\"route\", {})[\"final\"] = tag\ncfg.setdefault(\"log\", {})[\"level\"] = \"info\"\njson.dump(cfg, open(path, \"w\", encoding=\"utf-8\"), indent=2)\nprint(\"OK\", ep.get(\"server\"), ep.get(\"server_port\"), tag, flush=True)\nPY\npython3 -c 'import ast,sys; ast.parse(open(\"pin_sb.py\", encoding=\"utf-8\").read())' \\\n  && echo \"pin_sb.py 语法 OK\"\n"
-    - name: 'Egress vpngate: pick node A (egress=vpngate)'
-      run: "set -uo pipefail\nVD=\"$WORK/vpngate\"\ncd \"$VD\"\necho \"EGRESS=$EGRESS  A=baseline（改前）  B=current（改后）\"\nok=0\nfor attempt in 1 2 3; do\n  echo \"--- 选节点 A：第 $attempt/3 次（最多 $VPMAX 个候选，每个候选一份免费额度）\"\n  set +e\n  python3 probe_and_select_vpngate.py \\\n    --csv nodes.csv \\\n    --output \"$VD/sb-a.json\" \\\n    --zen-bin \"$GITHUB_WORKSPACE/zen-current\" \\\n    --singbox-bin \"$VD/sing-box\" \\\n    --mixed-port 18080 \\\n    --max-candidates \"$VPMAX\" \\\n    --concurrency 8 \\\n    --keep-nodes 1 > \"select-a-$attempt.log\" 2>&1\n  rc=$?\n  set -e\n  tail -40 \"select-a-$attempt.log\" || true\n  if [ \"$rc\" != \"0\" ] || [ ! -s sb-a.json ]; then\n    echo \"A 第 $attempt 次没选出节点（rc=$rc）\"\n    continue\n  fi\n  if ! line=$(python3 pin_sb.py sb-a.json); then\n    echo \"A 第 $attempt 次配置不可用（$line），重试\"\n    continue\n  fi\n  echo \"A 节点：$line\"\n  read -r _ a_srv a_prt a_tag <<< \"$line\"\n  printf '%s' \"$a_srv\" > node-a.server\n  printf '%s' \"$a_srv:$a_prt\" > node-a.endpoint\n\
-        \  {\n    echo \"VPN_NODE_A=$a_srv:$a_prt\"\n    echo \"VPN_TAG_A=$a_tag\"\n  } >> \"$GITHUB_ENV\"\n  ok=1\n  break\ndone\nif [ \"$ok\" != \"1\" ]; then\n  echo \"::error::vpngate 选不出 A 侧节点（免费节点此刻全挂/全被刷满）——本轮无法测量，不降级到 direct\"\n  exit 1\nfi\n"
-    - name: 'Egress vpngate: start sing-box A (egress=vpngate)'
-      run: "set -uo pipefail\nVD=\"$WORK/vpngate\"\ncd \"$VD\"\nport_open() {\n  python3 -c \"import socket,sys; s=socket.socket(); s.settimeout(1); sys.exit(0 if s.connect_ex(('127.0.0.1', int(sys.argv[1])))==0 else 1)\" \"$1\"\n}\nnohup ./sing-box run -c sb-a.json > singbox-a.log 2>&1 &\necho $! > singbox-a.pid\nlisten=0\nfor i in $(seq 1 25); do\n  if port_open 18080; then listen=1; break; fi\n  sleep 1\ndone\nif [ \"$listen\" != \"1\" ]; then\n  echo \"::error::sing-box A 没监听 18080\"\n  tail -40 singbox-a.log || true\n  exit 1\nfi\necho \"sing-box A 已在 127.0.0.1:18080 监听（节点 $(cat node-a.endpoint 2>/dev/null || echo ?)）\"\nipa=\"\"\nfor i in $(seq 1 4); do\n  ipa=$(curl -s -m 25 --proxy http://127.0.0.1:18080 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || true)\n  [ -n \"$ipa\" ] && break\n  sleep 3\ndone\nif [ -z \"$ipa\" ]; then\n  echo \"::error::A 侧（sing-box 18080）取不到出口 IP，隧道没通\"\n  tail -40 singbox-a.log || true\n  exit 1\nfi\necho \"A 侧出口 IP: $ipa\"\nprintf '%s' \"$ipa\"\
-        \ > ip-a.txt\necho \"VPN_IP_A=$ipa\" >> \"$GITHUB_ENV\"\n"
-    - name: Run shape acceptance (真实上游)
-      env:
-        MODES: ${{ github.event.inputs.modes || 'subset,content' }}
-        ONLY: ${{ github.event.inputs.scenarios || 's12_pristine,s13_pristine,s14_pristine,s12_rewritten' }}
-      run: "set -uo pipefail\nexport HTTPS_PROXY=http://127.0.0.1:18080 HTTP_PROXY=http://127.0.0.1:18080 ALL_PROXY=http://127.0.0.1:18080\nexport NO_PROXY=127.0.0.1,localhost\nset +e\nenv -u HTTPS_PROXY -u HTTP_PROXY -u ALL_PROXY \\\n  python3 tools/shape_acceptance.py \\\n    --bin ./zen-current --out acceptance.json \\\n    --modes \"$MODES\" --only \"$ONLY\" \\\n    --gateway-proxy http://127.0.0.1:18080 2>&1 | tee acceptance.log\nrc=${PIPESTATUS[0]}\nset -e\necho \"ACCEPT_RC=$rc\" >> \"$GITHUB_ENV\"\n{\n  echo \"\"\n  echo \"### 透传判据验收（真实上游）\"\n  echo '```'\n  tail -60 acceptance.log || true\n  echo '```'\n} >> \"$GITHUB_STEP_SUMMARY\"\necho \"shape_acceptance rc=$rc\"\n"
-    - name: Stop vpngate sing-box
-      if: always()
-      run: 'set -uo pipefail
+          echo "--- 1. VPN Gate 官方快照（CSV，末列是 base64 OpenVPN 配置）"
+          curl -fsSL --retry 3 --retry-delay 1 -o nodes.csv "https://www.vpngate.net/api/iphone/" || {
+            echo "::error::取不到 VPN Gate 快照（vpngate.net 不可达）"; exit 1; }
+          echo "nodes.csv 行数=$(wc -l < nodes.csv)"
 
-        if [ -f /tmp/vpngate/singbox.pid ]; then kill "$(cat /tmp/vpngate/singbox.pid)" 2>/dev/null || true; fi
+          echo "--- 2. sing-box（linux-amd64，动态取最新版；必须 1.11+）"
+          sb_tag=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])' 2>/dev/null || echo v1.12.0)
+          sb_ver=${sb_tag#v}
+          echo "sing-box tag=$sb_tag"
+          curl -fsSL --retry 3 --retry-delay 1 -o sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/${sb_tag}/sing-box-${sb_ver}-linux-amd64.tar.gz" || {
+            echo "::error::下载 sing-box ${sb_tag} 失败"; exit 1; }
+          tar -xzf sing-box.tar.gz
+          install -m 0755 "sing-box-${sb_ver}-linux-amd64/sing-box" ./sing-box
+          ./sing-box version | head -3 || true
+          ver=$(./sing-box version | awk 'NR==1{print $NF}')
+          echo "sing-box version=$ver"
+          if [ "$(printf '%s\n1.11.0\n' "$ver" | sort -V | head -1)" != "1.11.0" ]; then
+            echo "::error::sing-box $ver < 1.11，endpoints 字段不认（换 tag）"
+            exit 1
+          fi
 
-        pkill -f ''sing-box run'' 2>/dev/null || true
+          echo "--- 3. 探测脚本（必须同目录：probe 里 import vpngate_to_singbox）"
+          curl -fsSL --retry 3 -o probe_and_select_vpngate.py \
+            "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/probe_and_select_vpngate.py" || {
+            echo "::error::取 probe_and_select_vpngate.py 失败"; exit 1; }
+          curl -fsSL --retry 3 -o vpngate_to_singbox.py \
+            "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/vpngate_to_singbox.py" || {
+            echo "::error::取 vpngate_to_singbox.py 失败"; exit 1; }
+          wc -l probe_and_select_vpngate.py vpngate_to_singbox.py
 
-        echo cleaned
+          echo "--- 4. 配置钉扎脚本"
+          cat > pin_sb.py <<'PY'
+          import json
+          import sys
 
-        '
-    - name: Upload acceptance report
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: shape-acceptance-${{ github.run_id }}
-        path: 'acceptance.json
+          path = sys.argv[1]
+          cfg = json.load(open(path, encoding="utf-8"))
+          eps = cfg.get("endpoints") or []
+          if len(eps) != 1:
+              print(f"UNUSABLE endpoints={len(eps)}（要唯一节点；多了说明脚本走了兜底）", flush=True)
+              sys.exit(2)
+          ep = eps[0]
+          tag = ep.get("tag") or "vpngate-0"
+          ep["tag"] = tag
+          cfg["endpoints"] = [ep]
+          cfg["outbounds"] = [{"type": "direct", "tag": "direct"}]
+          cfg.setdefault("route", {})["final"] = tag
+          cfg.setdefault("log", {})["level"] = "info"
+          json.dump(cfg, open(path, "w", encoding="utf-8"), indent=2)
+          print("OK", ep.get("server"), ep.get("server_port"), tag, flush=True)
+          PY
+          python3 -c 'import ast,sys; ast.parse(open("pin_sb.py", encoding="utf-8").read())' \
+            && echo "pin_sb.py 语法 OK"
 
-          acceptance.log'
-        retention-days: '7'
-        if-no-files-found: warn
+      # ---------- egress=vpngate：一个节点 ----------
+      - name: "Egress vpngate: pick node (egress=vpngate)"
+        if: env.EGRESS == 'vpngate'
+        run: |
+          set -uo pipefail
+          VD="$WORK/vpngate"
+          cd "$VD"
+          ok=0
+          for attempt in 1 2 3; do
+            echo "--- 选节点：第 $attempt/3 次（最多 $VPMAX 个候选，每个候选一份免费额度）"
+            set +e
+            python3 probe_and_select_vpngate.py \
+              --csv nodes.csv \
+              --output "$VD/sb.json" \
+              --zen-bin "$GITHUB_WORKSPACE/zen-current" \
+              --singbox-bin "$VD/sing-box" \
+              --mixed-port 18080 \
+              --max-candidates "$VPMAX" \
+              --concurrency 8 \
+              --keep-nodes 1 > "select-$attempt.log" 2>&1
+            rc=$?
+            set -e
+            tail -40 "select-$attempt.log" || true
+            if [ "$rc" != "0" ] || [ ! -s sb.json ]; then
+              echo "第 $attempt 次没选出节点（rc=$rc）"
+              continue
+            fi
+            if ! line=$(python3 pin_sb.py sb.json); then
+              echo "第 $attempt 次配置不可用（$line），重试"
+              continue
+            fi
+            echo "节点：$line"
+            read -r _ srv prt tag <<< "$line"
+            printf '%s' "$srv" > node.server
+            printf '%s' "$srv:$prt" > node.endpoint
+            {
+              echo "VPN_NODE=$srv:$prt"
+              echo "VPN_TAG=$tag"
+            } >> "$GITHUB_ENV"
+            ok=1
+            break
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::vpngate 选不出节点（免费节点此刻全挂/全被刷满）——本轮无法测量，不降级到 direct"
+            exit 1
+          fi
+
+      - name: "Egress vpngate: start sing-box (egress=vpngate)"
+        if: env.EGRESS == 'vpngate'
+        run: |
+          set -uo pipefail
+          VD="$WORK/vpngate"
+          cd "$VD"
+          port_open() {
+            python3 -c "import socket,sys; s=socket.socket(); s.settimeout(1); sys.exit(0 if s.connect_ex(('127.0.0.1', int(sys.argv[1])))==0 else 1)" "$1"
+          }
+          nohup ./sing-box run -c sb.json > singbox.log 2>&1 &
+          echo $! > singbox.pid
+          listen=0
+          for i in $(seq 1 25); do
+            if port_open 18080; then listen=1; break; fi
+            sleep 1
+          done
+          if [ "$listen" != "1" ]; then
+            echo "::error::sing-box 没监听 18080"
+            tail -40 singbox.log || true
+            exit 1
+          fi
+          echo "sing-box 已在 127.0.0.1:18080 监听（节点 $(cat node.endpoint 2>/dev/null || echo ?)）"
+          ip=""
+          for i in $(seq 1 4); do
+            ip=$(curl -s -m 25 --proxy http://127.0.0.1:18080 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || true)
+            [ -n "$ip" ] && break
+            sleep 3
+          done
+          if [ -z "$ip" ]; then
+            echo "::error::sing-box 18080 取不到出口 IP，隧道没通"
+            tail -40 singbox.log || true
+            exit 1
+          fi
+          echo "出口 IP: $ip"
+          printf '%s' "$ip" > ip.txt
+          echo "VPN_IP=$ip" >> "$GITHUB_ENV"
+
+      # ---------- 跑探针 ----------
+      - name: Run shape acceptance (real upstream)
+        run: |
+          set -uo pipefail
+          proxy_arg=""
+          if [ "$EGRESS" = "vpngate" ]; then
+            proxy_arg="--gateway-proxy http://127.0.0.1:18080"
+          fi
+          only_arg=""
+          if [ -n "${SCENARIOS:-}" ]; then
+            only_arg="--only $SCENARIOS"
+          fi
+          set +e
+          # 探针自己只连 127.0.0.1：清掉代理变量，靠 --gateway-proxy 单独把代理交给网关
+          # （网关把 HTTP(S)_PROXY 当全局代理，连 127.0.0.1 也先 CONNECT）。
+          env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+              NO_PROXY=127.0.0.1,localhost \
+            python3 tools/shape_acceptance.py \
+              --bin ./zen-current --out acceptance.json \
+              --modes "$MODES" $only_arg $proxy_arg 2>&1 | tee acceptance.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "ACCEPT_RC=$rc" >> "$GITHUB_ENV"
+          echo "shape_acceptance rc=$rc"
+          exit 0
+
+      - name: Summarise
+        if: always()
+        run: |
+          set -uo pipefail
+          rc="${ACCEPT_RC:-9}"
+          {
+            echo "### 透传判据验收（真实上游）"
+            echo ""
+            echo "- 出口：\`$EGRESS\` / 节点 \`${VPN_NODE:-?}\` / 出口 IP \`${VPN_IP:-?}\`"
+            echo "- 档位：\`$MODES\`"
+            echo "- 探针退出码：\`$rc\`"
+            echo ""
+            python3 - <<'PY' || true
+          import json, os
+
+          path = "acceptance.json"
+          if not os.path.exists(path):
+              print("> 没有 acceptance.json（探针没跑起来或环境错误）")
+              raise SystemExit(0)
+          data = json.load(open(path, encoding="utf-8"))
+          src = data.get("pristine_source") or {}
+          print(f"- 原始定义：`{src.get('path')}`（{src.get('origin')}）")
+          if src.get("fallback"):
+              print("")
+              print("> **原始定义下载失败**，已退到仓库改写版：本轮 pristine 场景与 rewritten 等价，"
+                    "结论不能当成「官方原文」来读。")
+          print("")
+          print("| mode | scenario | branch | expected | http | verdict |")
+          print("|---|---|---|---|---|---|")
+          for r in data.get("results", []):
+              http = "-" if r.get("http") is None else r.get("http")
+              print(f"| `{r.get('mode')}` | `{r.get('scenario')}` | {r.get('gateway_branch') or '-'} "
+                    f"| {r.get('expected_branch') or '-'} | {http} | {r.get('verdict') or '-'} |")
+          print("")
+          for line in data.get("judgement") or []:
+              print(f"- {line}")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY" || true
+
+          # 判死条件：环境错误（rc=2）或「有不符合」但没撞额度。
+          q=0
+          if [ -s acceptance.json ]; then
+            q=$(python3 -c 'import json; print(int(json.load(open("acceptance.json", encoding="utf-8")).get("quota") or 0))' 2>/dev/null || echo 0)
+          fi
+          if [ "$rc" = "0" ]; then
+            echo "全部符合预期"
+            exit 0
+          fi
+          if [ "$q" -gt 0 ]; then
+            echo "::warning::本轮有 $q 条样本撞额度（429/402），结论不可用；换时间或换节点重跑"
+            exit 0
+          fi
+          if [ "$rc" = "2" ]; then
+            echo "::error::探针环境错误（rc=2）：看 acceptance.log"
+            exit 1
+          fi
+          echo "::error::有场景不符合预期（rc=$rc）且不是额度问题：看汇总表与 acceptance.log"
+          exit 1
+
+      - name: Stop vpngate sing-box
+        if: always() && env.EGRESS == 'vpngate'
+        run: |
+          set -uo pipefail
+          VD="$WORK/vpngate"
+          if [ -f "$VD/singbox.pid" ]; then
+            kill "$(cat "$VD/singbox.pid")" 2>/dev/null || true
+          fi
+          pkill -f "sing-box run -c sb" || true
+          echo "sing-box 已停"
+
+      - name: Upload acceptance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shape-acceptance-${{ github.run_id }}
+          path: |
+            acceptance.json
+            acceptance.log
+            _vpn/vpngate/sb.json
+            _vpn/vpngate/select-*.log
+            _vpn/vpngate/singbox.log
+          retention-days: 7
+          if-no-files-found: warn

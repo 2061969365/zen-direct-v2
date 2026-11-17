@@ -297,11 +297,100 @@ jobs:
             echo "- size: \`$size\` bytes"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # ---------- vpngate 出口（egress=vpngate）----------
+      # 复用 zen-vpngate-cloud-test 里已经验证过的探测脚本，不重写节点选择逻辑：
+      # 该脚本用真实 zen 二进制并发探测候选节点，只保留真拿到 200 的节点，
+      # 并产出带 mixed inbound（18080）的 sing-box 配置。
+      - name: "Egress vpngate: pick verified node (egress=vpngate)"
+        if: env.EGRESS == 'vpngate'
+        run: |
+          set -uo pipefail
+          mkdir -p "$WORK/vpngate"
+          cd "$WORK/vpngate"
+
+          echo "--- 1. VPN Gate 官方快照（CSV，末列是 base64 OpenVPN 配置）"
+          curl -fsSL --retry 3 --retry-delay 1 -o nodes.csv "https://www.vpngate.net/api/iphone/"
+          echo "nodes.csv 行数=$(wc -l < nodes.csv)"
+
+          echo "--- 2. sing-box (linux-amd64)"
+          curl -fsSL --retry 3 --retry-delay 1 -o sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-amd64.tar.gz"
+          tar -xzf sing-box.tar.gz
+          install -m 0755 sing-box-1.10.7-linux-amd64/sing-box ./sing-box
+          ./sing-box version | head -3
+
+          echo "--- 3. 取已验证的探测脚本"
+          curl -fsSL --retry 3 -o probe_and_select_vpngate.py \
+            "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/probe_and_select_vpngate.py"
+          wc -l probe_and_select_vpngate.py
+
+          echo "--- 4. 真实探测并选出节点（会消耗免费额度）"
+          set +e
+          python3 probe_and_select_vpngate.py \
+            --csv nodes.csv \
+            --output "$WORK/vpngate/sb.json" \
+            --zen-bin "$GITHUB_WORKSPACE/zen-direct" \
+            --singbox-bin "$WORK/vpngate/sing-box" \
+            --mixed-port 18080 \
+            --max-candidates 12 \
+            --keep-nodes 1 > select.log 2>&1
+          rc=$?
+          set -e
+          tail -60 select.log || true
+          if [ "$rc" != "0" ] || [ ! -s "$WORK/vpngate/sb.json" ]; then
+            echo "::error::vpngate 没选出可用节点（rc=$rc）"
+            exit 1
+          fi
+          echo "sb.json=$(stat -c%s "$WORK/vpngate/sb.json") bytes"
+
+      - name: "Egress vpngate: start sing-box (egress=vpngate)"
+        if: env.EGRESS == 'vpngate'
+        run: |
+          set -uo pipefail
+          cd "$WORK/vpngate"
+          ./sing-box run -c sb.json > singbox.log 2>&1 &
+          echo $! > singbox.pid
+          ok=0
+          for i in $(seq 1 25); do
+            if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(1); sys.exit(0 if s.connect_ex(('127.0.0.1',18080))==0 else 1)"; then
+              ok=1; break
+            fi
+            sleep 1
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::sing-box 没监听 18080"
+            tail -40 singbox.log || true
+            exit 1
+          fi
+          echo "sing-box 已在 18080 监听"
+          echo "--- 经代理取出口 IP"
+          curl -s -m 25 --proxy http://127.0.0.1:18080 https://api.ipify.org || true
+          echo
+          {
+            echo ""
+            echo "### vpngate 出口"
+            echo "- sing-box mixed inbound: \`127.0.0.1:18080\`"
+            echo "- 经代理出口 IP: \`$(curl -s -m 25 --proxy http://127.0.0.1:18080 https://api.ipify.org || echo unknown)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Start gateway (PORT=8081)
         run: |
           set -uo pipefail
           mkdir -p "$WORK"
           : > "$WORK/gateway.log"
+          # egress=vpngate 时让网关的出站走本地 sing-box mixed inbound；
+          # 网关 bun_transport.go 的 proxyFromEnvironment 复刻 net/http 的代理发现，
+          # 认 HTTPS_PROXY/HTTP_PROXY/NO_PROXY，所以只给这个进程设环境变量即可，
+          # 不写进 GITHUB_ENV，避免污染后续步骤（健康检查、artifact 上传）。
+          if [ "${EGRESS:-direct}" = "vpngate" ]; then
+            export HTTPS_PROXY="http://127.0.0.1:18080"
+            export HTTP_PROXY="http://127.0.0.1:18080"
+            export ALL_PROXY="http://127.0.0.1:18080"
+            export NO_PROXY="127.0.0.1,localhost"
+            echo "gateway 出站：经 sing-box 127.0.0.1:18080"
+          else
+            echo "gateway 出站：直连"
+          fi
           PORT=8081 OPENCODE_ZEN_BASE=https://opencode.ai/inference/v1 ./zen-direct > "$WORK/gateway.log" 2>&1 &
           echo $! > "$WORK/gateway.pid"
           echo "gateway pid=$(cat "$WORK/gateway.pid")"

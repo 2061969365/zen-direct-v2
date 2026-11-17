@@ -1334,9 +1334,22 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	// 而把同一份 body 交给改名路径的 opencode2api 8/8 全 200。
 	// 所以透传必须要求集合**完整**，子集一律走改名+补全。
 	if len(ranked) > 0 && shapePassThrough(ranked, protocol) {
+		// 透传不是「原样递出去」——描述里的指纹短语必须先洗掉，否则上游 429。
+		// 见 sanitizeRankedTools 上的实测记录。
+		//
+		// 只在 subset/content 两档做：exact 档走的是「客户端声明了完整官方集」，
+		// 那种文本就是官方原文，上游本来就收，改了反而破坏逐字透传的既有行为。
+		sanitized := 0
+		if shapeMode() != "exact" {
+			sanitized = sanitizeRankedTools(ranked, protocol)
+		}
+		reason := "passthrough (" + shapeMode() + "): " + shapeReason(ranked, protocol)
+		if sanitized > 0 {
+			reason += "; sanitized " + strconv.Itoa(sanitized) + " tool description(s)"
+		}
 		recordShapeDecision(summarizeShapeDecision(
 			shapeModePassthrough, len(items), clientToolNames(ranked, protocol), toolCount(payload),
-			"passthrough ("+shapeMode()+"): "+shapeReason(ranked, protocol)))
+			reason))
 		return renames, false
 	}
 	for _, entry := range ranked {
@@ -1594,6 +1607,45 @@ func officialContentMatches(ranked []map[string]any, protocol Format) bool {
 		}
 	}
 	return true
+}
+
+// sanitizeRankedTools 在透传前洗掉工具级描述里的指纹短语。
+//
+// 2026-11-17 真实上游实测（shape-acceptance run 44129660858）：
+//
+//	官方名 + 原始文本            → 200
+//	官方名 + 参数级 DSH 文本      → 200
+//	官方名 + 工具级被判原句        → 429  ← 指纹只在工具级描述
+//
+// 也就是说 subset 判据（只看名字）会把带指纹的请求整份放过去，然后 429。
+// 这里复用改名路径本来就有的 sanitizeToolDescription，把短语换成中性文本，
+// 既保住 12 进 12 出，又不给上游递指纹。ZEN_DESC_VERBATIM=1 时跳过（对照实验用）。
+func sanitizeRankedTools(ranked []map[string]any, protocol Format) int {
+	if verbatimDescMode() {
+		return 0
+	}
+	replaced := 0
+	for _, entry := range ranked {
+		name := entryToolName(entry, protocol)
+		if protocol == FmtChat {
+			fn, ok := entry["function"].(map[string]any)
+			if !ok {
+				continue
+			}
+			description, _ := fn["description"].(string)
+			if cleaned, hit := sanitizeToolDescription(name, description); hit {
+				fn["description"] = cleaned
+				replaced++
+			}
+			continue
+		}
+		description, _ := entry["description"].(string)
+		if cleaned, hit := sanitizeToolDescription(name, description); hit {
+			entry["description"] = cleaned
+			replaced++
+		}
+	}
+	return replaced
 }
 
 // shapeReason 给 /health 和日志用的一句话判定理由。

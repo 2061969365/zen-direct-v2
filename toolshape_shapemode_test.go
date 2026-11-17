@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -159,5 +160,86 @@ func TestShapeModeDefaultsToExact(t *testing.T) {
 	t.Setenv("ZEN_SHAPE_MODE", "SUBSET")
 	if got := shapeMode(); got != "subset" {
 		t.Errorf("应当大小写不敏感，得到 %q", got)
+	}
+}
+
+// subset 透传前必须洗掉工具描述里的指纹短语。
+// 依据：真实上游实测（run 44129660858）官方名 + 工具级被判原句 → 429；
+// 官方名 + 参数级文本 → 200。所以只洗工具级，且只在非 exact 档洗。
+func TestShapeModeSubsetSanitizesBannedDescriptions(t *testing.T) {
+	t.Setenv("ZEN_SHAPE_MODE", "subset")
+	names := officialNamesWithout("patch", "experimental_image_generate")
+	var sb strings.Builder
+	sb.WriteString(`{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}],"tools":[`)
+	for i, name := range names {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		desc := "Tool " + name + "."
+		if name == "read" {
+			desc = "Read a UTF-8 text file and return line-numbered content."
+		}
+		sb.WriteString(`{"type":"function","function":{"name":"` + name + `","description":"` + desc + `","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}`)
+	}
+	sb.WriteString(`]}`)
+
+	in := mustJSON(t, sb.String())
+	up, renames, err := buildUpstream(FmtChat, FmtChat, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renames.Count() != 0 {
+		t.Fatalf("subset 档下不该改名，实际改了 %d 个", renames.Count())
+	}
+	entries := asArr(up["tools"])
+	if len(entries) != len(names) {
+		t.Fatalf("subset 档下不该追加官方集：出站 %d 个（应为 %d）", len(entries), len(names))
+	}
+	for _, raw := range entries {
+		fn := asMap(asMap(raw)["function"])
+		if asStr(fn["name"]) != "read" {
+			continue
+		}
+		desc := asStr(fn["description"])
+		if strings.Contains(desc, "line-numbered content") {
+			t.Fatalf("指纹短语没洗掉：%q", desc)
+		}
+		if !strings.Contains(desc, "line-numbered output") {
+			t.Fatalf("应当换成中性文本，实际 %q", desc)
+		}
+	}
+}
+
+// exact 档不能跟着改：那是「客户端声明了完整官方集」，文本就是官方原文。
+func TestShapeModeExactKeepsOfficialTextVerbatim(t *testing.T) {
+	t.Setenv("ZEN_SHAPE_MODE", "exact")
+	names := officialNamesWithout()
+	var sb strings.Builder
+	sb.WriteString(`{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}],"tools":[`)
+	for i, name := range names {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		desc := "Tool " + name + "."
+		if name == "read" {
+			desc = "Read a UTF-8 text file and return line-numbered content."
+		}
+		sb.WriteString(`{"type":"function","function":{"name":"` + name + `","description":"` + desc + `","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}`)
+	}
+	sb.WriteString(`]}`)
+
+	in := mustJSON(t, sb.String())
+	up, _, err := buildUpstream(FmtChat, FmtChat, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range asArr(up["tools"]) {
+		fn := asMap(asMap(raw)["function"])
+		if asStr(fn["name"]) != "read" {
+			continue
+		}
+		if !strings.Contains(asStr(fn["description"]), "line-numbered content") {
+			t.Fatalf("exact 档不应脱敏，实际 %q", asStr(fn["description"]))
+		}
 	}
 }

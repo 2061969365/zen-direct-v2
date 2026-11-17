@@ -38,6 +38,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 要能 checkout 改前那个提交来编对照二进制，浅克隆不行
+          fetch-depth: 0
 
       - name: Setup Go (version from go.mod)
         uses: actions/setup-go@v5

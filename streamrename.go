@@ -110,6 +110,14 @@ type streamToolRenamer struct {
 	tools     map[string]*streamToolRenameState
 	order     []string
 	channelOn bool
+	// dsml 是 DeepSeek 文本工具调用恢复器：模型把 tool call 以 <|DSML|...>
+	// 标记写进正文时，从 content 分片里增量提取并还原成结构化调用。
+	// 仅在请求带客户端工具（renames 非空）的 chat 流上启用。
+	dsml      textToolExtractor
+	dsmlOn    bool
+	dsmlCalls int
+	// dsmlFlushed 防止终态冲刷执行两次（finish 帧与 [DONE] 都会走到）。
+	dsmlFlushed bool
 	// keyAlias 把同一 tool_call 的两种 key 形态（choice:index / choice:id）
 	// 都指向 canonical key，解决"首帧只有 id、后续帧只有 index"的分叉。
 	keyAlias map[string]string
@@ -150,6 +158,7 @@ func newStreamToolRenamer(protocol Format, renames *ToolRenames) *streamToolRena
 		tools:        map[string]*streamToolRenameState{},
 		keyAlias:     map[string]string{},
 		channelOn:    channelModeOn(),
+		dsmlOn:       protocol == FmtChat && renames != nil && !renames.Empty(),
 		channelArgs:  map[string]*strings.Builder{},
 		channelNames: map[string]string{},
 	}
@@ -158,6 +167,30 @@ func newStreamToolRenamer(protocol Format, renames *ToolRenames) *streamToolRena
 func (renamer *streamToolRenamer) channelName(key, fragment string) {
 	prev := renamer.channelNames[key]
 	renamer.channelNames[key] = mergeToolName(prev, fragment)
+}
+
+// appendDSMLCalls 把 DSML 提取出的调用以 wire 名注入 message/delta 的
+// tool_calls（index 顺延、id 现签）。wire 名由随后的逐行名字还原映射回
+// 客户端名。返回是否发生改动。
+func (renamer *streamToolRenamer) appendDSMLCalls(message map[string]any, calls ...textToolCall) bool {
+	if len(calls) == 0 {
+		return false
+	}
+	existing := asArr(message["tool_calls"])
+	base := len(existing)
+	for i, call := range calls {
+		existing = append(existing, map[string]any{
+			"index": base + i,
+			"id":    newID("call"),
+			"type":  "function",
+			"function": map[string]any{
+				"name":      call.Name,
+				"arguments": call.Arguments,
+			},
+		})
+	}
+	message["tool_calls"] = existing
+	return true
 }
 
 func (renamer *streamToolRenamer) rewriteFrame(raw string) []byte {
@@ -209,7 +242,7 @@ func (renamer *streamToolRenamer) rewriteFrame(raw string) []byte {
 		}
 		return RenameResponseTool([]byte(raw), renamer.renames)
 	}
-	if !strings.Contains(raw, `"tool_calls"`) && !strings.Contains(raw, `"finish_reason"`) {
+	if !strings.Contains(raw, `"tool_calls"`) && !strings.Contains(raw, `"finish_reason"`) && !renamer.dsmlOn {
 		return []byte(raw)
 	}
 	return renamer.rewriteChatFrame(raw)
@@ -302,6 +335,64 @@ func (renamer *streamToolRenamer) rewriteChatFrame(raw string) []byte {
 					if renamer.finishState(state, function) {
 						changed = true
 					}
+				}
+			}
+			// DSML 文本工具调用恢复（mcp 模式）：content 分片喂增量提取器，
+			// 提取出的调用以 wire 名注入 tool_calls 分片，随后的逐行名字还原
+			// （pipeSSE restoreAliasNames）把它们映射回客户端名。
+			if renamer.dsmlOn {
+				if raw, ok := message["content"].(string); ok && raw != "" {
+					visible, calls := renamer.dsml.Feed(raw)
+					if visible != raw {
+						message["content"] = visible
+						changed = true
+					}
+					if len(calls) > 0 {
+						renamer.dsmlCalls += len(calls)
+						if renamer.appendDSMLCalls(message, calls...) {
+							changed = true
+						}
+					}
+				}
+			}
+		}
+		if finished && renamer.dsmlOn && !renamer.dsmlFlushed {
+			// 终态帧冲刷（整个流一次）：残留文本尾 + 未闭合块 best-effort。
+			tail, calls := renamer.dsml.Flush()
+			renamer.dsmlFlushed = true
+			renamer.dsmlCalls += len(calls)
+			if tail != "" || len(calls) > 0 {
+				var target map[string]any
+				for _, rawChoice2 := range asArr(payload["choices"]) {
+					c2, ok2 := rawChoice2.(map[string]any)
+					if !ok2 || fmt.Sprint(firstAny(c2["index"], -1)) != fmt.Sprint(choiceIndex) {
+						continue
+					}
+					for _, container := range []string{"delta", "message"} {
+						if message, ok := c2[container].(map[string]any); ok && target == nil {
+							target = message
+						}
+					}
+				}
+				if target == nil {
+					target = map[string]any{}
+					choice["delta"] = target
+				}
+				if tail != "" {
+					prev, _ := target["content"].(string)
+					target["content"] = prev + tail
+					changed = true
+				}
+				if len(calls) > 0 {
+					if renamer.appendDSMLCalls(target, calls...) {
+						changed = true
+					}
+				}
+			}
+			if renamer.dsmlCalls > 0 {
+				if fr, ok := choice["finish_reason"].(string); ok && (fr == "" || fr == "stop" || fr == "end_turn") {
+					choice["finish_reason"] = "tool_calls"
+					changed = true
 				}
 			}
 		}

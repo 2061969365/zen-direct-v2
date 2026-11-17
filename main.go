@@ -1415,6 +1415,19 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	w.Header().Set("Content-Type", "application/json")
 	outBytes, _ := json.Marshal(out)
 	outBytes = restoreAliasNames(outBytes, reqRenames)
+	// DSML 文本工具调用恢复（mcp 模式，chat 入口）：DeepSeek 系模型会把
+	// tool call 以 <|DSML|...> 标记写进正文；先把它提取成结构化 tool_calls
+	// （wire 名），随后的 restoreAliasNames 把 wire 名映射回客户端名。
+	// 通道模式不需要（通道名调用经 restoreChannelCalls 走独立还原），
+	// 且 DSML 名与通道默认工具的对应关系不确定，避免误映射。
+	if entry == FmtChat && reqRenames != nil && !reqRenames.Empty() && !channelModeOn() {
+		var dsmlPayload map[string]any
+		if json.Unmarshal(outBytes, &dsmlPayload) == nil && ExtractChatTextToolCallsInto(dsmlPayload) {
+			if encoded, err := json.Marshal(dsmlPayload); err == nil {
+				outBytes = encoded
+			}
+		}
+	}
 	// 通道模式：把 _tool 选择器还原成真实工具名并展开 _args。
 	if channelModeOn() {
 		var chanPayload map[string]any

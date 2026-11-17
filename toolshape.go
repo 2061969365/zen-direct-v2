@@ -179,10 +179,9 @@ func sanitizeToolDescription(_ string, description string) (string, bool) {
 	if description == "" {
 		return description, false
 	}
-	// ZEN_DESC_VERBATIM：客户端描述逐字出站（对齐 opencode2api v1.4.8——
-	// 他们的 mcp_ 模式对客户端描述零触碰且线上跑通）。短语黑名单是
-	// clint_/官方名时代的校准；mcp_ 不透明名下描述是否仍被指纹待实测，
-	// 实测通过后此模式转默认，黑名单降级为 ZEN_DESC_VERBATIM=0 的后备。
+	// ZEN_DESC_SANITIZE=1 时启用短语黑名单（默认关闭：对齐 opencode2api
+	// v1.4.8 的零触碰描述做法；2026-11-17 同出口 A/B 实测证明描述文本
+	// 不是 429 的变量）。
 	if verbatimDescMode() {
 		return description, false
 	}
@@ -1086,10 +1085,19 @@ func allOfficialToolNames(ranked []map[string]any, protocol Format) bool {
 }
 
 // verbatimDescMode 报告是否逐字出站客户端描述（跳过短语黑名单）。
+//
+// 对照 opencode2api v1.4.8：他们的 mcp_ 模式对客户端描述零触碰（唯一的
+// 描述改写只针对他们自己追加的官方 shell/bash 主机替换），线上跑通。
+// 2026-11-17 同出口 A/B 实测（A=真实 DSH 描述含封禁短语，B=中性描述）：
+// A 与 B 结果一致，说明描述文本不是 429 的变量——此前"描述指纹"的因果
+// 判断是出口波动造成的假相关。
+//
+// 因此默认逐字出站（保留客户端对模型的完整语义），黑名单降级为
+// ZEN_DESC_SANITIZE=1 显式开启的后备手段。
 func verbatimDescMode() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("ZEN_DESC_VERBATIM"))) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ZEN_DESC_SANITIZE"))) {
 	case "1", "on", "true", "yes":
-		return true
+		return false
 	}
-	return false
+	return true
 }

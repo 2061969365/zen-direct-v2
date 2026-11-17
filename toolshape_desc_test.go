@@ -36,6 +36,8 @@ func chatTool(name, description string) map[string]any {
 // 处理方式是把命中的短语就地替换掉，而不是整段丢弃描述——描述是模型判断工具用途的
 // 唯一提示，抹掉会让模型不会用这个工具。
 func TestSanitizeToolDescriptionRewritesPhrases(t *testing.T) {
+	// 黑名单是后备路径（默认关闭），显式开启后验证其行为。
+	t.Setenv("ZEN_DESC_SANITIZE", "1")
 	cases := []struct {
 		name        string
 		description string
@@ -142,6 +144,10 @@ func TestSanitizeToolDescriptionRewritesPhrases(t *testing.T) {
 // 描述按官方原文出站、不做脱敏（见 renameAndCompleteTools 的说明），
 // 这条用例要覆盖的是第三方客户端工具那条路径。
 func TestOutboundHasNoBannedPhrases(t *testing.T) {
+	// 短语黑名单默认关闭（对齐 opencode2api v1.4.8 的零触碰描述做法：
+	// 2026-11-17 同出口 A/B 实测证明描述文本不是 429 的变量）。
+	// 这里显式开启，验证后备路径本身仍然有效。
+	t.Setenv("ZEN_DESC_SANITIZE", "1")
 	tools := []any{
 		chatTool("dsh_read", "Read a UTF-8 text file and return line-numbered content."),
 		chatTool("dsh_edit", "Edit an existing UTF-8 text file by replacing literal text."),

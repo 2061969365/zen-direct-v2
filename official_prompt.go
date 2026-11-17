@@ -2,6 +2,7 @@ package main
 
 import (
 	_ "embed"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,7 +14,23 @@ import (
 //go:embed tools/opencode_prompt_v2.txt
 var opencodePromptV2 string
 
+// ZEN_PROMPT_FILE 可覆盖注入的官方提示词正文（对照实验用：opencode2api
+// v1.4.8 用的是 8.5KB 旧版，我们抓的是 CLI 2.2.5 的 95KB 原文）。
 var officialSystemPrompt = opencodePromptV2
+
+// promptFilePrompt 读取 ZEN_PROMPT_FILE 指定的提示词正文（未设置时为空）。
+func promptFilePrompt() string {
+	path := strings.TrimSpace(os.Getenv("ZEN_PROMPT_FILE"))
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("ZEN_PROMPT_FILE 读取失败 %s: %v", path, err)
+		return ""
+	}
+	return string(data)
+}
 
 // opencodePromptMarker 是官方提示词的开头短语，测试与排障用来识别官方提示词。
 //
@@ -74,7 +91,11 @@ func opencodeSystemPrompt(model string) string {
 	// 静态正文（94.8KB，含 219 个 skills）来自官方 CLI 2.2.5 抓包；
 	// 动态尾部由 opencodeEnvironment 逐字拼出。不再追加独立的 skills 段——
 	// 官方正文里已经包含完整的 <available_skills>。
-	return opencodePromptV2 + opencodeEnvironment(model)
+	body := opencodePromptV2
+	if override := promptFilePrompt(); override != "" {
+		body = override
+	}
+	return body + opencodeEnvironment(model)
 }
 
 func injectOfficialSystemPrompt(payload map[string]any) bool {

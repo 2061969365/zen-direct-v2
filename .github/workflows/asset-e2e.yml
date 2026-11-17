@@ -313,11 +313,17 @@ jobs:
           curl -fsSL --retry 3 --retry-delay 1 -o nodes.csv "https://www.vpngate.net/api/iphone/"
           echo "nodes.csv 行数=$(wc -l < nodes.csv)"
 
-          echo "--- 2. sing-box (linux-amd64)"
+          echo "--- 2. sing-box (linux-amd64, 动态取最新版)"
+          # 必须用 1.11+：vpngate_to_singbox.py 生成的配置带 `endpoints` 字段，
+          # 1.10.x 会报 "unknown field endpoints"（run 44065949688 实测）。
+          sb_tag=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])' 2>/dev/null || echo v1.12.0)
+          sb_ver=${sb_tag#v}
+          echo "sing-box tag=$sb_tag"
           curl -fsSL --retry 3 --retry-delay 1 -o sing-box.tar.gz \
-            "https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-amd64.tar.gz"
+            "https://github.com/SagerNet/sing-box/releases/download/${sb_tag}/sing-box-${sb_ver}-linux-amd64.tar.gz"
           tar -xzf sing-box.tar.gz
-          install -m 0755 sing-box-1.10.7-linux-amd64/sing-box ./sing-box
+          install -m 0755 "sing-box-${sb_ver}-linux-amd64/sing-box" ./sing-box
           ./sing-box version | head -3
 
           echo "--- 3. 取已验证的探测脚本"

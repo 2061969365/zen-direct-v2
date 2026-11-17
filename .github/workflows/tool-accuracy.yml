@@ -15,9 +15,9 @@ on:
         required: false
         default: "2"
       baseline_ref:
-        description: "对照用的提交（改前）"
+        description: "对照用的提交（改前，必须是远端存在的 SHA）"
         required: false
-        default: "3b944fa"
+        default: "97f9ca2"
       tasks:
         description: "只跑指定任务，逗号分隔（留空=全部 6 个）"
         required: false
@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 30
     env:
       TRIALS: ${{ github.event.inputs.trials || '2' }}
-      BASELINE_REF: ${{ github.event.inputs.baseline_ref || '3b944fa' }}
+      BASELINE_REF: ${{ github.event.inputs.baseline_ref || '97f9ca2' }}
       ONLY_TASKS: ${{ github.event.inputs.tasks || '' }}
 
     steps:
@@ -72,7 +72,41 @@ jobs:
           bash scripts/sync_assets.sh || true
           go build -o zen-current .
 
-      - name: Build baseline binary (${{ github.event.inputs.baseline_ref || '3b944fa' }})
+      - name: Preflight — 确认出口 IP 还有额度
+        run: |
+          set -uo pipefail
+          PORT=18080 ./zen-current > _pf.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS -m 3 http://127.0.0.1:18080/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          body='{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}],"max_tokens":1}'
+          ok=0
+          for attempt in 1 2 3 4; do
+            code=$(curl -s -o _pf.json -w '%{http_code}' -m 60 \
+              -X POST http://127.0.0.1:18080/v1/chat/completions \
+              -H 'content-type: application/json' -d "$body" || echo 000)
+            echo "preflight attempt=$attempt http=$code ip=$(curl -s -m 8 https://api.ipify.org || echo '?')"
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            if [ "$code" = "429" ] || [ "$code" = "402" ]; then
+              echo "出口 IP 没额度，重连 WARP 换一个"
+              sudo warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+              sleep 3
+              sudo warp-cli --accept-tos connect >/dev/null 2>&1 || true
+              sleep 6
+            else
+              echo "::error::preflight 非额度失败（http=$code）"; head -c 300 _pf.json || true
+              break
+            fi
+          done
+          pkill -f zen-current || true
+          sleep 1
+          if [ "$ok" != "1" ]; then
+            echo "::error::连续 4 个出口 IP 都没额度，本轮无法测量"
+            exit 1
+          fi
+
+      - name: Build baseline binary (${{ github.event.inputs.baseline_ref || '97f9ca2' }})
         run: |
           set -euo pipefail
           git worktree add --detach _baseline "$BASELINE_REF"

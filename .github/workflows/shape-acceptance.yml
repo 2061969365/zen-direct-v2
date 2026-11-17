@@ -4,11 +4,11 @@ name: shape-acceptance
     inputs:
       modes:
         description: 判据档位，逗号分隔
-        required: 'false'
+        required: false
         default: subset,content
       scenarios:
         description: 场景，逗号分隔
-        required: 'false'
+        required: false
         default: s12_pristine,s13_pristine,s14_pristine,s12_rewritten
 permissions:
   contents: read

@@ -323,7 +323,10 @@ jobs:
           echo "--- 3. 取已验证的探测脚本"
           curl -fsSL --retry 3 -o probe_and_select_vpngate.py \
             "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/probe_and_select_vpngate.py"
-          wc -l probe_and_select_vpngate.py
+          # probe_and_select 里 `import vpngate_to_singbox`，必须同目录取下来
+          curl -fsSL --retry 3 -o vpngate_to_singbox.py \
+            "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/vpngate_to_singbox.py"
+          wc -l probe_and_select_vpngate.py vpngate_to_singbox.py
 
           echo "--- 4. 真实探测并选出节点（会消耗免费额度）"
           set +e

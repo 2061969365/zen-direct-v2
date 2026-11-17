@@ -80,20 +80,48 @@ jobs:
             curl -fsS -m 3 http://127.0.0.1:18080/health >/dev/null 2>&1 && break
             sleep 1
           done
+
           body='{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}],"max_tokens":1}'
+          ip_now() { curl -s -m 8 https://api.ipify.org 2>/dev/null || true; }
+
+          rotate() {
+            local prev=$1
+            sudo warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+            sleep 3
+            sudo warp-cli --accept-tos connect >/dev/null 2>&1 || true
+            # 等 IP 真的变：WARP 有时会粘在同一张出口上
+            for i in $(seq 1 20); do
+              sleep 2
+              local cur; cur=$(ip_now)
+              if [ -n "$cur" ] && [ "$cur" != "$prev" ]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
           ok=0
-          for attempt in 1 2 3 4; do
+          stuck=0
+          for attempt in 1 2 3 4 5; do
             code=$(curl -s -o _pf.json -w '%{http_code}' -m 60 \
               -X POST http://127.0.0.1:18080/v1/chat/completions \
-              -H 'content-type: application/json' -d "$body" || echo 000)
-            echo "preflight attempt=$attempt http=$code ip=$(curl -s -m 8 https://api.ipify.org || echo '?')"
+              -H 'content-type: application/json' -d "$body" 2>/dev/null)
+            code=${code:-curl_failed}
+            echo "preflight attempt=$attempt http=$code ip=$(ip_now)"
             if [ "$code" = "200" ]; then ok=1; break; fi
             if [ "$code" = "429" ] || [ "$code" = "402" ]; then
-              echo "出口 IP 没额度，重连 WARP 换一个"
-              sudo warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
-              sleep 3
-              sudo warp-cli --accept-tos connect >/dev/null 2>&1 || true
-              sleep 6
+              prev=$(ip_now)
+              if rotate "$prev"; then
+                echo "出口已换: $prev -> $(ip_now)"
+              else
+                stuck=$((stuck + 1))
+                echo "第 $stuck 次没换动，重新注册 WARP 身份"
+                sudo warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+                sudo warp-cli --accept-tos registration new >/dev/null 2>&1 || true
+                sudo warp-cli --accept-tos connect >/dev/null 2>&1 || true
+                sleep 8
+              fi
+              [ "$stuck" -ge 3 ] && { echo "::error::WARP 连续换不出新出口"; break; }
             else
               echo "::error::preflight 非额度失败（http=$code）"; head -c 300 _pf.json || true
               break
@@ -102,7 +130,7 @@ jobs:
           pkill -f zen-current || true
           sleep 1
           if [ "$ok" != "1" ]; then
-            echo "::error::连续 4 个出口 IP 都没额度，本轮无法测量"
+            echo "::error::没有可用出口，本轮无法测量（免费层按出口 IP 计量，每个 IP 的额度都很小）"
             exit 1
           fi
 

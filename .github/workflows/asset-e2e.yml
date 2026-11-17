@@ -30,6 +30,11 @@ on:
         description: "要注入的资产分支（留空 = 资产仓库 main；填 asset-drift/latest = 验证漂移 PR 的内容）"
         required: false
         default: ""
+      contract:
+        description: "是否跑响应侧契约探针（args_schema/multiturn/streaming/parallel/errors/endpoints，会多花额度）"
+        required: false
+        type: boolean
+        default: false
       egress:
         description: "出口：direct = runner 直连；warp = Cloudflare WARP；vpngate = VPN Gate 节点 + sing-box"
         required: false
@@ -56,6 +61,7 @@ jobs:
       EGRESS: ${{ github.event.inputs.egress || 'direct' }}
       # 留空 = 资产仓库 main；填 asset-drift/latest 可验证漂移 PR 里那份资产
       ASSET_REF: ${{ github.event.inputs.asset_ref || '' }}
+      RUN_CONTRACT: ${{ github.event.inputs.contract || 'false' }}
       WORK: ${{ github.workspace }}/_e2e
     steps:
       - name: Checkout
@@ -406,6 +412,33 @@ jobs:
             echo "- 经代理出口 IP: \`$(curl -s -m 25 --proxy http://127.0.0.1:18080 https://api.ipify.org || echo unknown)\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # 出站契约对拍：零额度、完全不出网（自己起 sink + 第二个网关实例）。
+      # 注意：现在**预期就是 FAIL**——官方 CLI 现在发 12 个工具，网关判定「不齐」
+      # 会改名成 mcp_<digest> 再补 14 个官方桩，出站变 26 个。这条只报告不拦截，
+      # 等「官方集合到底是 12 还是 14」这个产品决策定下来再谈改闸门。
+      - name: Outbound conformance (出站契约对拍，零额度)
+        if: hashFiles('tools/outbound_conformance.py') != ''
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          mkdir -p "$WORK"
+          set +e
+          python3 tools/outbound_conformance.py \
+            --bin ./zen-direct --out "$WORK/outbound.json" 2>&1 | tee "$WORK/outbound.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "OUTBOUND_RC=$rc" >> "$GITHUB_ENV"
+          {
+            echo ""
+            echo "### 出站契约对拍（零额度）"
+            echo ""
+            echo '```'
+            grep -E '^\[s[0-9]+\]|^\[conf\]' "$WORK/outbound.log" || tail -20 "$WORK/outbound.log"
+            echo '```'
+            echo ""
+            echo "- rc: \`$rc\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Start gateway (PORT=8081)
         run: |
           set -uo pipefail
@@ -481,6 +514,40 @@ jobs:
             tail -50 "$WORK/probe.log" || true
             echo "=== gateway.log tail ==="
             tail -50 "$WORK/gateway.log" || true
+          fi
+
+      # 响应侧契约：asset_probe 只判「有没有调工具」，这里判「调得对不对」。
+      # 默认关闭——它要多发十来个请求，跑多了会把免费额度打穿。
+      - name: Contract probe (响应侧契约)
+        if: env.RUN_CONTRACT == 'true' && hashFiles('tools/contract_probe.py') != ''
+        run: |
+          set -uo pipefail
+          mkdir -p "$WORK"
+          set +e
+          python3 tools/contract_probe.py \
+            --base http://127.0.0.1:8081 \
+            --model "$MODEL" \
+            --out "$WORK/contract.json" \
+            --timeout 180 2>&1 | tee "$WORK/contract.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "CONTRACT_RC=$rc" >> "$GITHUB_ENV"
+          echo "contract_probe rc=$rc"
+
+          {
+            echo ""
+            echo "### 响应侧契约（contract_probe）"
+            echo "- rc: \`$rc\`"
+            echo ""
+            echo '```'
+            tail -40 "$WORK/contract.log" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$rc" != "0" ]; then
+            echo "::error::响应侧契约未通过（rc=$rc）"
+            tail -40 "$WORK/contract.log" || true
+            exit 1
           fi
 
       - name: Verdict + step summary
@@ -693,5 +760,7 @@ jobs:
           path: |
             _e2e/verdict.json
             _e2e/gateway.log
+            _e2e/outbound.json
+            _e2e/contract.json
           retention-days: 7
           if-no-files-found: warn

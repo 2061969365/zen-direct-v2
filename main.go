@@ -1725,9 +1725,10 @@ func main() {
 			runID = strings.TrimSpace(os.Getenv("GITHUB_RUN_ID"))
 		}
 		repo := strings.TrimSpace(os.Getenv("GITHUB_REPOSITORY"))
-		fmt.Fprintf(w, `{"status":"ok","mode":"direct","version":%q,"table_models":%d,"run_id":%q,"repo":%q,"started_at":%q,"uptime_sec":%d,"egress_ip":%q,"sidecar":%s,"stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"up429":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d,"last_ttfb_ms":%d,"ttfb_samples":%d}}`,
+		fmt.Fprintf(w, `{"status":"ok","mode":"direct","version":%q,"table_models":%d,"run_id":%q,"repo":%q,"started_at":%q,"uptime_sec":%d,"egress_ip":%q,"sidecar":%s,"stats":{"reqs":%d,"transport_retry":%d,"flaky_retry":%d,"up5xx":%d,"up4xx":%d,"up429":%d,"circuit_open":%d,"ttfb_p50_ms":%d,"ttfb_p95_ms":%d,"last_ttfb_ms":%d,"ttfb_samples":%d},"tool_shape":%s}`,
 			appVersion, tableModelCount(), runID, repo, processStart.UTC().Format(time.RFC3339), int(time.Since(processStart).Seconds()), egressIP(),
-			sidecar.statusJSON(), s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.Up429, s.CircuitOpens, s.TTFBP50, s.TTFBP95, s.LastTTFBMs, s.Samples)
+			sidecar.statusJSON(), s.Reqs, s.TransportRetry, s.FlakyRetry, s.Up5xx, s.Up4xx, s.Up429, s.CircuitOpens, s.TTFBP50, s.TTFBP95, s.LastTTFBMs, s.Samples,
+			ShapeHealthJSON())
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != "GET" {

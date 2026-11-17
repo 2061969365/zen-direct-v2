@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"os"
 	"regexp"
 	"runtime"
@@ -857,6 +858,234 @@ func firstString(values ...string) string {
 	return ""
 }
 
+// ── 整形决策可观测性 ──────────────────────────────────────────────
+//
+// 出站整形有三条互斥路径（透传 / 通道 / 改名+补全），对外完全不可见：
+// 客户端只看到 200，没人知道走了哪条、为什么。这里把每次决策记下来，
+// 通过 /health 的 "tool_shape" 与一条 gateway.log 行暴露。
+//
+// 关键约束：**只加观测，不改判定**。下面所有代码只读 payload 的最终形状，
+// 一个字节都不参与 renameAndCompleteTools 的分支条件。
+
+// ShapeDecision 记录一次出站整形的选择结果，用于排障与回归。
+type ShapeDecision struct {
+	Mode            string   // "passthrough" | "channel" | "rename_complete" | "none"
+	ClientTools     int      // 客户端声明的工具数
+	OutboundTools   int      // 整形后出站的工具数
+	OfficialSetSize int      // 当前官方集合的大小
+	MissingOfficial []string // 客户端缺了哪些官方名（按官方顺序，最多列 14 个）
+	ExtraClient     []string // 客户端多出来的非官方名
+	Reason          string   // 一句话，人能看懂的判定原因
+}
+
+const (
+	// shapeModePassthrough：客户端发齐官方集，原样出站。
+	shapeModePassthrough = "passthrough"
+	// shapeModeChannel：ZEN_TOOL_CHANNEL 生效，客户端工具收成官方通道桩。
+	shapeModeChannel = "channel"
+	// shapeModeRenameComplete：客户端工具改名成 mcp_<digest> 并补官方集。
+	shapeModeRenameComplete = "rename_complete"
+	// shapeModeNone：没有可供整形的客户端工具（只补了官方桩）。
+	shapeModeNone = "none"
+)
+
+// shapeDecisionMissingCap 是 MissingOfficial 的展示上限（官方集当前 14 个，
+// 上限跟着官方集走，写死 14 是任务约定的对外形状）。
+const shapeDecisionMissingCap = 14
+
+// shapeState 是进程级的"最近一次决策 + 每种模式的累计次数"。
+//
+// 并发模型：单个 RWMutex 统一保护 last / hasLast / counts。三者必须是同一
+// 时刻的快照才自洽（counts 的总和要覆盖 last），所以不拆成两把锁；写入只在
+// 整形路径里发生（每请求 1 次，锁内只做 map 自增 + 小切片拷贝），读侧走
+// RLock 并返回深拷贝，调用方随便读都不会与后续写入共享底层数组。
+var shapeState struct {
+	mu      sync.RWMutex
+	last    ShapeDecision
+	hasLast bool
+	counts  map[string]int
+}
+
+// shapeDecisionMode 取一个模式名上报，空值兜到 none。
+func shapeDecisionMode(mode string) string {
+	if mode == "" {
+		return shapeModeNone
+	}
+	return mode
+}
+
+// toolCount 读 payload["tools"] 的条目数（不存在或形状异常时算 0），
+// 只用于上报出站工具数，不参与任何判定。
+func toolCount(payload map[string]any) int {
+	if list, ok := payload["tools"].([]any); ok {
+		return len(list)
+	}
+	return 0
+}
+
+// clientToolNames 摘出客户端声明的工具名（保持声明顺序，跳过无名条目）。
+// 必须在改名之前取：改名是就地改 map，改完再读就只能读到 mcp_<digest> 上线名。
+func clientToolNames(ranked []map[string]any, protocol Format) []string {
+	names := make([]string, 0, len(ranked))
+	for _, entry := range ranked {
+		if name := entryToolName(entry, protocol); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// summarizeShapeDecision 把客户端声明的工具名与出站数量汇成一条决策。
+//
+// clientNames 是**改名之前**的客户端工具名；clientTools 是 payload 里声明的
+// 条目数（含畸形条目）；outbound 是整形后 payload["tools"] 的实际长度。
+func summarizeShapeDecision(mode string, clientTools int, clientNames []string, outbound int, reason string) ShapeDecision {
+	official := v2OfficialToolOrder
+	declared := clientNames
+	seen := make(map[string]bool, len(official))
+	for _, name := range declared {
+		if name == "" {
+			continue
+		}
+		seen[name] = true
+	}
+	missing := make([]string, 0, len(official))
+	for _, name := range official {
+		if !seen[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > shapeDecisionMissingCap {
+		missing = missing[:shapeDecisionMissingCap]
+	}
+	officialSet := officialToolNameSet()
+	extra := make([]string, 0)
+	extrasSeen := make(map[string]bool, len(declared))
+	for _, name := range declared {
+		if name == "" || officialSet[name] || extrasSeen[name] {
+			continue
+		}
+		extrasSeen[name] = true
+		extra = append(extra, name)
+	}
+	return ShapeDecision{
+		Mode:            shapeDecisionMode(mode),
+		ClientTools:     clientTools,
+		OutboundTools:   outbound,
+		OfficialSetSize: len(official),
+		MissingOfficial: missing,
+		ExtraClient:     extra,
+		Reason:          reason,
+	}
+}
+
+// recordShapeDecision 落一次决策：更新最近决策、累加模式计数、打一条结构化日志。
+//
+// 日志格式固定为单行 key=value，gateway.log 里直接
+// `grep 'tool_shape mode=rename_complete'` 即可定位走到改名+补全的全集。
+func recordShapeDecision(decision ShapeDecision) {
+	decision.Mode = shapeDecisionMode(decision.Mode)
+	// 拷贝一份切片：调用方（summarizeShapeDecision）每次都给新切片，但这里
+	// 不依赖那个约定——入参的底层数组不能与锁内状态共享，否则双方都可能在
+	// 无锁的情况下读写同一段内存。
+	decision.MissingOfficial = append([]string{}, decision.MissingOfficial...)
+	decision.ExtraClient = append([]string{}, decision.ExtraClient...)
+	shapeState.mu.Lock()
+	shapeState.last = decision
+	shapeState.hasLast = true
+	if shapeState.counts == nil {
+		shapeState.counts = map[string]int{}
+	}
+	shapeState.counts[decision.Mode]++
+	shapeState.mu.Unlock()
+
+	log.Printf("tool_shape mode=%s client_tools=%d outbound_tools=%d official_set_size=%d missing_official=[%s] extra_client=[%s] reason=%q",
+		decision.Mode, decision.ClientTools, decision.OutboundTools, decision.OfficialSetSize,
+		strings.Join(decision.MissingOfficial, ","), strings.Join(decision.ExtraClient, ","),
+		decision.Reason)
+}
+
+// LastShapeDecision 返回最近一次整形决策；进程内还没发生过整形时返回 false。
+func LastShapeDecision() (ShapeDecision, bool) {
+	shapeState.mu.RLock()
+	defer shapeState.mu.RUnlock()
+	if !shapeState.hasLast {
+		return ShapeDecision{}, false
+	}
+	out := shapeState.last
+	out.MissingOfficial = append([]string{}, shapeState.last.MissingOfficial...)
+	out.ExtraClient = append([]string{}, shapeState.last.ExtraClient...)
+	return out, true
+}
+
+// ShapeDecisionCounters 返回每种 Mode 各发生过多少次。
+//
+// 四个模式恒定在场（没发生过就是 0），调用方拿到的是一份独立 map。
+func ShapeDecisionCounters() map[string]int {
+	counters := map[string]int{
+		shapeModePassthrough:    0,
+		shapeModeChannel:        0,
+		shapeModeRenameComplete: 0,
+		shapeModeNone:           0,
+	}
+	shapeState.mu.RLock()
+	defer shapeState.mu.RUnlock()
+	for mode, count := range shapeState.counts {
+		counters[mode] = count
+	}
+	return counters
+}
+
+// shapeDecisionNode 是 ShapeDecision 在 /health 里的线上形状（snake_case）。
+type shapeDecisionNode struct {
+	Mode            string   `json:"mode"`
+	ClientTools     int      `json:"client_tools"`
+	OutboundTools   int      `json:"outbound_tools"`
+	OfficialSetSize int      `json:"official_set_size"`
+	MissingOfficial []string `json:"missing_official"`
+	ExtraClient     []string `json:"extra_client"`
+	Reason          string   `json:"reason"`
+}
+
+// shapeHealthNode 是 /health 里 "tool_shape" 的完整值。
+type shapeHealthNode struct {
+	Last   *shapeDecisionNode `json:"last"`
+	Counts map[string]int     `json:"counts"`
+}
+
+// ShapeHealthJSON 渲染 /health 的 "tool_shape" 值。
+//
+// 还没发生过整形时 last 为 null、counts 为零值，序列化不会失败也不会报错；
+// 万一 JSON 编码失败（不该发生，字段全是基础类型）也返回等价的安全形状，
+// 保证 /health 永远可读。
+func ShapeHealthJSON() string {
+	payload := shapeHealthNode{Counts: ShapeDecisionCounters()}
+	if decision, ok := LastShapeDecision(); ok {
+		missing := decision.MissingOfficial
+		if missing == nil {
+			missing = []string{}
+		}
+		extra := decision.ExtraClient
+		if extra == nil {
+			extra = []string{}
+		}
+		payload.Last = &shapeDecisionNode{
+			Mode:            decision.Mode,
+			ClientTools:     decision.ClientTools,
+			OutboundTools:   decision.OutboundTools,
+			OfficialSetSize: decision.OfficialSetSize,
+			MissingOfficial: missing,
+			ExtraClient:     extra,
+			Reason:          decision.Reason,
+		}
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return `{"last":null,"counts":{"channel":0,"none":0,"passthrough":0,"rename_complete":0}}`
+	}
+	return string(raw)
+}
+
 func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenames, bool) {
 	renames := NewToolRenames()
 	used := map[string]bool{}
@@ -901,6 +1130,10 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 		rewriteChannelHistory(payload, protocol)
 		// tool_choice 指向的是客户端名：不改写的话上游看到未声明工具直接报错。
 		rewriteChannelToolChoice(payload, protocol)
+		// 观测：通道分支的出站形状与判定理由（不参与上面的任何条件）。
+		recordShapeDecision(summarizeShapeDecision(
+			shapeModeChannel, len(items), clientToolNames(ranked, protocol), toolCount(payload),
+			"ZEN_TOOL_CHANNEL is set and the client toolset is not the complete official set; client tools collapsed into official channel stubs"))
 		return renames, true
 	}
 
@@ -923,6 +1156,9 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	// 而把同一份 body 交给改名路径的 opencode2api 8/8 全 200。
 	// 所以透传必须要求集合**完整**，子集一律走改名+补全。
 	if len(ranked) > 0 && completeOfficialToolset(ranked, protocol) {
+		recordShapeDecision(summarizeShapeDecision(
+			shapeModePassthrough, len(items), clientToolNames(ranked, protocol), toolCount(payload),
+			"client declared the complete official tool set; passed through verbatim"))
 		return renames, false
 	}
 	for _, entry := range ranked {
@@ -961,6 +1197,18 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	// 这里保留补集行为，让非官方客户端仍能被上游接受。
 	shaped = append(shaped, official...)
 	payload["tools"] = shaped
+	// 观测：改名+补全分支。客户端一个工具都没声明时（len(ranked)==0，例如
+	// tool_choice:none 被剥空的上游请求）没有任何名字被改，只补了官方桩，
+	// 这一档单独记 none，免得和"有客户端工具被改名"混在一起看不出差别。
+	{
+		mode := shapeModeRenameComplete
+		reason := "client tool names are not the complete official set"
+		if len(ranked) == 0 {
+			mode = shapeModeNone
+			reason = "client declared no tools; nothing to rename, only the official stub set was appended"
+		}
+		recordShapeDecision(summarizeShapeDecision(mode, len(items), declaredNames, len(shaped), reason))
+	}
 	if protocol == FmtChat || protocol == FmtResponses {
 		bindOfficialToolAliases(renames, declaredNames, v2OfficialToolOrder)
 		declared := make(map[string]string, len(declaredNames))

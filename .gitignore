@@ -43,3 +43,7 @@ last_429_*.json
 
 # 资产注入时留的原文件备份（scripts/sync_assets.sh）
 tools/*.json.orig
+
+# Python 工具运行时产生的缓存（tools/*.py）
+__pycache__/
+*.pyc

@@ -20,12 +20,13 @@ on:
         required: false
         default: "all"
       egress:
-        description: "出口：direct = runner 直连；warp = Cloudflare WARP"
+        description: "出口：direct = runner 直连；warp = Cloudflare WARP；vpngate = VPN Gate 节点 + sing-box"
         required: false
         type: choice
         options:
           - direct
           - warp
+          - vpngate
         default: "direct"
   schedule:
     # 每天一次；避开 UTC 03:00（资产抓包窗口）

@@ -1,0 +1,72 @@
+name: cmp-binaries
+
+# 对比「生产模板里那份二进制」与「当前 HEAD 构建」的出站 body。
+#
+# 为什么不用某个源码 commit 当基准：生产部署的 bin/zen-direct 不是从当前源码
+# 构建的（符号、字符串都对不上），拿源码 commit 比会得出错误结论。
+# 这里直接把模板目录里的那份二进制跑起来抓流量。
+
+on:
+  workflow_dispatch:
+    inputs:
+      cap:
+        description: 请求体夹具
+        required: false
+        default: 'tools/fixtures/dsh_capture.json'
+      old_bin_url:
+        description: 生产二进制的下载地址（可选；留空则用仓库里的 prod-bin.b64）
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  cmp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: 构建 HEAD
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags "-s -w -X main.appVersion=head" -o zen-new .
+          ls -l zen-new
+
+      - name: 准备生产二进制（从节点仓库下载正在跑的那份）
+        env:
+          OLD_BIN_URL: ${{ github.event.inputs.old_bin_url || 'https://raw.githubusercontent.com/xia35480/zen2-1101-0937/main/bin/zen-direct' }}
+        run: |
+          set -euo pipefail
+          echo "下载 $OLD_BIN_URL"
+          curl -fsSL --retry 3 "$OLD_BIN_URL" -o zen-old
+          chmod +x zen-old
+          ls -l zen-old
+          sha256sum zen-old
+
+      - name: 对比出站 body
+        env:
+          CAP: ${{ github.event.inputs.cap || 'tools/fixtures/dsh_capture.json' }}
+        run: |
+          set -uo pipefail
+          python3 tools/cmp_binaries.py "$CAP" old ./zen-old new ./zen-new 2>&1 | tee cmp.log
+          {
+            echo ""
+            echo "### 生产二进制 vs HEAD 出站对比"
+            echo '```'
+            cat cmp.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cmp-${{ github.run_id }}
+          path: cmp.log
+          retention-days: 7
+          if-no-files-found: warn

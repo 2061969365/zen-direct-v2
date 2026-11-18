@@ -1380,13 +1380,18 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 		}
 		shaped = append(shaped, entry)
 	}
-	// 第三方客户端工具重命名并脱敏后，若缺官方名则补上官方集。
-	//
 	// 上游的判定是“工具名集合是否为官方原样”，所以补官方集本身就是给
 	// 第三方工具打通行证。2026-11-16 实测：只发一个官方名 read（描述/参数
 	// 自定义）即可 200，非官方名 pwsh 一律 429——放行的不是描述，是名字集合。
 	// 这里保留补集行为，让非官方客户端仍能被上游接受。
-	shaped = append(shaped, official...)
+	//
+	// ZEN_NO_STUB=1 时不补（仅供实验）：用来回答「补桩是否必需」以及
+	// 「出站工具数超限是不是 429 的成因」。DSH 发 45 个工具、补桩后 59 个，
+	// 实测同一出口 12/20/30 个入参都 200、40 个入参（出站 54）就 429，
+	// 所以必须能单独关掉补桩去测 45 个出站到底行不行。
+	if !noStubMode() {
+		shaped = append(shaped, official...)
+	}
 	payload["tools"] = shaped
 	// 观测：改名+补全分支。客户端一个工具都没声明时（len(ranked)==0，例如
 	// tool_choice:none 被剥空的上游请求）没有任何名字被改，只补了官方桩，
@@ -1655,6 +1660,20 @@ func sanitizeRankedTools(ranked []map[string]any, protocol Format) int {
 		}
 	}
 	return replaced
+}
+
+// noStubMode 报告是否跳过「补 14 个官方桩」。ZEN_NO_STUB=1/on/true/yes 时跳过。
+//
+// 只用于实验：回答「补桩是否必需」。DSH 发 45 个工具，补桩后出站 59 个，
+// 而同一出口实测 12/20/30 个入参（出站 26/34/44）都 200、40 个入参（出站 54）
+// 就 429 —— 所以要能单独关掉补桩，测 45 个出站本身行不行。
+// 生产不要开：不补桩时上游可能按“名字集合不是官方原样”直接拒。
+func noStubMode() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ZEN_NO_STUB"))) {
+	case "1", "on", "true", "yes":
+		return true
+	}
+	return false
 }
 
 // shapeReason 给 /health 和日志用的一句话判定理由。

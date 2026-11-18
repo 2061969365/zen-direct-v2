@@ -229,28 +229,6 @@ func sanitizeToolDescription(_ string, description string) (string, bool) {
 	return cleaned, replaced
 }
 
-// stubNeverCallSuffix 追加在官方桩描述末尾，劝模型不要选桩。
-//
-// 为什么需要它：桩存在的唯一目的是让上游看到**完整的官方工具集**（这是免费层
-// 放行条件），不是给模型用的。但桩用的是裸官方名（read/edit/write）且带完整
-// 真实描述，模型会优先选它；选中后网关还原映射里查不到对应客户端工具
-// （客户端可能只声明了 read_file），于是把裸名 read 原样发给客户端，
-// SDK 解析 tool_calls 时对不上，抛
-// `Expected 'function.name' to be a string.`，整轮对话失败。
-//
-// 措辞照搬 opencode2api 的 stubNeverCall：指令跟随强的模型会遵守。
-const stubNeverCallSuffix = " Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead."
-
-// stubNeverCallMode 报告是否给桩描述追加禁调后缀。
-// ZEN_STUB_NEVERCALL=0 关掉（对照实验用：验证加后缀会不会影响上游校验）。
-func stubNeverCallMode() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("ZEN_STUB_NEVERCALL"))) {
-	case "0", "off", "false", "no":
-		return false
-	}
-	return true
-}
-
 func renderOfficialTool(protocol Format, name string) map[string]any {
 	loadOfficialTools()
 	description := "Agent tool " + name
@@ -263,11 +241,6 @@ func renderOfficialTool(protocol Format, name string) map[string]any {
 	}
 	if name == "shell" {
 		description = v2ShellDescription(description)
-	}
-	// 桩只为过上游门禁存在，不该被模型选中。加禁调后缀降低误选概率。
-	// 用 ZEN_STUB_NEVERCALL=0 可关掉，做「加后缀是否影响上游校验」的对照。
-	if stubNeverCallMode() {
-		description += stubNeverCallSuffix
 	}
 	if protocol == FmtChat {
 		function := map[string]any{
@@ -1362,6 +1335,7 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 				// 三条描述都会触发 429，换成官方原文后同一请求体转 200。
 				description, _ := fn["description"].(string)
 				if cleaned, replaced := sanitizeToolDescription(wireName, description); replaced {
+					description = cleaned
 					fn["description"] = cleaned
 				}
 			}
@@ -1371,6 +1345,7 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 			}
 			description, _ := entry["description"].(string)
 			if cleaned, replaced := sanitizeToolDescription(wireName, description); replaced {
+				description = cleaned
 				entry["description"] = cleaned
 			}
 		}

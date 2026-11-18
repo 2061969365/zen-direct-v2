@@ -47,3 +47,9 @@ tools/*.json.orig
 # Python 工具运行时产生的缓存（tools/*.py）
 __pycache__/
 *.pyc
+
+# 提示词旧版本备份（本地留存，不入库）
+tools/opencode_prompt_v2.txt.bak-*
+
+# 本地调查摘要（不入库）
+docs/v1.1.0-summary.md

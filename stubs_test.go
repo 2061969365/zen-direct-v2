@@ -139,6 +139,8 @@ func TestStubDedupOnWire(t *testing.T) {
 	if seen[myToolWire] != 1 || seen[bashWire] != 1 {
 		t.Fatalf("别名映射不对：%v", seen)
 	}
+	// 描述逐字透传，不额外加任何标识：2026-11-18 实测给客户端工具描述嵌真名
+	// 标识（G 方案）对选桩率毫无影响（7/7 仍选桩），已移除该逻辑。
 	if desc[bashWire] != "client tool" {
 		t.Fatalf("别名描述应原样保留：%q", desc[bashWire])
 	}

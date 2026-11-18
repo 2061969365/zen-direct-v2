@@ -34,10 +34,14 @@ func promptFilePrompt() string {
 
 // opencodePromptMarker 是官方提示词的开头短语，测试与排障用来识别官方提示词。
 //
-// 注意：**不能**用它判定"客户端已经带了官方提示词"从而跳过注入。DSH / Pi 等
-// 客户端的自研提示词里也会引用这句话；一旦据此跳过，上游免费层门禁必 429
+// 注意：**不能**用它判定"客户端已经带了官方提示词"从而跳过注入。客户端的
+// 自研提示词里也可能引用这句话；一旦据此跳过，上游免费层门禁必 429
 // （2026-11-16 实测：DSH 全挂、Pi 正常，就是这条）。注入一律无条件执行。
-const opencodePromptMarker = "You are an AI agent running in OpenCode, a coding agent harness"
+//
+// 2026-11-19：正文从 102KB 的 DSH system prompt 换成官方 CLI 原文（8.5KB，
+// 来自 opencode2api 的 opencode_prompt_v2.txt），marker 随之改为官方首句。
+// 原 102KB 版本留在 tools/opencode_prompt_v2.txt.bak-dsh-102k。
+const opencodePromptMarker = "You are opencode, an interactive CLI tool"
 
 const opencodeSkills = `Skills provide specialized instructions and workflows for specific tasks.
 Use the skill tool to load a skill when a task matches its description.
@@ -69,33 +73,44 @@ func opencodeEnvironment(model string) string {
 	if platform == "windows" {
 		platform = "win32"
 	}
-	// 逐字对齐官方 CLI 2.2.5 抓包里的动态尾部（system prompt 的最后一段）。
+	// 逐字对齐官方 CLI 发出的动态尾部（system prompt 的最后一段）。
 	// 上游按完整 system prompt 指纹判定客户端身份，这段的措辞/空行/顺序
-	// 与官方不一致就会 429。工作目录与日期是仅有的动态量。
+	// 与官方不一致就会 429。工作目录、模型名与日期是仅有的动态量。
+	//
+	// 格式取自官方 CLI 原文（与 opencode2api 的 opencodeEnvironment 一致）：
+	// 首行声明模型身份，随后是 <env> 块。不再插入本机专属路径等自造内容——
+	// 那不是官方措辞，只会让指纹偏离。
+	apiModel := strings.TrimSpace(strings.TrimPrefix(model, "opencode/"))
+	if apiModel == "" {
+		apiModel = "unknown"
+	}
 	return strings.Join([]string{
-		"Today's date: " + time.Now().UTC().Format("Mon Jan 02 2006"),
-		"",
+		"You are powered by the model named " + apiModel + ". The exact model ID is opencode/" + apiModel,
 		"Here is some useful information about the environment you are running in:",
 		"<env>",
 		"  Working directory: " + opencodeWorkDir,
 		"  Workspace root folder: " + opencodeWorkDir,
 		"  Is directory a git repo: yes",
 		"  Platform: " + platform,
-		"  Prefer F:\\dsh-temp\\opencode over generic system temporary directories such as /tmp; it is pre-created and approved for external access.",
+		"  Today's date: " + time.Now().UTC().Format("Mon Jan 02 2006"),
 		"</env>",
-		"When you create a worktree outside the current working directory and intend to use it as your primary working directory, consider using `execute` to call `tools.opencode.session_move` and make the worktree the session's working directory.",
 	}, "\n")
 }
 
 func opencodeSystemPrompt(model string) string {
-	// 静态正文（94.8KB，含 219 个 skills）来自官方 CLI 2.2.5 抓包；
-	// 动态尾部由 opencodeEnvironment 逐字拼出。不再追加独立的 skills 段——
-	// 官方正文里已经包含完整的 <available_skills>。
+	// 静态正文（8.5KB 官方 CLI 原文，取自 opencode2api 的
+	// opencode_prompt_v2.txt）与动态尾部、skills 段逐字拼接。
+	//
+	// 2026-11-19 之前正文误存为 DSH 自己的 system prompt（102KB，含
+	// 「记忆自动写入协议」「REA reverse engineering」等本机规则），既浪费
+	// 上下文又与出站工具集语义冲突；那份留在
+	// tools/opencode_prompt_v2.txt.bak-dsh-102k。
 	body := opencodePromptV2
 	if override := promptFilePrompt(); override != "" {
 		body = override
 	}
-	return body + opencodeEnvironment(model)
+	// skills 段单独追加：官方正文不含 <available_skills>，由 CLI 运行时补。
+	return body + opencodeEnvironment(model) + "\n" + opencodeSkills
 }
 
 func injectOfficialSystemPrompt(payload map[string]any) bool {

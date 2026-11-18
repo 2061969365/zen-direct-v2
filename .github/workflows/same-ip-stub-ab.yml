@@ -45,6 +45,10 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 需要旧版 ref（tag v1.0.0 / 历史 commit），默认浅克隆不带这些。
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: actions/setup-go@v5
         with:
@@ -62,6 +66,12 @@ jobs:
 
           # 旧版：另一个 worktree
           OLD="$RUNNER_TEMP/old"; rm -rf "$OLD"
+          # tag 可能没随 checkout 拉下来，显式补一次再解析。
+          git fetch --tags --force origin >/dev/null 2>&1 || true
+          if ! git rev-parse --verify --quiet "$OLD_REF^{commit}" >/dev/null; then
+            echo "::error::解析不到旧版 ref：$OLD_REF（现有 tag：$(git tag --list | tail -8 | tr '\n' ' ')）"
+            exit 1
+          fi
           git worktree add -f --detach "$OLD" "$OLD_REF"
           ( cd "$OLD" && go build -trimpath -ldflags "-s -w -X main.appVersion=v-old" -o "$W/zen-old" . )
           echo "--- zen-old ($OLD_REF) ---"; ls -l "$W/zen-old"

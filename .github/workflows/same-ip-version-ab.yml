@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 35
     env:
       ROUNDS: ${{ github.event.inputs.rounds || '2' }}
-      OLD_REF: ${{ github.event.inputs.old_ref || '0bd5b09' }}
+      OLD_REF: ${{ github.event.inputs.old_ref || '6fb10d8' }}
     steps:
       - uses: actions/checkout@v4
         with:

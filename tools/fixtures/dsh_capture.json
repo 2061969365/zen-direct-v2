@@ -1,0 +1,686 @@
+{
+ "tools": [
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool anysearch_batch_search.",
+    "name": "anysearch_batch_search"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool anysearch_capabilities.",
+    "name": "anysearch_capabilities"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool anysearch_search.",
+    "name": "anysearch_search"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool ask_user_question.",
+    "name": "ask_user_question"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool create_goal.",
+    "name": "create_goal"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool dsh_im_group_file.",
+    "name": "dsh_im_group_file"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool dsh_im_group_history.",
+    "name": "dsh_im_group_history"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool dsh_im_return_file.",
+    "name": "dsh_im_return_file"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool edit.",
+    "name": "edit"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool exit_plan_mode.",
+    "name": "exit_plan_mode"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool get_goal.",
+    "name": "get_goal"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool glob.",
+    "name": "glob"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool grep.",
+    "name": "grep"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool interrupt_agent.",
+    "name": "interrupt_agent"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool job_kill.",
+    "name": "job_kill"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool job_list.",
+    "name": "job_list"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool job_output.",
+    "name": "job_output"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool list_agents.",
+    "name": "list_agents"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool present.",
+    "name": "present"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool purge_apply.",
+    "name": "purge_apply"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool purge_revert.",
+    "name": "purge_revert"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool purge_status.",
+    "name": "purge_status"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool pwsh.",
+    "name": "pwsh"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool read.",
+    "name": "read"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool read_image.",
+    "name": "read_image"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool schedule_create.",
+    "name": "schedule_create"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool schedule_delete.",
+    "name": "schedule_delete"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool schedule_list.",
+    "name": "schedule_list"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool schedule_update.",
+    "name": "schedule_update"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool send_message.",
+    "name": "send_message"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool skill.",
+    "name": "skill"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool spawn_teammate.",
+    "name": "spawn_teammate"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool subagent.",
+    "name": "subagent"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool subagent_fork.",
+    "name": "subagent_fork"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool team_task_create.",
+    "name": "team_task_create"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool team_task_get.",
+    "name": "team_task_get"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool team_task_list.",
+    "name": "team_task_list"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool team_task_update.",
+    "name": "team_task_update"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool todo_write.",
+    "name": "todo_write"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool update_goal.",
+    "name": "update_goal"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool wait_agent.",
+    "name": "wait_agent"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool web_fetch.",
+    "name": "web_fetch"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool web_search.",
+    "name": "web_search"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool workflow.",
+    "name": "workflow"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool write.",
+    "name": "write"
+   },
+   "type": "function"
+  }
+ ],
+ "model": "deepseek-v4.1-flash-free",
+ "messages": [
+  {
+   "role": "user",
+   "content": "say ok"
+  }
+ ]
+}

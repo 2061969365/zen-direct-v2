@@ -1,0 +1,111 @@
+name: same-ip-version-ab
+
+# 同出口双版本 A/B：**同一个 runner、同一个出口 IP**，先后启动 v0.9.39 与 HEAD，
+# 各发一次真实 DSH 抓包体，比较上游状态码。
+#
+# 为什么要同 runner：免费层按出口 IP 计量。跨节点对比时「A 的 IP 有额度、B 的 IP
+# 没额度」会让结论完全失真。这里两个版本共用 runner 的出口，IP 必然相同。
+# 交替顺序跑两轮（A→B、B→A），排除「谁先跑谁吃额度」的顺序偏差。
+#
+# 输入：
+#   rounds  轮数（默认 2，即 A→B + B→A）
+#   cap_b64 真实 DSH 请求体（base64）；留空则用仓库内 tools/fixtures/dsh_capture.json
+
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: 轮数（每轮两个版本，顺序交替）
+        required: false
+        default: '2'
+      old_ref:
+        description: 旧版本提交（默认 v0.9.39 对应的 0bd5b09）
+        required: false
+        default: '0bd5b09'
+
+permissions:
+  contents: read
+
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      ROUNDS: ${{ github.event.inputs.rounds || '2' }}
+      OLD_REF: ${{ github.event.inputs.old_ref || '0bd5b09' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: 编译两个版本
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags "-s -w -X main.appVersion=v0.9.40" -o zen-0.9.40 .
+          git worktree add /tmp/oldtree "$OLD_REF"
+          ( cd /tmp/oldtree && go build -trimpath -ldflags "-s -w -X main.appVersion=v0.9.39" -o "$GITHUB_WORKSPACE/zen-0.9.39" . )
+          ls -l zen-0.9.39 zen-0.9.40
+
+      - name: 确认两个二进制确实不同
+        run: |
+          set -euo pipefail
+          A=$(sha256sum zen-0.9.39 | cut -d' ' -f1)
+          B=$(sha256sum zen-0.9.40 | cut -d' ' -f1)
+          echo "old=$A"
+          echo "new=$B"
+          if [ "$A" = "$B" ]; then
+            echo "::error::两个二进制相同，A/B 无意义"
+            exit 1
+          fi
+
+      - name: 记录出口身份
+        run: |
+          set -uo pipefail
+          for i in 1 2 3; do
+            curl -s -m 15 https://api.ipify.org || true
+            echo
+            sleep 2
+          done
+
+      - name: 同出口 A/B（真实 DSH 抓包）
+        env:
+          DSH_CAP: ${{ github.workspace }}/tools/fixtures/dsh_capture.json
+          AB_OUT: ab_same_ip.json
+          BIN_OLD: ${{ github.workspace }}/zen-0.9.39
+          BIN_NEW: ${{ github.workspace }}/zen-0.9.40
+        run: |
+          set -uo pipefail
+          python3 tools/ab_same_ip.py 2>&1 | tee ab.log
+          rc=${PIPESTATUS[0]}
+          {
+            echo ""
+            echo "### 同出口双版本 A/B"
+            echo '```'
+            tail -45 ab.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: 网关日志（tool_shape / 429）
+        if: always()
+        run: |
+          set -uo pipefail
+          for f in /tmp/gw-*.log; do
+            [ -f "$f" ] || continue
+            echo "===== $f ====="
+            grep -E 'tool_shape|429|listening' "$f" | tail -15 || true
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: same-ip-ab-${{ github.run_id }}
+          path: |
+            ab_same_ip.json
+            ab.log
+          retention-days: 7
+          if-no-files-found: warn

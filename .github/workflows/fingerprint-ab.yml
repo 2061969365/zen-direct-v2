@@ -171,7 +171,7 @@ jobs:
           nohup ./sing-box run -c sb.json > singbox.log 2>&1 &
           echo $! > singbox.pid
           listen=0
-          for i in $(seq 1 25); do
+          for i in $(seq 1 30); do
             if port_open 18080; then listen=1; break; fi
             sleep 1
           done
@@ -181,10 +181,11 @@ jobs:
             exit 1
           fi
           ip=""
-          for i in $(seq 1 4); do
+          for i in $(seq 1 10); do
             ip=$(curl -s -m 25 --proxy http://127.0.0.1:18080 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || true)
             [ -n "$ip" ] && break
-            sleep 3
+            echo "  取出口 IP 第 $i 次未成功，等 5s"
+            sleep 5
           done
           if [ -z "$ip" ]; then
             echo "::error::vpngate 隧道取不到出口 IP"

@@ -90,9 +90,31 @@ jobs:
           curl -fsSL --retry 3 -o probe_and_select_vpngate.py \
             "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/probe_and_select_vpngate.py" || {
             echo "::error::取不到探测脚本"; exit 1; }
-          curl -fsSL --retry 3 -o pin_sb.py \
-            "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/pin_sb.py" || {
-            echo "::error::取不到 pin_sb.py"; exit 1; }
+          # pin_sb.py：把配置钉成唯一节点 + route.final 指向它。
+          # 理由见 tool-accuracy.yml：urltest 的 auto 会让 sing-box 报
+          # "endpoint is not ready yet"，所以必须钉死。
+          cat > pin_sb.py <<'PY'
+          import json
+          import sys
+
+          path = sys.argv[1]
+          cfg = json.load(open(path, encoding="utf-8"))
+          eps = cfg.get("endpoints") or []
+          if len(eps) != 1:
+              print(f"UNUSABLE endpoints={len(eps)}（要唯一节点；多了说明脚本走了兜底）", flush=True)
+              sys.exit(2)
+          ep = eps[0]
+          tag = ep.get("tag") or "vpngate-0"
+          ep["tag"] = tag
+          cfg["endpoints"] = [ep]
+          cfg["outbounds"] = [{"type": "direct", "tag": "direct"}]
+          cfg.setdefault("route", {})["final"] = tag
+          cfg.setdefault("log", {})["level"] = "info"
+          json.dump(cfg, open(path, "w", encoding="utf-8"), indent=2)
+          print("OK", ep.get("server"), ep.get("server_port"), tag, flush=True)
+          PY
+          python3 -c 'import ast,sys; ast.parse(open("pin_sb.py", encoding="utf-8").read())' \
+            && echo "pin_sb.py 语法 OK"
           ls -l
 
       - name: "Egress vpngate - pick clean node"

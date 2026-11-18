@@ -19,9 +19,9 @@ on:
         required: false
         default: '2'
       old_ref:
-        description: 旧版本提交（默认 v0.9.39 对应的 0bd5b09）
+        description: 旧版本提交（默认 6fb10d8，v0.9.39 行为的最后一个远端提交）
         required: false
-        default: '0bd5b09'
+        default: '6fb10d8'
 
 permissions:
   contents: read

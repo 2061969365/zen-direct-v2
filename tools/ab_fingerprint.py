@@ -210,7 +210,10 @@ def check_fixture(path):
         print("混了非官方名 → 两个版本都会走 rename_complete，测不到指纹差异")
         return 1
     descs = [((t.get("function") or {}).get("description") or "") for t in tools]
-    print("描述样本: %r" % descs[:3])
+    print("描述样本: %r" % descs[:2])
+    if os.environ.get("ALLOW_OFFICIAL_TEXT") == "1":
+        print("（ALLOW_OFFICIAL_TEXT=1：允许官方原文，用于验 execute 这类具体工具）")
+        return 0
     if any(d.startswith("Read a file or directory") or "Use when:" in d for d in descs):
         print("描述看着像官方原文 → 两版本都会 200，测不出差异")
         return 1

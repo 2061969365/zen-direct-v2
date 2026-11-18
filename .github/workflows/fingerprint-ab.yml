@@ -199,8 +199,38 @@ jobs:
           BIN_OLD: ${{ github.workspace }}/zen-0.9.39
           BIN_NEW: ${{ github.workspace }}/zen-0.9.40
           GATEWAY_PROXY: http://127.0.0.1:18080
+          ALLOW_OFFICIAL_TEXT: '1'
         run: |
           set -uo pipefail
+          # 先确认这条 vpngate 隧道此刻真的能吃 200，否则整轮 429 毫无意义。
+          # 用旧版二进制做一次最小请求（无工具），探到 200 才开跑。
+          echo "--- 隧道可用性预检 ---"
+          PRE_OK=0
+          for attempt in 1 2 3; do
+            PORT=18599 OPENCODE_ZEN_BASE="http://127.0.0.1:19500/inference/v1" \
+              HTTPS_PROXY=http://127.0.0.1:18080 HTTP_PROXY=http://127.0.0.1:18080 \
+              NO_PROXY=127.0.0.1,localhost \
+              "$GITHUB_WORKSPACE/zen-0.9.39" >/tmp/pre.log 2>&1 &
+            PPID_GW=$!
+            for i in $(seq 1 20); do
+              curl -fsS http://127.0.0.1:18599/health >/dev/null 2>&1 && break
+              sleep 0.5
+            done
+            CODE=$(curl -s -o /tmp/pre.json -w '%{http_code}' --noproxy '*' --max-time 100 \
+              -H 'content-type: application/json' \
+              -d '{"model":"deepseek-v4.1-flash-free","stream":false,"messages":[{"role":"user","content":"ok"}],"max_tokens":8}' \
+              http://127.0.0.1:18599/v1/chat/completions || echo 000)
+            kill $PPID_GW 2>/dev/null || true
+            echo "预检 #$attempt -> $CODE"
+            if [ "$CODE" = "200" ]; then PRE_OK=1; break; fi
+            sleep 5
+          done
+          if [ "$PRE_OK" != "1" ]; then
+            echo "::warning::vpngate 隧道此刻拿不到 200（出口被刷满），本轮结论无意义，跳过 A/B"
+            echo "PRE_OK=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "PRE_OK=1" >> "$GITHUB_ENV"
           python3 tools/ab_fingerprint.py 2>&1 | tee ab.log
           rc=${PIPESTATUS[0]}
           {

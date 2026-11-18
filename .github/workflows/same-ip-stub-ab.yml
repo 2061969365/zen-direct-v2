@@ -1,0 +1,359 @@
+name: same-ip-stub-ab
+
+# 同一个 runner、**同一个 vpngate 出口 IP**，交替打 v1.0.0 与 v1.0.3 两个二进制。
+#
+# 为什么必须这样做：免费额度按出口 IP 计量，跨 IP 对比无法区分「版本差异」
+# 和「额度差异」。只有固定出口、交替发同一份请求，差异才归因到版本。
+#
+# 测的不是字节相等，而是**ZCode 报的那个错**：
+#   模型选中官方桩后，网关把桩名发给客户端 → 客户端不认识 → SDK 抛
+#   `Expected 'function.name' to be a string.`
+# 所以每发都检查返回的 tool_calls 名是否落在客户端声明集合内。
+#
+# 输入：
+#   old_ref  v1.0.0 的 commit（默认 tag v1.0.0）
+#   vpmax    候选节点数上限
+#   rounds   每轮各打几发（两版本交替）
+
+on:
+  workflow_dispatch:
+    inputs:
+      old_ref:
+        description: '旧版 ref（默认 v1.0.0）'
+        required: false
+        default: 'v1.0.0'
+      vpmax:
+        description: 'vpngate 候选节点数'
+        required: false
+        default: '40'
+      rounds:
+        description: '每个版本的发送轮数上限'
+        required: false
+        default: '8'
+
+permissions:
+  contents: read
+
+env:
+  VPMAX: ${{ github.event.inputs.vpmax || '40' }}
+  ROUNDS: ${{ github.event.inputs.rounds || '8' }}
+  OLD_REF: ${{ github.event.inputs.old_ref || 'v1.0.0' }}
+
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: 编译两个版本
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/ab"; mkdir -p "$W"
+          echo "WORK=$W" >> "$GITHUB_ENV"
+
+          # 新版：当前 checkout
+          go build -trimpath -ldflags "-s -w -X main.appVersion=v-new" -o "$W/zen-new" .
+          echo "--- zen-new ---"; ls -l "$W/zen-new"
+
+          # 旧版：另一个 worktree
+          OLD="$RUNNER_TEMP/old"; rm -rf "$OLD"
+          git worktree add -f --detach "$OLD" "$OLD_REF"
+          ( cd "$OLD" && go build -trimpath -ldflags "-s -w -X main.appVersion=v-old" -o "$W/zen-old" . )
+          echo "--- zen-old ($OLD_REF) ---"; ls -l "$W/zen-old"
+          sha256sum "$W/zen-old" "$W/zen-new"
+
+      - name: 装 sing-box + vpngate 工具箱
+        run: |
+          set -euo pipefail
+          VD="$RUNNER_TEMP/vp"; mkdir -p "$VD"; cd "$VD"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl jq python3 >/dev/null
+
+          echo "--- VPN Gate 节点快照"
+          curl -fsSL --retry 3 -o nodes.csv "https://www.vpngate.net/api/iphone/" \
+            || { echo "::error::取不到 VPN Gate 快照"; exit 1; }
+          wc -l nodes.csv
+
+          echo "--- sing-box（必须 1.11+）"
+          sb_tag=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+          ver="${sb_tag#v}"
+          curl -fsSL -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${sb_tag}/sing-box-${ver}-linux-amd64.tar.gz"
+          tar xz --strip-components=1 -f sb.tar.gz "sing-box-${ver}-linux-amd64/sing-box"
+          chmod +x sing-box; ./sing-box version | head -2
+
+          echo "--- 探测脚本（必须同目录）"
+          curl -fsSL --retry 3 -o probe_and_select_vpngate.py \
+            "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/probe_and_select_vpngate.py"
+          curl -fsSL --retry 3 -o vpngate_to_singbox.py \
+            "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/vpngate_to_singbox.py"
+          wc -l probe_and_select_vpngate.py vpngate_to_singbox.py
+
+          cat > pin_sb.py <<'PY'
+          import json
+          import sys
+
+          path = sys.argv[1]
+          cfg = json.load(open(path, encoding="utf-8"))
+          eps = cfg.get("endpoints") or []
+          if len(eps) != 1:
+              print(f"UNUSABLE endpoints={len(eps)}", flush=True)
+              sys.exit(2)
+          ep = eps[0]
+          tag = ep.get("tag") or "vpngate-0"
+          ep["tag"] = tag
+          cfg["endpoints"] = [ep]
+          cfg["outbounds"] = [{"type": "direct", "tag": "direct"}]
+          cfg.setdefault("route", {})["final"] = tag
+          cfg.setdefault("log", {})["level"] = "info"
+          json.dump(cfg, open(path, "w", encoding="utf-8"), indent=2)
+          print("OK", ep.get("server"), ep.get("server_port"), tag, flush=True)
+          PY
+          python3 -c 'import ast; ast.parse(open("pin_sb.py", encoding="utf-8").read())'
+
+      - name: 选一个 vpngate 节点（用旧版做探针）
+        run: |
+          set -uo pipefail
+          W="$WORK"; VD="$RUNNER_TEMP/vp"
+          cd "$VD"
+          ok=0
+          for attempt in 1 2 3; do
+            echo "--- 第 $attempt/3 次选节点（最多 $VPMAX 个候选）"
+            set +e
+            python3 probe_and_select_vpngate.py \
+              --csv nodes.csv --output "$VD/sb.json" \
+              --zen-bin "$W/zen-old" --singbox-bin "$VD/sing-box" \
+              --mixed-port 18080 --max-candidates "$VPMAX" \
+              --concurrency 8 --keep-nodes 1 > "select-$attempt.log" 2>&1
+            rc=$?
+            set -e
+            tail -30 "select-$attempt.log" || true
+            [ "$rc" != "0" ] && { echo "第 $attempt 次失败 rc=$rc"; continue; }
+            [ ! -s sb.json ] && { echo "第 $attempt 次没产出 sb.json"; continue; }
+            if ! line=$(python3 pin_sb.py sb.json); then
+              echo "第 $attempt 次配置不可用（$line）"; continue
+            fi
+            echo "选定节点：$line"
+            read -r _ srv prt tag <<< "$line"
+            echo "VPN_NODE=$srv:$prt" >> "$GITHUB_ENV"
+            ok=1; break
+          done
+          [ "$ok" = "1" ] || { echo "::error::vpngate 选不出节点"; exit 1; }
+
+      - name: 起 sing-box（固定出口）
+        run: |
+          set -uo pipefail
+          VD="$RUNNER_TEMP/vp"; cd "$VD"
+          port_open() {
+            python3 -c "import socket,sys; s=socket.socket(); s.settimeout(1); sys.exit(0 if s.connect_ex(('127.0.0.1', int(sys.argv[1])))==0 else 1)" "$1"
+          }
+          nohup ./sing-box run -c sb.json > singbox.log 2>&1 &
+          echo $! > singbox.pid
+          for i in $(seq 1 30); do port_open 18080 && break; sleep 1; done
+          port_open 18080 || { echo "::error::sing-box 未监听 18080"; tail -40 singbox.log; exit 1; }
+          echo "--- 出口 IP（两版本共用这一个）"
+          ip=$(curl -s -m 25 -x http://127.0.0.1:18080 https://api.ipify.org || true)
+          echo "EGRESS_IP=$ip" >> "$GITHUB_ENV"
+          echo "出口 IP = $ip"
+
+      - name: 两版本交替打同一份请求
+        env:
+          PROXY: http://127.0.0.1:18080
+        run: |
+          set -uo pipefail
+          W="$WORK"
+          cat > "$W/ab.py" <<'PY'
+          import json, os, subprocess, sys, time, urllib.request, urllib.error
+
+          WORK = os.environ["WORK"]
+          PROXY = os.environ["PROXY"]
+          ROUNDS = int(os.environ.get("ROUNDS", "8"))
+          EGRESS = os.environ.get("EGRESS_IP", "?")
+
+          BINS = [("v1.0.0", os.path.join(WORK, "zen-old")),
+                  ("v1.0.3", os.path.join(WORK, "zen-new"))]
+
+          # ZCode 式客户端：声明非官方名工具（read_file / shell_write），
+          # 这样网关必须走「改名+补桩」，桩才会出现在出站里。
+          CLIENT_TOOLS = [
+              {"type": "function", "function": {
+                  "name": "read_file", "description": "Read a file from disk.",
+                  "parameters": {"type": "object",
+                                 "properties": {"path": {"type": "string"}},
+                                 "required": ["path"]}}},
+              {"type": "function", "function": {
+                  "name": "shell_write", "description": "Write text to a file.",
+                  "parameters": {"type": "object",
+                                 "properties": {"path": {"type": "string"},
+                                                "text": {"type": "string"}},
+                                 "required": ["path", "text"]}}},
+          ]
+          DECLARED = {t["function"]["name"] for t in CLIENT_TOOLS}
+
+          def wait_health(port, timeout=90):
+              end = time.time() + timeout
+              while time.time() < end:
+                  try:
+                      urllib.request.urlopen("http://127.0.0.1:%d/health" % port, timeout=3).read()
+                      return True
+                  except Exception:
+                      time.sleep(0.5)
+              return False
+
+          def start(binary, port):
+              env = dict(os.environ)
+              env.update({"PORT": str(port),
+                          "PROXY_URL": PROXY,
+                          "NO_PROXY": "127.0.0.1,localhost",
+                          "OPENCODE_ZEN_BASE": "https://opencode.ai/inference/v1"})
+              log = open(os.path.join(WORK, "gw-%d.log" % port), "wb")
+              p = subprocess.Popen([binary], env=env, stdout=log, stderr=subprocess.STDOUT)
+              return p, log
+
+          def health(port):
+              try:
+                  return json.loads(urllib.request.urlopen(
+                      "http://127.0.0.1:%d/health" % port, timeout=10).read())
+              except Exception:
+                  return {}
+
+          def call(port, prompt, timeout=150):
+              body = {"model": "deepseek-v4.1-flash-free",
+                      "messages": [{"role": "user", "content": prompt}],
+                      "tools": CLIENT_TOOLS, "max_tokens": 120,
+                      "tool_choice": "required"}
+              req = urllib.request.Request(
+                  "http://127.0.0.1:%d/v1/chat/completions" % port,
+                  data=json.dumps(body).encode(),
+                  headers={"content-type": "application/json"})
+              try:
+                  return 200, json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+              except urllib.error.HTTPError as exc:
+                  return exc.code, exc.read().decode("utf-8", "replace")[:300]
+              except Exception as exc:
+                  return 0, "%s: %s" % (type(exc).__name__, exc)
+
+          def inspect(payload):
+              """返回 (tool_calls 名列表, 非法名列表, 是否泄漏桩名)。"""
+              names, bad = [], []
+              if not isinstance(payload, dict):
+                  return names, bad, False
+              for choice in payload.get("choices") or []:
+                  msg = choice.get("message") or {}
+                  for tc in msg.get("tool_calls") or []:
+                      fn = tc.get("function") or {}
+                      n = fn.get("name")
+                      names.append(n)
+                      if not isinstance(n, str) or not n.strip():
+                          bad.append(n)
+                      elif n not in DECLARED:
+                          bad.append("%s(未声明)" % n)
+              return names, bad, False
+
+          PROMPTS = [
+              "Read the file README.md using read_file.",
+              "Write the text 'hi' to /tmp/a.txt using shell_write.",
+              "List what tools you have.",
+          ]
+
+          procs = []
+          summary = {}
+          try:
+              ports = {}
+              for i, (label, binary) in enumerate(BINS):
+                  port = 18200 + i
+                  p, log = start(binary, port)
+                  procs.append((p, log))
+                  ports[label] = port
+                  if not wait_health(port):
+                      print("%s 网关起不来" % label)
+                      sys.exit(1)
+                  print("%-8s port=%d 起好" % (label, port))
+              print("出口 IP =", EGRESS)
+              print()
+
+              for rnd in range(ROUNDS):
+                  for label, _ in BINS:
+                      port = ports[label]
+                      prompt = PROMPTS[rnd % len(PROMPTS)]
+                      code, payload = call(port, prompt)
+                      h = health(port)
+                      shape = ((h.get("tool_shape") or {}).get("last") or {})
+                      names, bad, _ = inspect(payload)
+                      key = label
+                      s = summary.setdefault(key, {"200": 0, "quota": 0,
+                                                   "bad": 0, "n": 0, "modes": set()})
+                      s["n"] += 1
+                      if shape.get("mode"):
+                          s["modes"].add(shape["mode"])
+                      if code == 200:
+                          s["200"] += 1
+                      if code == 429 or "FreeUsageLimit" in str(payload):
+                          s["quota"] += 1
+                      if bad:
+                          s["bad"] += 1
+                      print("r%-2d %-8s http=%-4s mode=%-16s out=%-3s names=%s%s" % (
+                          rnd + 1, label, code, shape.get("mode") or "-",
+                          shape.get("outbound_tools") or "-", names[:3],
+                          "" if not bad else "  <<< 非法:%s" % bad[:2]))
+                      time.sleep(3)
+          finally:
+              for p, log in procs:
+                  p.terminate()
+                  try: p.wait(timeout=10)
+                  except Exception: p.kill()
+                  log.close()
+
+          print()
+          print("=" * 78)
+          print("汇总（同一出口 IP = %s）" % EGRESS)
+          for label, _ in BINS:
+              s = summary.get(label)
+              if not s:
+                  continue
+              print("  %-8s 发 %d  200=%d  429/额度=%d  非法工具名=%d  分支=%s" % (
+                  label, s["n"], s["200"], s["quota"], s["bad"],
+                  ",".join(sorted(s["modes"])) or "-"))
+          old = summary.get("v1.0.0", {})
+          new = summary.get("v1.0.3", {})
+          print()
+          if old.get("bad", 0) > 0 and new.get("bad", 0) == 0:
+              print("结论：旧版有非法工具名 %d 次，新版 0 次 —— 修复生效" % old["bad"])
+          elif old.get("bad", 0) == 0 and new.get("bad", 0) == 0:
+              print("结论：两版都没出现非法工具名（本轮可能未触发桩被选中）")
+          elif new.get("bad", 0) > 0:
+              print("结论：新版仍有 %d 次非法工具名 —— 未修好" % new["bad"])
+          PY
+          WORK="$W" PROXY="$PROXY" ROUNDS="$ROUNDS" EGRESS_IP="${EGRESS_IP:-?}" python3 "$W/ab.py" 2>&1 | tee "$W/ab.log"
+
+      - name: 停机并汇总
+        if: always()
+        run: |
+          set -uo pipefail
+          VD="$RUNNER_TEMP/vp"
+          [ -f "$VD/singbox.pid" ] && kill "$(cat "$VD/singbox.pid")" 2>/dev/null || true
+          W="$RUNNER_TEMP/ab"
+          {
+            echo ""
+            echo "### 同出口双版本对比"
+            echo ""
+            echo "- 出口 IP: \`${EGRESS_IP:-?}\`"
+            echo "- vpngate 节点: \`${VPN_NODE:-?}\`"
+            echo '```'
+            tail -40 "$W/ab.log" 2>/dev/null || echo "(无日志)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: same-ip-ab-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/ab/*.log
+            ${{ runner.temp }}/vp/singbox.log
+          retention-days: 7
+          if-no-files-found: warn

@@ -115,11 +115,19 @@ def health(port):
 
 
 def run_once(label, binary, gw_port, body):
+    """跑一个版本。
+
+    走 vpngate 时不能用本地桩：网关把 HTTP(S)_PROXY 当全局代理，loopback 也会被
+    塞进 sing-box，本地桩必然 502。所以 USE_SINK=0 时让网关直连真实上游，只看
+    状态码与 /health 的 branch；出站字节另有离线对拍覆盖。
+    """
+    use_sink = os.environ.get("USE_SINK", "0" if GATEWAY_PROXY else "1") == "1"
     with _lock:
         _seen.clear()
     env = dict(os.environ)
     env.update({"PORT": str(gw_port),
-                "OPENCODE_ZEN_BASE": "http://127.0.0.1:%d/inference/v1" % SINK_PORT,
+                "OPENCODE_ZEN_BASE": ("http://127.0.0.1:%d/inference/v1" % SINK_PORT)
+                if use_sink else UPSTREAM,
                 "NO_PROXY": "127.0.0.1,localhost",
                 "no_proxy": "127.0.0.1,localhost"})
     env.pop("ZEN_SHAPE_MODE", None)
@@ -228,9 +236,14 @@ def main():
     print("网关出口代理: %s" % (GATEWAY_PROXY or "（直连）"))
 
     rounds_n = int(os.environ.get("ROUNDS", "2"))
-    srv = ThreadingHTTPServer(("127.0.0.1", SINK_PORT), Sink)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    time.sleep(1)
+    use_sink = os.environ.get("USE_SINK", "0" if GATEWAY_PROXY else "1") == "1"
+    srv = None
+    if use_sink:
+        srv = ThreadingHTTPServer(("127.0.0.1", SINK_PORT), Sink)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        time.sleep(1)
+    else:
+        print("本地桩关闭：网关直连真实上游（走代理时 loopback 会被 sing-box 吃掉）")
 
     results = []
     try:
@@ -250,7 +263,8 @@ def main():
                           % (d.get("read") or d.get("mcp__read"),
                              d.get("edit") or d.get("mcp__edit")))
     finally:
-        srv.shutdown()
+        if srv is not None:
+            srv.shutdown()
 
     json.dump(results, open(OUT, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     print("\n" + "=" * 70)

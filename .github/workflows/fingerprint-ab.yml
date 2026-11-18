@@ -63,6 +63,8 @@ jobs:
           [ "$A" != "$B" ] || { echo "::error::两个二进制相同"; exit 1; }
 
       - name: 校验夹具是这个场景（全部官方名 + 非官方文本）
+        env:
+          ALLOW_OFFICIAL_TEXT: '1'
         run: |
           set -euo pipefail
           python3 tools/ab_fingerprint.py --check "$CAP_FILE" || {

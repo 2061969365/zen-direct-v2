@@ -90,6 +90,9 @@ jobs:
           curl -fsSL --retry 3 -o probe_and_select_vpngate.py \
             "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/probe_and_select_vpngate.py" || {
             echo "::error::取不到探测脚本"; exit 1; }
+          curl -fsSL --retry 3 -o vpngate_to_singbox.py \
+            "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/vpngate_to_singbox.py" || {
+            echo "::error::取不到 vpngate_to_singbox.py"; exit 1; }
           # pin_sb.py：把配置钉成唯一节点 + route.final 指向它。
           # 理由见 tool-accuracy.yml：urltest 的 auto 会让 sing-box 报
           # "endpoint is not ready yet"，所以必须钉死。

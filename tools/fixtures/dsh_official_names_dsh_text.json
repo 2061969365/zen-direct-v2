@@ -1,0 +1,116 @@
+{
+ "model": "deepseek-v4.1-flash-free",
+ "tools": [
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool edit.",
+    "name": "edit"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool glob.",
+    "name": "glob"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool grep.",
+    "name": "grep"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool read.",
+    "name": "read"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool skill.",
+    "name": "skill"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool subagent.",
+    "name": "subagent"
+   },
+   "type": "function"
+  },
+  {
+   "function": {
+    "parameters": {
+     "properties": {
+      "arg": {
+       "type": "string"
+      }
+     },
+     "type": "object"
+    },
+    "description": "Tool write.",
+    "name": "write"
+   },
+   "type": "function"
+  }
+ ],
+ "messages": [
+  {
+   "role": "user",
+   "content": "say ok"
+  }
+ ]
+}

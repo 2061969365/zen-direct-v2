@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 )
 
@@ -85,29 +84,32 @@ func reverseStrings(in []string) []string {
 	return out
 }
 
-// TestOfficialSubsetFallsThroughToRename 锁 exact 档的行为：官方名子集必须
-// 改名+补全（2026-11-17 实测「官方名 + 非官方文本」整份透传会 429）。
-// 默认档改成 subset 之后这条仍要能通过 ZEN_SHAPE_MODE=exact 复现。
-func TestOfficialSubsetFallsThroughToRename(t *testing.T) {
-	t.Setenv("ZEN_SHAPE_MODE", "exact")
+// TestOfficialSubsetPassesThroughVerbatim 锁定 v1.0 的 subset 契约：
+// 客户端工具名只要**全部落在官方集合内**，整份原样透传——不改名、不补桩。
+//
+// 依据：2026-11-18 shape-acceptance 在 vpngate 单节点实测 6/6 全 200
+// （12 原始定义 / 13 / 14 / 12 改写 / 12 参数级 DSH 文本 / 12 工具级被判原句），
+// 前提是透传前用 sanitizeRankedTools 洗掉工具级指纹短语。
+//
+// 注意：这是 v1.0 起**唯一**的透传判据，exact 档已移除；线上名也已是写死的
+// 哈希名，所以透传时客户端工具名保持原样，不经过哈希改写。
+func TestOfficialSubsetPassesThroughVerbatim(t *testing.T) {
 	for _, subset := range [][]string{{"read"}, {"read", "edit"}, {"read", "edit", "write", "patch"}} {
 		payload := officialSubsetPayload(t, subset)
 		_, shaped := renameAndCompleteTools(payload, FmtChat)
-		if !shaped {
-			t.Fatalf("subset %v must be shaped, not passed through verbatim", subset)
+		if shaped {
+			t.Fatalf("subset %v 应当整份透传，不该走改名+补全", subset)
 		}
 		out := asArr(payload["tools"])
-		if len(out) != len(subset)+len(v2OfficialToolOrder) {
-			t.Fatalf("subset %v: outbound tools = %d, want %d", subset, len(out), len(subset)+len(v2OfficialToolOrder))
+		if len(out) != len(subset) {
+			t.Fatalf("subset %v: 出站 %d 个，want %d（不补桩）", subset, len(out), len(subset))
 		}
 		for i := range subset {
 			name := entryToolName(asMap(out[i]), FmtChat)
-			if !strings.HasPrefix(name, ClientToolPrefix()) {
-				t.Fatalf("subset %v: outbound tool %d = %q, want %q prefix", subset, i, name, ClientToolPrefix())
+			if name != subset[i] {
+				t.Fatalf("subset %v: 出站第 %d 个名字 = %q, want %q（透传不改名）",
+					subset, i, name, subset[i])
 			}
-		}
-		if allOfficialToolNames(mapsFromArr(out), FmtChat) {
-			t.Fatalf("subset %v: outbound must not look like a pure official set", subset)
 		}
 	}
 }

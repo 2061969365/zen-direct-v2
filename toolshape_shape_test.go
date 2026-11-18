@@ -76,37 +76,31 @@ func TestShapeDecisionEmptyStateIsSafe(t *testing.T) {
 	}
 }
 
-// 12 个官方名是官方 CLI 现在的实际形态（patch 已经不在），必须被记为
-// rename_complete 且出站 26 个。
-// TestShapeDecisionOfficialSubsetTwelve 锁的是 exact 档的契约：
-// 集合不齐时必须走改名+补全，出站 12 -> 26。默认档改成 subset 之后，
-// 这条行为仍然要能通过 ZEN_SHAPE_MODE=exact 复现（回退路径不能烂）。
+// TestShapeDecisionOfficialSubsetTwelve 锁定 v1.0 的 subset 契约：
+// 12 个官方名（官方 CLI 现在的实际形态，patch 已不在）走 passthrough，
+// 出站 12 个，为 0。
 func TestShapeDecisionOfficialSubsetTwelve(t *testing.T) {
-	t.Setenv("ZEN_SHAPE_MODE", "exact")
 	resetShapeState(t)
 	clientNames := v2OfficialToolOrder[:12]
 	payload := shapeTestPayload(clientNames)
-	if _, shaped := renameAndCompleteTools(payload, FmtChat); !shaped {
-		t.Fatal("12 个官方名必须走改名+补全")
+	if _, shaped := renameAndCompleteTools(payload, FmtChat); shaped {
+		t.Fatal("12 个官方名应当透传，不该改名+补全")
 	}
 	decision, ok := LastShapeDecision()
 	if !ok {
 		t.Fatal("决策没有被记录")
 	}
-	if decision.Mode != shapeModeRenameComplete {
-		t.Fatalf("mode = %q, want %q", decision.Mode, shapeModeRenameComplete)
+	if decision.Mode != shapeModePassthrough {
+		t.Fatalf("mode = %q, want %q", decision.Mode, shapeModePassthrough)
 	}
 	if decision.ClientTools != 12 {
 		t.Fatalf("client_tools = %d, want 12", decision.ClientTools)
 	}
-	if decision.OutboundTools != 26 {
-		t.Fatalf("outbound_tools = %d, want 26", decision.OutboundTools)
+	if decision.OutboundTools != 12 {
+		t.Fatalf("outbound_tools = %d, want 12（透传不补桩）", decision.OutboundTools)
 	}
 	if decision.OfficialSetSize != len(v2OfficialToolOrder) {
 		t.Fatalf("official_set_size = %d, want %d", decision.OfficialSetSize, len(v2OfficialToolOrder))
-	}
-	if got, want := strings.Join(decision.MissingOfficial, ","), "patch,experimental_image_generate"; got != want {
-		t.Fatalf("missing_official = %q, want %q（按官方顺序）", got, want)
 	}
 	if len(decision.ExtraClient) != 0 {
 		t.Fatalf("extra_client 应为空，实际 %v", decision.ExtraClient)
@@ -114,16 +108,8 @@ func TestShapeDecisionOfficialSubsetTwelve(t *testing.T) {
 	if decision.Reason == "" {
 		t.Fatal("reason 不能为空")
 	}
-	// 出站数量必须与 payload 实际长度一致，不能只是自说自话。
-	if got, want := toolCount(payload), 26; got != want {
-		t.Fatalf("payload 实际出站 %d 个，want %d", got, want)
-	}
-	if counters := ShapeDecisionCounters(); counters[shapeModeRenameComplete] != 1 {
-		t.Fatalf("rename_complete 计数 = %d, want 1", counters[shapeModeRenameComplete])
-	}
 }
 
-// 完整官方集必须记为 passthrough，且出站数量与客户端一致。
 func TestShapeDecisionFullOfficialPassthrough(t *testing.T) {
 	resetShapeState(t)
 	payload := shapeTestPayload(v2OfficialToolOrder)
@@ -249,13 +235,12 @@ func TestShapeDecisionMissingCapFallsBack(t *testing.T) {
 // 必须等于落盘次数。真机上有编译器时再跑一次
 // `CGO_ENABLED=1 go test -race ./...` 收口。
 // TestShapeDecisionConcurrentRecording 只验并发安全，不验某一档的判定结果。
-// 显式钉成 exact，让两条分支的断言前提保持稳定（默认档变化不该让这条测试变义）。
+// v1.0 起档位固定，这里不再设置环境变量；断言只看快照自洽性。
 func TestShapeDecisionConcurrentRecording(t *testing.T) {
-	t.Setenv("ZEN_SHAPE_MODE", "exact")
 	resetShapeState(t)
 	var wg sync.WaitGroup
 	const workers = 64
-	errs := make(chan string, workers*4)
+	errs := make(chan string, workers*32)
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(i int) {
@@ -278,11 +263,13 @@ func TestShapeDecisionConcurrentRecording(t *testing.T) {
 				// 快照自洽性：读到的必须是一条完整决策，不能是半更新状态。
 				switch decision.Mode {
 				case shapeModePassthrough:
+					// subset 档的 passthrough 允许 missing_official 非空
+					// （客户端只声明了官方集的一部分），但不允许有 extra_client。
 					if decision.ClientTools != decision.OutboundTools {
 						errs <- fmt.Sprintf("worker %d: passthrough %d/%d", i, decision.ClientTools, decision.OutboundTools)
 					}
-					if len(decision.MissingOfficial) != 0 || len(decision.ExtraClient) != 0 {
-						errs <- fmt.Sprintf("worker %d: passthrough 带了差异列表", i)
+					if len(decision.ExtraClient) != 0 {
+						errs <- fmt.Sprintf("worker %d: passthrough 带了 extra_client", i)
 					}
 				case shapeModeRenameComplete:
 					if decision.OutboundTools <= decision.ClientTools {

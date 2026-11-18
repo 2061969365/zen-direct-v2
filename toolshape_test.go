@@ -5,27 +5,46 @@ import (
 	"testing"
 )
 
-// TestToolWireNameIsReadable 钉住新契约（2026-11-17 起）：线上名必须可读。
+// TestToolWireNameIsHashed 锁定线上名格式：**固定 mcp_<12位sha256> 哈希名**。
 //
-// 旧契约是"不透明"（mcp_<12hex>），模型只能靠描述猜工具，这是工具调用
-// 准确率的最大损失源，所以名字改成 mcp__<归一化原名>。不透明性不再是
-// 返回值，可逆性改由 ToolRenames 的映射表承担（见 toolshape_wirename_test.go）。
-func TestToolWireNameIsReadable(t *testing.T) {
+// 2026-11-18 实测（同节点同请求体，只改命名格式）：
+//
+//	哈希名 mcp_2d4f8285de96            → 200
+//	可读名 mcp__anysearch_batch_search  → 429
+//
+// 可读名与官方 MCP 的 mcp__<server>__<tool> 同形，像 mcp__read / mcp__edit
+// 会被上游判为冒充官方名并拒绝。所以这里断言名字必须是纯哈希，不含任何
+// 客户端语义（不能出现原名、也不能出现归一化后的原名）。
+func TestToolWireNameIsHashed(t *testing.T) {
 	used := map[string]bool{}
-	for _, client := range []string{"ScheduleWakeup", "ReportFindings", "Read", "Bash", "subagent_fork", "ops_bash"} {
+	clients := []string{"ScheduleWakeup", "ReportFindings", "Read", "Bash",
+		"subagent_fork", "ops_bash", "anysearch_batch_search"}
+	for _, client := range clients {
 		wireName := ClientToolWireName(client, used)
 		if !strings.HasPrefix(wireName, ClientToolPrefix()) {
 			t.Errorf("wire name %q does not carry the client prefix", wireName)
 		}
-		if !strings.HasPrefix(wireName, ClientToolPrefix()+"_") {
-			t.Errorf("wire name %q is missing the mcp__ separator (want %q)", wireName, ClientToolPrefix()+"_"+normalizeClientToolWireName(client))
+		body := strings.TrimPrefix(wireName, ClientToolPrefix())
+		body = strings.TrimSuffix(body, "_2")
+		body = strings.TrimSuffix(body, "_3")
+		if len(body) != clientToolDigestLength {
+			t.Errorf("wire name %q 主体长度 = %d, want %d（哈希名固定 12 位）",
+				wireName, len(body), clientToolDigestLength)
 		}
-		if len(wireName) > toolWireNameLimit {
-			t.Errorf("wire name %q is longer than %d bytes", wireName, toolWireNameLimit)
+		for _, ch := range body {
+			if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+				t.Errorf("wire name %q 主体含非 hex 字符 %q（说明不是哈希名）", wireName, ch)
+				break
+			}
 		}
-		want := ClientToolPrefix() + "_" + normalizeClientToolWireName(client)
+		want := ClientToolPrefix() + toolNameDigest(client, clientToolDigestLength)
 		if wireName != want {
-			t.Errorf("wire name %q != %q (readable form expected)", wireName, want)
+			t.Errorf("wire name %q != %q", wireName, want)
+		}
+		// 绝不能把客户端原名泄进线上名
+		lower := strings.ToLower(client)
+		if strings.Contains(strings.ToLower(body), lower) {
+			t.Errorf("wire name %q 泄露了客户端原名 %q", wireName, client)
 		}
 	}
 }
@@ -53,14 +72,14 @@ func TestToolRenamesRestoreOpaqueNames(t *testing.T) {
 // FreeUsageLimitError。所以这条一旦回归，网关会整体不可用。
 //
 // 2026-11-17 修正：透传条件从 allOfficialToolNames（官方名子集也算真）收紧为
-// completeOfficialToolset。子集透传实测 0/8 全 429，见
-// toolshape_official_subset_test.go 与 docs/head2head-zen-vs-opencode2api.md。
+// 2026-11-18 起（v1.0）：
+//   - 透传判据固定为 subset：官方名子集整份原样发出，不补桩（12 进 12 出）；
+//   - 但透传前一律用 sanitizeRankedTools 洗掉工具级指纹短语，否则上游 429。
 //
-// 2026-11-18 补充：默认档已改成 subset（见 shapeMode 注释里的 6/6 验收），
-// 非 exact 档会在透传前洗掉工具级指纹短语。这条测试锁的是 **exact 档**的
-// 「逐字透传」契约，所以显式钉住档位。
-func TestOfficialToolsetPassesThroughVerbatim(t *testing.T) {
-	t.Setenv("ZEN_SHAPE_MODE", "exact")
+// 所以「逐字透传」现在指**名字与结构**逐字，描述里的指纹短语会被替换。
+// 实测依据：shape-acceptance 44129660858 里「官方名 + 工具级被判原句」
+// 未脱敏时 429，脱敏后 44130648925 转 200。
+func TestOfficialToolsetPassesThroughWithSanitizedDescriptions(t *testing.T) {
 	names := v2OfficialToolOrder
 	var sb strings.Builder
 	sb.WriteString(`{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}],"tools":[`)
@@ -70,7 +89,7 @@ func TestOfficialToolsetPassesThroughVerbatim(t *testing.T) {
 		}
 		desc := "Tool " + name + "."
 		if name == "read" {
-			// 官方原文里可能含“封禁短语”，但那是官方口径，透传时不能改。
+			// 官方原文里的封禁短语：透传前必须被洗掉。
 			desc = "Read a UTF-8 text file and return line-numbered content."
 		}
 		sb.WriteString(`{"type":"function","function":{"name":"` + name + `","description":"` + desc + `","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}`)
@@ -96,11 +115,15 @@ func TestOfficialToolsetPassesThroughVerbatim(t *testing.T) {
 	}
 	for _, raw := range entries {
 		fn := asMap(asMap(raw)["function"])
-		if asStr(fn["name"]) == "read" {
-			desc := asStr(fn["description"])
-			if !strings.Contains(desc, "line-numbered content") {
-				t.Fatalf("官方描述被脱敏了: %q", desc)
-			}
+		if asStr(fn["name"]) != "read" {
+			continue
+		}
+		desc := asStr(fn["description"])
+		if strings.Contains(desc, "line-numbered content") {
+			t.Fatalf("指纹短语没洗掉: %q", desc)
+		}
+		if !strings.Contains(desc, "line-numbered output") {
+			t.Fatalf("应当换成中性文本，实际 %q", desc)
 		}
 	}
 }

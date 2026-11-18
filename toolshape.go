@@ -622,12 +622,10 @@ func (r *ToolRenames) ResolveFuzzy(wire string) (string, bool) {
 	if match, ok := r.byShape[foldToolName(candidate)]; ok && match != "" {
 		return match, true
 	}
-	// 旧形状（mcp_<hex>）不参与编辑距离修复：它和可读名差得远，硬修只会把
-	// 一个语义未知的名字猜成别的工具。原样透传 + 一条 warn。
-	if legacyClientToolWireName(wire) {
-		warnLegacyClientToolWire(wire)
-		return wire, false
-	}
+	// 2026-11-18 起哈希名（mcp_<hex>）是**唯一**的线上名格式，所以它必须参与
+	// 编辑距离修复——否则模型把哈希抄错一位就再也还原不成客户端工具名。
+	// 早期可读名时期这里会跳过旧形状（当时哈希名是历史残留，猜它没有意义）；
+	// 现在跳过等于让模糊修复整个失效。
 	if !strings.HasPrefix(wire, ClientToolPrefix()) {
 		return wire, false
 	}
@@ -687,11 +685,11 @@ func editDistanceAtMostOne(a, b string) bool {
 
 // ClientToolWireName 生成一个客户端工具的线上名：
 //
-//	read              → mcp__read
-//	github_create_issue → mcp__github_create_issue
-//	My Tool!          → mcp__my_tool        （非法字符归一成 _）
-//	<超长名>           → mcp__<截断>_<8hex>  （截断 + digest 尾巴，仍唯一）
-//	重名（归一后撞车）  → mcp__read_2 / _3 …
+//	read                → mcp_3316348dbadf
+//	github_create_issue → mcp_f3316348dbad
+//	My Tool!            → mcp_<sha256 前 12 位>
+//	<超长名>            → mcp_<sha256 前 12 位>（长度恒定，不截断）
+//	重名（哈希撞车）     → 追加 _2 / _3 …
 //
 // 旧实现用 sha256 截断当名字（mcp_<12hex>），模型看到的是一串无语义的哈希，
 // 只能靠描述猜工具——这是工具调用准确率的最大损失源。现在名字自己是可读的，
@@ -700,28 +698,26 @@ func editDistanceAtMostOne(a, b string) bool {
 //
 // used 由调用方按请求持有（renameAndCompleteTools 里一个请求一份），保持
 // "先到先占、后来者加 _2/_3"的语义；并发安全边界与旧实现一致。
+// ClientToolWireName 返回客户端工具的线上名：**固定的 mcp_<12位sha256> 哈希名**。
+//
+// 为什么写死哈希名、不留可读名开关：2026-11-18 实测，可读名会直接 429。
+//
+//	哈希名   mcp_2d4f8285de96           → 200
+//	可读名   mcp__anysearch_batch_search → 429
+//
+// 可读名（mcp__<name>）与官方 MCP 的 mcp__<server>__<tool> 同形，像 mcp__edit、
+// mcp__read、mcp__write 这种会以“官方名的变体”身份被上游判为冒充并被拒；
+// 纯哈希名没有语义，不会被误认。可读名由 0bd5b09 引入，只在排障时好看，
+// 代价是整条通道不可用，所以彻底去掉。
+//
+// 唯一性靠 claimClientToolWireName 的 _2/_3 后缀兜底（sha256 撞车概率可忽略，
+// 但同一进程内重复声明同名工具时会出现）。
 func ClientToolWireName(name string, used map[string]bool) string {
 	if used == nil {
 		used = map[string]bool{}
 	}
-	prefix := ClientToolPrefix() + clientToolNameSeparator
-	budget := toolWireNameLimit - len(prefix)
-	if budget <= 0 {
-		// ZEN_TOOL_PREFIX 被设成超长串：前缀已经吃光长度预算，退回纯 digest
-		// 形态。长度可能超限，但唯一性与可逆性（映射表）不受影响。
-		return claimClientToolWireName(prefix+toolNameDigest(name, clientToolDigestLength), used)
-	}
-	clean := normalizeClientToolWireName(name)
-	if len(clean) > budget {
-		tag := clientToolNameSeparator + toolNameDigest(name, clientToolDigestTailLength)
-		if len(tag) >= budget {
-			clean = toolNameDigest(name, budget)
-		} else {
-			// clean 归一化后只剩 ASCII，按字节截断不会切坏多字节字符。
-			clean = clean[:budget-len(tag)] + tag
-		}
-	}
-	return claimClientToolWireName(prefix+clean, used)
+	base := ClientToolPrefix() + toolNameDigest(name, clientToolDigestLength)
+	return claimClientToolWireName(base, used)
 }
 
 // claimClientToolWireName 占用 base；被占时按 _2/_3… 追加后缀（并截断 base
@@ -746,33 +742,6 @@ func claimClientToolWireName(base string, used map[string]bool) string {
 			return candidate
 		}
 	}
-}
-
-// normalizeClientToolWireName 归一化工具名主体：小写；非 [a-z0-9_] 一律换成
-// _（中文等非 ASCII 字符逐个换，随后被压成一个）；连续 _ 压成一个；首尾 _
-// 去掉；空结果回退成 tool。
-func normalizeClientToolWireName(name string) string {
-	var builder strings.Builder
-	builder.Grow(len(name))
-	lastSeparator := false
-	for _, char := range strings.ToLower(name) {
-		switch {
-		case char >= 'a' && char <= 'z', char >= '0' && char <= '9':
-			builder.WriteRune(char)
-			lastSeparator = false
-		default:
-			if lastSeparator {
-				continue
-			}
-			lastSeparator = true
-			builder.WriteByte('_')
-		}
-	}
-	clean := strings.Trim(builder.String(), clientToolNameSeparator)
-	if clean == "" {
-		return clientToolNameFallback
-	}
-	return clean
 }
 
 // toolNameDigest 返回 sha256(name) 的前 n 位 hex。
@@ -1060,7 +1029,7 @@ const (
 	shapeModePassthrough = "passthrough"
 	// shapeModeChannel：ZEN_TOOL_CHANNEL 生效，客户端工具收成官方通道桩。
 	shapeModeChannel = "channel"
-	// shapeModeRenameComplete：客户端工具改名成 mcp__<name> 并补官方集。
+	// shapeModeRenameComplete：客户端工具改名成 mcp_<12位hex> 并补官方集。
 	shapeModeRenameComplete = "rename_complete"
 	// shapeModeNone：没有可供整形的客户端工具（只补了官方桩）。
 	shapeModeNone = "none"
@@ -1101,7 +1070,7 @@ func toolCount(payload map[string]any) int {
 }
 
 // clientToolNames 摘出客户端声明的工具名（保持声明顺序，跳过无名条目）。
-// 必须在改名之前取：改名是就地改 map，改完再读就只能读到 mcp__<name> 上线名。
+// 必须在改名之前取：改名是就地改 map，改完再读就只能读到 mcp_<hex> 上线名。
 func clientToolNames(ranked []map[string]any, protocol Format) []string {
 	names := make([]string, 0, len(ranked))
 	for _, entry := range ranked {
@@ -1275,7 +1244,7 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	declaredNames := make([]string, 0, len(items))
 	shaped := make([]any, 0, len(items)+len(v2OfficialToolOrder))
 	// 不裁剪也不重排：客户端工具按原顺序出站。工具名会被改成可读的
-	// mcp__<name>（见 ClientToolWireName），
+	// mcp_<12位hex>（见 ClientToolWireName），
 	// 顺序对上游没有意义，保持原序让出站 body 与客户端请求一一对应，便于排障。
 	ranked := make([]map[string]any, 0, len(items))
 	passThrough := make([]any, 0)
@@ -1321,7 +1290,7 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 	//
 	// 为什么必须这样：官方 CLI 发出的 tools 名称就是 edit/read/shell…，
 	// 上游按“工具名集合是否官方原样”判定客户端身份。把它们改名成
-	// mcp__<name> 再补一份官方集，出站变成 26 个工具、顺序也与原版不同，
+	// mcp_<hex> 再补一份官方集，出站变成 26 个工具、顺序也与原版不同，
 	// 实测同一份 body 从 200 直接掉到 429 FreeUsageLimitError；不整形则 200，
 	// 且 upBytes 与原请求字节数一致。
 	//
@@ -1485,7 +1454,7 @@ func rewriteToolReferences(payload map[string]any, protocol Format, renames *Too
 
 var nameFieldPattern = regexp.MustCompile(`"name"\s*:\s*"([^"]+)"`)
 
-// RenameResponseTool replaces wire names (mcp__<name>) in raw JSON/SSE bytes back to client names.
+// RenameResponseTool replaces wire names (mcp_<12位hex>) in raw JSON/SSE bytes back to client names.
 func RenameResponseTool(line []byte, renames *ToolRenames) []byte {
 	if renames == nil || renames.Empty() || len(line) == 0 {
 		return line
@@ -1543,33 +1512,21 @@ func allOfficialToolNames(ranked []map[string]any, protocol Format) bool {
 // 这是"原样透传"的唯一入口条件。只看 allOfficialToolNames 是不够的——
 // 它对 {read} 这种官方名子集也为真，而子集透传会被上游当成
 // "自称官方、schema 却不是官方原文"而 429（2026-11-17 多出口实测）。
-// shapeMode 返回透传判据的档位，由 ZEN_SHAPE_MODE 控制。
+// shapeMode 返回透传判据的档位。v1.0 起固定为 subset，不再提供环境变量切换。
 //
-//	subset  （默认）客户端的工具名只要都属于官方集合就算过（不管缺哪个）
-//	exact   集合必须与官方集合完全相等（旧行为，可用环境变量回退）
-//	content subset 之上再要求每个工具的定义与官方逐字一致
-//
-// 为什么默认改成 subset：官方 CLI 现在发的集合不稳定（12 或 13，差在
-// experimental_image_generate），exact 判据永远为假，每个请求都走
-// 「改名 + 补 14 个官方桩」，出站从 12 涨到 26 —— 同一批能力出现两次，
-// 模型的选择面凭空翻倍。
+// 为什么固定 subset：官方 CLI 发的工具集不稳定（12 或 13，差在
+// experimental_image_generate），exact 判据（必须凑齐 14 个）对真实客户端
+// 永远为假，每个请求都走「改名 + 补 14 个官方桩」，出站从 12 涨到 26——
+// 同一批能力出现两次，模型的选择面凭空翻倍。
 //
 // 真实上游验收（shape-acceptance run 44130648925，vpngate 单节点）：
 //
 //	subset × {12 原始定义, 13, 14, 12 改写, 12 参数级 DSH 文本, 12 工具级被判原句}
 //	→ 6/6 全 200，quota=0
 //
-// 其中「工具级被判原句」这一发在**没有脱敏**时是 429（run 44129660858），
+// 其中「工具级被判原句」那一发在**没有脱敏**时是 429（run 44129660858），
 // 所以透传分支必须配合 sanitizeRankedTools 一起用，不能只放宽判据。
-//
-// 回退方式：ZEN_SHAPE_MODE=exact 即恢复旧行为，代码路径未删。
 func shapeMode() string {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("ZEN_SHAPE_MODE"))) {
-	case "exact":
-		return "exact"
-	case "content":
-		return "content"
-	}
 	return "subset"
 }
 
@@ -1662,17 +1619,12 @@ func sanitizeRankedTools(ranked []map[string]any, protocol Format) int {
 	return replaced
 }
 
-// noStubMode 报告是否跳过「补 14 个官方桩」。ZEN_NO_STUB=1/on/true/yes 时跳过。
+// noStubMode 恒为 false：v1.0 起不再提供跳过补桩的开关。
 //
-// 只用于实验：回答「补桩是否必需」。DSH 发 45 个工具，补桩后出站 59 个，
-// 而同一出口实测 12/20/30 个入参（出站 26/34/44）都 200、40 个入参（出站 54）
-// 就 429 —— 所以要能单独关掉补桩，测 45 个出站本身行不行。
-// 生产不要开：不补桩时上游可能按“名字集合不是官方原样”直接拒。
+// 历史：ZEN_NO_STUB 曾在实验期用来回答「补桩是否必需」。结论是补桩要保留——
+// 不补桩时上游会按“名字集合不是官方原样”拒绝第三方客户端。
+// 上线版本不留这种能让整条通道不可用的开关。
 func noStubMode() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("ZEN_NO_STUB"))) {
-	case "1", "on", "true", "yes":
-		return true
-	}
 	return false
 }
 

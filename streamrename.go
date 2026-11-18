@@ -193,7 +193,78 @@ func (renamer *streamToolRenamer) appendDSMLCalls(message map[string]any, calls 
 	return true
 }
 
+// sanitizeStreamFrame 是流式帧出口的最后一道硬约束：function.name 只要出现，
+// 就必须是非空字符串。
+//
+// 客户端 SDK 解析 tool_calls 时做强校验，拿到 null / 缺失 / 纯空白会抛
+// `Expected 'function.name' to be a string.`，整轮对话失败。上游断流、
+// 模型幻觉出未声明工具名、映射表查不到时都可能留下空值——那是上游行为，
+// 网关只能在出口兜底。
+//
+// 注意：**name 字段整个缺失时不补**。这就是 OpenAI 分片流的正常形态
+// （首帧给 name，后续帧只给 arguments，客户端按 index 累积），补了反而
+// 会破坏拼接。只有「name 字段存在但内容非法」才改写。
+//
+// 只在帧里确实含 function 对象时才做解析，避免热路径上给每个 SSE 帧都
+// 解一次 JSON。
+func sanitizeStreamFrame(frame []byte) []byte {
+	if len(frame) == 0 || !bytes.Contains(frame, []byte(`"function"`)) {
+		return frame
+	}
+	trimmed := bytes.TrimSpace(frame)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return frame
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		return frame
+	}
+	fixed := 0
+	for _, rawChoice := range asArr(payload["choices"]) {
+		choice, ok := rawChoice.(map[string]any)
+		if !ok {
+			continue
+		}
+		container, _ := choice["delta"].(map[string]any)
+		if container == nil {
+			container, _ = choice["message"].(map[string]any)
+		}
+		if container == nil {
+			continue
+		}
+		for _, rawCall := range asArr(container["tool_calls"]) {
+			call, ok := rawCall.(map[string]any)
+			if !ok {
+				continue
+			}
+			fn, ok := call["function"].(map[string]any)
+			if !ok {
+				continue
+			}
+			if _, exists := fn["name"]; !exists {
+				continue // 分片流中间帧，正常
+			}
+			if sanitizeResponseToolName(fn, "") {
+				fixed++
+			}
+		}
+	}
+	if fixed == 0 {
+		return frame
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return frame
+	}
+	return encoded
+}
+
 func (renamer *streamToolRenamer) rewriteFrame(raw string) []byte {
+	out := renamer.rewriteFrameInner(raw)
+	return sanitizeStreamFrame(out)
+}
+
+func (renamer *streamToolRenamer) rewriteFrameInner(raw string) []byte {
 	if renamer.protocol != FmtChat {
 		// 通道模式：responses 流的 function_call 参数跨帧分段，无法逐帧还原；
 		// response.completed 帧携带完整 output[]，在这里一次性还原。

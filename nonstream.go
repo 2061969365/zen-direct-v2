@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"log"
 	"strings"
 )
 
@@ -225,6 +226,11 @@ func sseToChatCompletion(raw []byte, model string) (map[string]any, error) {
 	}
 	if usage != nil {
 		out["usage"] = usage
+	}
+	// 出口硬约束：保证响应体里没有任何非字符串的 function.name。
+	// 客户端 SDK 对 function.name 做强校验，空值会让整轮对话失败。
+	if fixed := sanitizeResponseBodyTools(out); fixed > 0 {
+		log.Printf("[shape] 非流式响应兜底 %d 个空白 function.name", fixed)
 	}
 	return out, nil
 }

@@ -229,6 +229,28 @@ func sanitizeToolDescription(_ string, description string) (string, bool) {
 	return cleaned, replaced
 }
 
+// stubNeverCallSuffix 追加在官方桩描述末尾，劝模型不要选桩。
+//
+// 为什么需要它：桩存在的唯一目的是让上游看到**完整的官方工具集**（这是免费层
+// 放行条件），不是给模型用的。但桩用的是裸官方名（read/edit/write）且带完整
+// 真实描述，模型会优先选它；选中后网关还原映射里查不到对应客户端工具
+// （客户端可能只声明了 read_file），于是把裸名 read 原样发给客户端，
+// SDK 解析 tool_calls 时对不上，抛
+// `Expected 'function.name' to be a string.`，整轮对话失败。
+//
+// 措辞照搬 opencode2api 的 stubNeverCall：指令跟随强的模型会遵守。
+const stubNeverCallSuffix = " Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead."
+
+// stubNeverCallMode 报告是否给桩描述追加禁调后缀。
+// ZEN_STUB_NEVERCALL=0 关掉（对照实验用：验证加后缀会不会影响上游校验）。
+func stubNeverCallMode() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ZEN_STUB_NEVERCALL"))) {
+	case "0", "off", "false", "no":
+		return false
+	}
+	return true
+}
+
 func renderOfficialTool(protocol Format, name string) map[string]any {
 	loadOfficialTools()
 	description := "Agent tool " + name
@@ -241,6 +263,11 @@ func renderOfficialTool(protocol Format, name string) map[string]any {
 	}
 	if name == "shell" {
 		description = v2ShellDescription(description)
+	}
+	// 桩只为过上游门禁存在，不该被模型选中。加禁调后缀降低误选概率。
+	// 用 ZEN_STUB_NEVERCALL=0 可关掉，做「加后缀是否影响上游校验」的对照。
+	if stubNeverCallMode() {
+		description += stubNeverCallSuffix
 	}
 	if protocol == FmtChat {
 		function := map[string]any{
@@ -1453,6 +1480,91 @@ func rewriteToolReferences(payload map[string]any, protocol Format, renames *Too
 }
 
 var nameFieldPattern = regexp.MustCompile(`"name"\s*:\s*"([^"]+)"`)
+
+// responseToolNameFallback 是工具名彻底还原不出时的占位。
+// 用 `unknown_tool` 而不是空串：客户端能解析，模型下一轮也能看懂。
+const responseToolNameFallback = "unknown_tool"
+
+// sanitizeResponseToolName 是响应出口的硬约束：function.name 必须是非空字符串。
+//
+// 为什么需要它：客户端 SDK（OpenAI 官方 SDK、ZCode 等）解析工具调用时会对
+// function.name 做强类型校验，一旦拿到 null / 缺失 / 纯空白就直接抛
+// `Expected 'function.name' to be a string.`，整轮对话失败。
+//
+// 网关这边有多处会写这个字段：流式 name 分片合并、模糊还原、别名还原、
+// 非流式 tool_calls 组装。上游断流、模型幻觉出未声明的工具名、映射表查不到
+// 时，都可能留下空值。这些是**上游行为**，网关无法从源头杜绝，只能在出口
+// 兜底：还原不出名字时用 fallback 占位，保证客户端至少能解析响应。
+//
+// 返回 true 表示做过兜底。
+func sanitizeResponseToolName(function map[string]any, fallback string) bool {
+	if function == nil {
+		return false
+	}
+	if fallback == "" {
+		fallback = responseToolNameFallback
+	}
+	value, exists := function["name"]
+	if !exists {
+		function["name"] = fallback
+		return true
+	}
+	if s, ok := value.(string); ok && strings.TrimSpace(s) != "" {
+		return false
+	}
+	// 空串、纯空白、null、数字/对象/布尔：一律换成可解析的占位名。
+	function["name"] = fallback
+	return true
+}
+
+// sanitizeResponseBodyTools 扫描整个响应体，把所有 function.name 兜底。
+// 覆盖 chat 非流式（choices[].message.tool_calls）与 responses
+// （output[].name / function_call）两种形态。返回兜底次数。
+func sanitizeResponseBodyTools(payload map[string]any) int {
+	if payload == nil {
+		return 0
+	}
+	fixed := 0
+	for _, rawChoice := range asArr(payload["choices"]) {
+		choice, ok := rawChoice.(map[string]any)
+		if !ok {
+			continue
+		}
+		message, ok := choice["message"].(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, rawCall := range asArr(message["tool_calls"]) {
+			call, ok := rawCall.(map[string]any)
+			if !ok {
+				continue
+			}
+			if fn, ok := call["function"].(map[string]any); ok {
+				if sanitizeResponseToolName(fn, "") {
+					fixed++
+				}
+			}
+		}
+	}
+	for _, rawItem := range asArr(payload["output"]) {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		if asStr(item["type"]) == "function_call" {
+			if s, ok := item["name"].(string); !ok || strings.TrimSpace(s) == "" {
+				item["name"] = responseToolNameFallback
+				fixed++
+			}
+		}
+		if fn, ok := item["function"].(map[string]any); ok {
+			if sanitizeResponseToolName(fn, "") {
+				fixed++
+			}
+		}
+	}
+	return fixed
+}
 
 // RenameResponseTool replaces wire names (mcp_<12位hex>) in raw JSON/SSE bytes back to client names.
 func RenameResponseTool(line []byte, renames *ToolRenames) []byte {

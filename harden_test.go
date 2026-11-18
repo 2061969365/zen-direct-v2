@@ -569,6 +569,15 @@ func TestIsTransportRetryable(t *testing.T) {
 	}
 }
 
+// TestTransportRetryOnce 验证「建连即断」时同请求重试一次。
+//
+// 必须显式把上游客户端的 responseTimeout 设短：Windows 上 httptest 服务端
+// hijack+close 后，客户端 socket 的 RST 不会立刻唤醒阻塞中的 br.Peek，
+// 要等到读超时才报错（Linux 上 RST 会立刻唤醒）。用默认的 120s 时这条测试
+// 会原地卡满两分钟——那是平台差异，不是网关缺陷。
+//
+// 2026-11-18 实测：responseTimeout=2s 时，首轮 Peek 立刻返回
+// wsarecv: forcibly closed，第二轮 200，calls=2，全程 10ms。
 func TestTransportRetryOnce(t *testing.T) {
 	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -583,6 +592,11 @@ func TestTransportRetryOnce(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"resp_retry","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
 	}))
 	defer srv.Close()
+
+	oldClient := httpClient
+	httpClient = &http.Client{Transport: newBunTransport(nil, 2*time.Second, 30*time.Second)}
+	defer func() { httpClient = oldClient }()
+
 	u, _ := url.Parse(srv.URL)
 	old := upstream
 	upstream = u

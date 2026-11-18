@@ -27,6 +27,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,11 +57,19 @@ type bunTransport struct {
 }
 
 // bunConn 是一条上游连接，带读缓冲（响应解析）与所属池键。
+//
+// 连接在池里空闲时，watcher goroutine 会阻塞在 br.Peek(1) 上：服务端一旦
+// 关掉连接，Peek 立刻返回，watcher 就把它移出池并关闭。这样池里永远不会
+// 留一条已死的连接等着被复用。watched 在 watcher 返回后关闭，watchErr
+// 记录 Peek 因何结束（读到数据 / 服务端关闭 / 我们主动设的过期 deadline）。
 type bunConn struct {
 	net.Conn
-	key   string
-	br    *bufio.Reader
-	timer *time.Timer
+	key      string
+	br       *bufio.Reader
+	timer    *time.Timer
+	idleAt   time.Time
+	watched  chan struct{}
+	watchErr error
 }
 
 // bunConnTiming 记录取连接各阶段耗时；复用池连接时 dial/handshake 为 0。
@@ -169,10 +178,18 @@ func bunReadBody(req *http.Request) ([]byte, error) {
 	return io.ReadAll(req.Body)
 }
 
-// conn 取一条连接：优先复用池里的，否则新建（必要时先过代理，再做 uTLS 握手）。
+// conn 取一条连接：优先复用池里的健康连接，否则新建（必要时先过代理，再做
+// uTLS 握手）。
+//
+// 这里的循环是「池里那条已经死了」的兜底：watcher 通常已经在连接死掉时把它
+// 移出池，但存在竞态窗口（服务端刚关、watcher 还没被调度）。所以取出后还要
+// 用 reclaim() 二次确认，死的关掉再取下一条。
 func (t *bunTransport) conn(ctx context.Context, key, addr, serverName, scheme string) (*bunConn, bunConnTiming, error) {
-	if c := t.takeIdle(key); c != nil {
-		return c, bunConnTiming{reused: true}, nil
+	for c := t.takeIdle(key); c != nil; c = t.takeIdle(key) {
+		if c.reclaim() {
+			return c, bunConnTiming{reused: true}, nil
+		}
+		c.Close()
 	}
 	var timing bunConnTiming
 	dialStart := time.Now()
@@ -459,10 +476,41 @@ func (t *bunTransport) exchange(req *http.Request, c *bunConn, head, body []byte
 	return resp, false, nil
 }
 
+// bunDropped 判断一个错误是否属于「连接被对端掐断、可以安全重试」。
+//
+// 为什么不能只判 syscall.ECONNRESET：Windows 上对端 RST 表现为
+// WSARECONNRESET（10054），Go 把它包成 *net.OpError → *os.SyscallError →
+// syscall.Errno(10054)，与 Linux 的 ECONNRESET（104）不是同一个值，
+// errors.Is(err, syscall.ECONNRESET) 匹配不上。
+// 2026-11-18 实测（Windows，本地 httptest 掐首个连接）：
+//
+//	请求体 683B  → io.EOF（判得出，能重试）
+//	请求体 4KB+  → wsarecv: forcibly closed（判不出，重试不触发，请求挂死）
+//
+// Linux 生产环境两者都能匹配，所以这个盲区只在 Windows 开发/测试时暴露；
+// 但重试是通道可用性的关键路径，不该依赖平台差异。
 func bunDropped(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) ||
-		errors.Is(err, syscall.EPIPE)
+		errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	// Windows：WSAECONNRESET/WSAECONNABORTED 的 Errno 值，以及 Go 在
+	// RST 之后读会给出的 "wsarecv"/"forcibly closed" 文本兜底。
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch uintptr(errno) {
+		case 10053, 10054: // WSAECONNABORTED, WSAECONNRESET
+			return true
+		}
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "forcibly closed") ||
+		strings.Contains(text, "wsarecv") ||
+		strings.Contains(text, "connection reset")
 }
 
 func bunDecodable(encoding string) bool {
@@ -560,14 +608,15 @@ func (t *bunTransport) takeIdle(key string) *bunConn {
 		return nil
 	}
 	c := list[len(list)-1]
-	t.idle[key] = list[:len(list)-1]
-	if c.timer != nil {
-		c.timer.Stop()
-		c.timer = nil
+	if len(list) == 1 {
+		delete(t.idle, key)
+	} else {
+		t.idle[key] = list[:len(list)-1]
 	}
 	return c
 }
 
+// putIdle 把读完响应的连接放回池，并启动它的空闲 watcher。
 func (t *bunTransport) putIdle(c *bunConn) {
 	t.mu.Lock()
 	if len(t.idle[c.key]) >= t.maxIdlePerHost {
@@ -575,6 +624,10 @@ func (t *bunTransport) putIdle(c *bunConn) {
 		c.Close()
 		return
 	}
+	c.idleAt = time.Now()
+	c.watched = make(chan struct{})
+	c.watchErr = nil
+	c.timer = nil
 	if t.idleTimeout > 0 {
 		c.timer = time.AfterFunc(t.idleTimeout, func() {
 			if t.removeIdle(c) {
@@ -584,6 +637,34 @@ func (t *bunTransport) putIdle(c *bunConn) {
 	}
 	t.idle[c.key] = append(t.idle[c.key], c)
 	t.mu.Unlock()
+	// 空闲期间阻塞在 Peek 上：服务端一关连接就立刻返回，watcher 顺手把
+	// 它移出池并关闭。这样池里不会留死连接等着被复用。
+	go func() {
+		_, c.watchErr = c.br.Peek(1)
+		if t.removeIdle(c) {
+			c.Close()
+		}
+		close(c.watched)
+	}()
+}
+
+// reclaim 停掉刚取出的连接的空闲 watcher，并报告它是否还能用：
+// watcher 的 Peek 必须是因为我们在这里设的过期 deadline 而结束（而不是读到
+// 数据、或服务端关闭）。读超时不会破坏 TLS 状态，连接可以继续承载下一个请求。
+func (c *bunConn) reclaim() bool {
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+	// 没进过池的连接不会有 watcher（watched 为 nil）。对它 <<- 会永久阻塞，
+	// 所以这里必须先确认：没有 watcher 就没有「空闲期已死」的证据，按可用处理。
+	if c.watched == nil {
+		_ = c.SetReadDeadline(time.Time{})
+		return true
+	}
+	_ = c.SetReadDeadline(time.Unix(1, 0))
+	<-c.watched
+	return errors.Is(c.watchErr, os.ErrDeadlineExceeded) && c.SetReadDeadline(time.Time{}) == nil
 }
 
 func (t *bunTransport) removeIdle(c *bunConn) bool {

@@ -102,6 +102,10 @@ type streamToolRenameState struct {
 	choiceIndex      any
 	modelID          string
 	emitted          bool
+	// suppressed 标记这条调用的名字未能还原成客户端认识的工具：名字帧不
+	// 下发，后续 arguments 帧也一并吞掉，整条调用对客户端不可见。
+	// 见 unresolvableToolName 的说明。
+	suppressed bool
 }
 
 type streamToolRenamer struct {
@@ -342,7 +346,8 @@ func (renamer *streamToolRenamer) rewriteChatFrame(raw string) []byte {
 			if !ok {
 				continue
 			}
-			for callIndex, rawCall := range asArr(message["tool_calls"]) {
+			messageCalls := asArr(message["tool_calls"])
+			for callIndex, rawCall := range messageCalls {
 				call, ok := rawCall.(map[string]any)
 				if !ok {
 					continue
@@ -383,6 +388,27 @@ func (renamer *streamToolRenamer) rewriteChatFrame(raw string) []byte {
 					if renamer.applyNameFragment(state, function, name) {
 						changed = true
 					}
+				}
+				// 名字未能还原成客户端认识的工具：整条调用都不下发。名字帧
+				// 已在 applyNameFragment 里删掉，后续 arguments 分片在这里
+				// 吞掉；同时把这条 tool_call 从本帧移除。客户端全程看不到
+				// 这条调用，历史里也不会出现它不认识的名字。
+				if state.suppressed {
+					keptCalls := make([]any, 0, len(messageCalls))
+					for _, rawCall2 := range messageCalls {
+						c2, ok2 := rawCall2.(map[string]any)
+						if ok2 && c2["index"] != nil && call["index"] != nil && c2["index"] == call["index"] {
+							continue
+						}
+						keptCalls = append(keptCalls, rawCall2)
+					}
+					if len(keptCalls) == 0 {
+						delete(message, "tool_calls")
+					} else {
+						message["tool_calls"] = keptCalls
+					}
+					changed = true
+					continue
 				}
 				if arguments, exists := function["arguments"]; exists && !state.decided {
 					if renamer.renames.HasLongerPrefix(state.pending) {
@@ -725,6 +751,19 @@ func (renamer *streamToolRenamer) applyNameFragment(state *streamToolRenameState
 		return true
 	}
 	client, renamed := renamer.renames.ResolveFuzzy(state.pending)
+	// 未映射名字不下发：模型选了裸官方名桩而客户端没声明同名工具时，
+	// 这个名字在客户端那边不存在。流式逐帧下发，一旦把名字发出去就无法
+	// 撤回，所以必须在决定名字的这一帧就拦住——整条调用后续帧
+	// （arguments 分片）由 state.suppressed 吞掉。
+	//
+	// 判据用 renamed（ResolveFuzzy 是否真的完成了映射）：模糊修复成功
+	// （哈希名抄错一位）与精确还原都算能还原，只有「原样返回」才是未映射。
+	if !renamed && !renamer.renames.Declared(client) {
+		state.suppressed = true
+		state.decided, state.renamed = true, true
+		delete(function, "name")
+		return true
+	}
 	function["name"] = client
 	state.decided, state.renamed = true, renamed
 	return true

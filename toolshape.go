@@ -1319,6 +1319,10 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 		recordShapeDecision(summarizeShapeDecision(
 			shapeModePassthrough, len(items), clientToolNames(ranked, protocol), toolCount(payload),
 			reason))
+		// 透传分支同样要记录声明的工具名。这里客户端工具名与官方名重合
+		// （DSH 声明 read/write/edit…），模型回显 read 是正常行为，响应侧
+		// 必须能据此放行；不记录的话会被当成「客户端不认识的桩名」误删。
+		renames.SetDeclared(clientToolNames(ranked, protocol))
 		return renames, false
 	}
 	for _, entry := range ranked {
@@ -1386,8 +1390,61 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 		}
 		sanitizeToolHistory(payload, protocol, declared, renames, officialToolNameSet())
 	}
+	// 记录本次声明的客户端工具名。响应侧要靠它判断「模型返回的这个名字
+	// 客户端到底认不认识」，见 unresolvableToolName。
+	renames.SetDeclared(declaredNames)
 	rewriteToolReferences(payload, protocol, renames)
 	return renames, true
+}
+
+// unresolvableToolName 判断响应里的一个工具名是否属于「客户端不认识、网关
+// 也还原不了」的情况，返回给客户端的替代名（空串表示应当把整条调用丢掉）。
+//
+// 为什么必须有这道闸：出站 body 里同时存在
+//
+//	mcp_<12位hex>   客户端工具，模型看不出是什么
+//	read/edit/...   14 个裸官方名桩，带完整官方描述，模型必然选它
+//
+// 模型选中桩后，若客户端恰好声明了同名工具（DSH 声明 read），还原正常；
+// 但客户端声明的是 read_file 这类名字时（ZCode），桩名 read 在还原表里
+// 找不到对应项。
+//
+// 2026-11-20 实测（ZCode）：把未映射的 read 原样下发后，客户端虽然不立刻
+// 崩（v1.1.0 的 function.name 兜底挡住了空值），却把这条不存在的工具调用
+// 写进了本地会话历史；下一轮它自己恢复会话时发现历史里有当前工具表没有
+// 的名字，直接报 `Model request failed. TraceID: hydrate-trace`。也就是说
+// 下发脏名字只是把失败从第 1 轮推迟到第 2 轮，并且污染了客户端状态。
+//
+// 所以这里改成：认不出的名字**不下发**，返回空串让调用方把整条 tool_call
+// 连同等价的空响应一起丢掉。宁可这一轮没有工具调用，也不给客户端一个它
+// 无法处理的工具名。
+//
+// 反过来，若客户端本来就声明了这个名字（官方名客户端，如 DSH 声明 read），
+// 那是正常回显，原样通过。
+func unresolvableToolName(renames *ToolRenames, wire string) (string, bool) {
+	if renames == nil || wire == "" {
+		return wire, true
+	}
+	// 客户端声明过这个名字：正常回显，放行。
+	if renames.Declared(wire) {
+		return wire, true
+	}
+	// 能精确还原成某个客户端工具：放行。
+	if client, ok := renames.Client(wire); ok {
+		return client, true
+	}
+	// 官方名绑定了客户端工具（DSH 的 read → read）：放行到绑定的名字。
+	if client, ok := renames.Official(wire); ok {
+		return client, true
+	}
+	// 模糊修复（大小写、形状折叠、哈希名错一位）能对上：放行。
+	if client, ok := renames.ResolveFuzzy(wire); ok && client != wire {
+		return client, true
+	}
+	// 认不出。区分两种情形：
+	//   - 裸官方名桩（read/edit/shell…）未被绑定 → 未映射，必须丢弃
+	//   - 其它任意未声明名字 → 同样不该交给客户端
+	return "", false
 }
 
 func clientWireName(renames *ToolRenames, used map[string]bool, client string) string {
@@ -1777,4 +1834,149 @@ func verbatimDescMode() bool {
 		return true
 	}
 	return false
+}
+
+// dropUnresolvableToolCalls 从已序列化的响应体里删掉「客户端不认识、网关
+// 也还原不了」的工具调用，返回处理后的字节和删除条数。
+//
+// 只做删除，不改名：能还原的调用在这之前已经被 restoreAliasNames /
+// 流式 renamer 处理过了，到这里还认不出的就是该丢的。
+//
+// chat 形态：choices[].message.tool_calls[]
+// responses 形态：output[] 里 type=="function_call" 的条目
+//
+// 一条都不删时原样返回入参切片（不重新序列化），避免热路径上无谓的
+// 编解码，也保证字节级不变。
+func dropUnresolvableToolCalls(body []byte, renames *ToolRenames) ([]byte, int) {
+	// 不能用 renames.Empty() 提前返回：透传分支（客户端自带完整官方集）
+	// 没有任何改名映射，toWire 为空，但 declared 记录了客户端声明的工具名，
+	// 那里恰恰最需要放行判断。
+	if len(body) == 0 || renames == nil || (renames.Empty() && len(renames.declared) == 0) {
+		return body, 0
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, 0
+	}
+	dropped := 0
+
+	for _, rawChoice := range asArr(payload["choices"]) {
+		choice, ok := rawChoice.(map[string]any)
+		if !ok {
+			continue
+		}
+		message, ok := choice["message"].(map[string]any)
+		if !ok {
+			continue
+		}
+		calls := asArr(message["tool_calls"])
+		if len(calls) == 0 {
+			continue
+		}
+		kept := make([]any, 0, len(calls))
+		for _, rawCall := range calls {
+			call, ok := rawCall.(map[string]any)
+			if !ok {
+				kept = append(kept, rawCall)
+				continue
+			}
+			fn := asMap(call["function"])
+			name := asStr(fn["name"])
+			if _, ok := unresolvableToolName(renames, name); ok {
+				kept = append(kept, rawCall)
+				continue
+			}
+			dropped++
+		}
+		if len(kept) == 0 {
+			delete(message, "tool_calls")
+			// 空正文 + 无工具调用的 assistant 消息没有信息量，一并删掉，
+			// 免得客户端看到一条空白 assistant 气泡。
+			delete(choice, "message")
+		} else {
+			message["tool_calls"] = kept
+		}
+	}
+
+	out := asArr(payload["output"])
+	if len(out) > 0 {
+		kept := make([]any, 0, len(out))
+		for _, rawItem := range out {
+			item, ok := rawItem.(map[string]any)
+			if !ok {
+				kept = append(kept, rawItem)
+				continue
+			}
+			isCall := asStr(item["type"]) == "function_call"
+			if !isCall {
+				kept = append(kept, rawItem)
+				continue
+			}
+			if _, ok := unresolvableToolName(renames, asStr(item["name"])); ok {
+				kept = append(kept, rawItem)
+				continue
+			}
+			dropped++
+		}
+		payload["output"] = kept
+	}
+
+	if dropped == 0 {
+		return body, 0
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return body, 0
+	}
+	return encoded, dropped
+}
+
+// maskUnresolvableToolCalls 是 dropUnresolvableToolCalls 的姊妹实现：
+// 不删除调用，而是把认不出的名字换成 responseToolNameFallback。
+//
+// 保留给需要「客户端必须收到一条完整 tool_calls」的场景（例如客户端会按
+// finish_reason=tool_calls 期待至少一条调用）。当前生产路径用删除版，
+// 因为 ZCode 的问题是客户端会把幽灵名字写进历史，屏蔽比改名干净。
+func maskUnresolvableToolCalls(body []byte, renames *ToolRenames) ([]byte, int) {
+	if len(body) == 0 || renames == nil || renames.Empty() {
+		return body, 0
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, 0
+	}
+	masked := 0
+	for _, rawChoice := range asArr(payload["choices"]) {
+		choice, ok := rawChoice.(map[string]any)
+		if !ok {
+			continue
+		}
+		message, ok := choice["message"].(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, rawCall := range asArr(message["tool_calls"]) {
+			call, ok := rawCall.(map[string]any)
+			if !ok {
+				continue
+			}
+			fn, ok := call["function"].(map[string]any)
+			if !ok {
+				continue
+			}
+			name := asStr(fn["name"])
+			if replacement, ok := unresolvableToolName(renames, name); !ok || replacement == "" {
+				fn["name"] = responseToolNameFallback
+				masked++
+			}
+		}
+	}
+	if masked == 0 {
+		return body, 0
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return body, 0
+	}
+	return encoded, masked
 }

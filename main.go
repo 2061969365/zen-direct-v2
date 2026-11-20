@@ -1437,6 +1437,14 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 			}
 		}
 	}
+	// 未映射工具调用拦截：模型选了裸官方名桩、而客户端没声明同名工具时，
+	// 这个名字在客户端那边不存在。原样下发会让客户端把一条幽灵调用写进
+	// 会话历史，下一轮恢复会话时崩（ZCode 的 `Model request failed.
+	// TraceID: hydrate-trace`）。这里整条丢掉，宁可这一轮没有工具调用。
+	if encoded, dropped := dropUnresolvableToolCalls(outBytes, reqRenames); dropped > 0 {
+		log.Printf("[REQ %s] dropped %d unresolvable tool call(s) before sending to client", reqID, dropped)
+		outBytes = encoded
+	}
 	log.Printf("[REQ %s] non-stream done ttfbMs=%d ms=%d outBytes=%d",
 		reqID, ttfbMs, time.Since(reqStart).Milliseconds(), len(outBytes))
 	_, _ = w.Write(outBytes)

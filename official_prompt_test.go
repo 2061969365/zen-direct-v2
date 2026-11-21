@@ -12,7 +12,7 @@ func TestOfficialPromptInjected(t *testing.T) {
 			map[string]any{"role": "user", "content": "hi"},
 		},
 	}
-	if !injectOfficialSystemPrompt(payload) {
+	if !injectOfficialSystemPrompt(payload, clientEnvironment{}) {
 		t.Fatal("首条不是官方提示词时应注入")
 	}
 	msgs := payload["messages"].([]any)
@@ -48,7 +48,7 @@ func TestOfficialPromptAlwaysInjected(t *testing.T) {
 					map[string]any{"role": "user", "content": "hi"},
 				},
 			}
-			if !injectOfficialSystemPrompt(payload) {
+			if !injectOfficialSystemPrompt(payload, clientEnvironment{}) {
 				t.Fatal("客户端自带官方提示词时仍须重新注入（跳过即 429）")
 			}
 			msgs := payload["messages"].([]any)
@@ -84,7 +84,7 @@ func TestOfficialPromptMarkerAloneStillInjects(t *testing.T) {
 					map[string]any{"role": "user", "content": "hi"},
 				},
 			}
-			if !injectOfficialSystemPrompt(payload) {
+			if !injectOfficialSystemPrompt(payload, clientEnvironment{}) {
 				t.Fatal("只提到开头短语的客户端提示词仍须注入官方提示词")
 			}
 			msgs := payload["messages"].([]any)
@@ -101,13 +101,13 @@ func TestOfficialPromptMarkerAloneStillInjects(t *testing.T) {
 
 // 结构不认识（没有 messages 或类型不对）时安静返回 false。
 func TestOfficialPromptShapeGuard(t *testing.T) {
-	if injectOfficialSystemPrompt(nil) {
+	if injectOfficialSystemPrompt(nil, clientEnvironment{}) {
 		t.Error("nil payload 应返回 false")
 	}
-	if injectOfficialSystemPrompt(map[string]any{"messages": "nope"}) {
+	if injectOfficialSystemPrompt(map[string]any{"messages": "nope"}, clientEnvironment{}) {
 		t.Error("messages 类型不对应返回 false")
 	}
-	if injectOfficialSystemPrompt(map[string]any{}) {
+	if injectOfficialSystemPrompt(map[string]any{}, clientEnvironment{}) {
 		t.Error("没有 messages 应返回 false")
 	}
 }
@@ -115,7 +115,7 @@ func TestOfficialPromptShapeGuard(t *testing.T) {
 // 空 messages 也要能注入（首轮请求）。
 func TestOfficialPromptEmptyHistory(t *testing.T) {
 	payload := map[string]any{"messages": []any{}}
-	if !injectOfficialSystemPrompt(payload) {
+	if !injectOfficialSystemPrompt(payload, clientEnvironment{}) {
 		t.Fatal("空 messages 应注入")
 	}
 	if n := len(payload["messages"].([]any)); n != 1 {
@@ -136,7 +136,7 @@ func TestOfficialPromptPartsArray(t *testing.T) {
 			map[string]any{"role": "user", "content": "hi"},
 		},
 	}
-	if !injectOfficialSystemPrompt(payload) {
+	if !injectOfficialSystemPrompt(payload, clientEnvironment{}) {
 		t.Fatal("分块 system 也要注入")
 	}
 	got, _ := payload["messages"].([]any)[0].(map[string]any)["content"].(string)

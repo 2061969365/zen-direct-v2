@@ -197,6 +197,52 @@ func replaceFoldInsensitive(description, phrase, replacement string) (string, bo
 	return builder.String(), true
 }
 
+// nbspDescription 把描述里的普通 ASCII 空格换成不换行空格 U+00A0。
+//
+// 为什么用这个手段：上游免费层的工具描述判定是**纯字面匹配**——
+// opencode2api issue #188 的二分表已经证明：同一份 110 工具请求体，
+// 只把 edit/read/skill 三条描述换成中性文本就 200，而仅改工具名仍 429；
+// 加前缀 `Tool. ` 无效（子串匹配），全小写也无效（大小写不敏感）。
+// 也就是说黑名单永远追不上——上游换一批指纹，我们就得再加一条规则。
+//
+// 换掉空格字节打断字面匹配，语义与可读性对模型几乎无影响（NBSP 在文本
+// 渲染上和空格一样），而覆盖面对「任何尚未出现的指纹」都成立。
+// 这是 opencode2api v1.5.1（commit 6575c62）的做法。
+//
+// 只处理顶层 description：issue 实测「同一句话放在参数 description 里 → 200」，
+// 动参数 schema 既无收益又破坏客户端 schema 一致性；官方 14 个桩的描述是
+// 上游认可的原文，也不能动。
+//
+// 幂等：NBSP 本身不是 " "，重复调用不会累积；\n、\t 与已有 NBSP 原样保留。
+func nbspDescription(description string) string {
+	if description == "" {
+		return description
+	}
+	return strings.ReplaceAll(description, " ", "\u00a0")
+}
+
+// shapeToolDescription 是客户端工具描述的出口处理：先跑短语黑名单（把已知
+// 指纹换成中性措辞，让描述更短更干净），再统一把剩余空格换成 NBSP 打断
+// 一切字面匹配。ZEN_DESC_VERBATIM=1 时两步都跳过。
+//
+// 返回处理后的描述与是否发生改动。
+func shapeToolDescription(name, description string) (string, bool) {
+	if verbatimDescMode() {
+		return description, false
+	}
+	shaped := description
+	changed := false
+	if cleaned, replaced := sanitizeToolDescription(name, shaped); replaced {
+		shaped = cleaned
+		changed = true
+	}
+	if withNBSP := nbspDescription(shaped); withNBSP != shaped {
+		shaped = withNBSP
+		changed = true
+	}
+	return shaped, changed
+}
+
 // sanitizeToolDescription 把描述里的上游封禁短语就地替换成中性说法。
 //
 // 只替换短语，保留描述其余部分：模型靠描述判断工具用途，整段抹掉会让它不会用这个
@@ -205,9 +251,12 @@ func sanitizeToolDescription(_ string, description string) (string, bool) {
 	if description == "" {
 		return description, false
 	}
-	// ZEN_DESC_SANITIZE=1 时启用短语黑名单（默认关闭：对齐 opencode2api
-	// v1.4.8 的零触碰描述做法；2026-11-17 同出口 A/B 实测证明描述文本
-	// 不是 429 的变量）。
+	// ZEN_DESC_VERBATIM=1 时描述逐字出站（对照实验用）。
+	//
+	// 2026-11-21 更正：这里原先写着「2026-11-17 同出口 A/B 实测证明描述文本
+	// 不是 429 的变量」——那个结论是错的。上游免费层确实按描述字面匹配判 429，
+	// 见 opencode2api issue #188 的完整二分表：同样 110 个工具，换掉
+	// edit/read/skill 三条描述即 200，仅改工具名仍 429。
 	if verbatimDescMode() {
 		return description, false
 	}
@@ -1334,13 +1383,11 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 				if wireName != name {
 					fn["name"] = wireName
 				}
-				// 描述里若带上游封禁的客户端指纹，换成中性文本。见
-				// bannedDescriptionFragments 的实测：DSH 的 read/edit/write
-				// 三条描述都会触发 429，换成官方原文后同一请求体转 200。
+				// 描述出口处理：短语黑名单 + NBSP。见 shapeToolDescription
+				// 上关于「上游是字面匹配器」的实测说明。
 				description, _ := fn["description"].(string)
-				if cleaned, replaced := sanitizeToolDescription(wireName, description); replaced {
-					description = cleaned
-					fn["description"] = cleaned
+				if shapedDesc, replaced := shapeToolDescription(wireName, description); replaced {
+					fn["description"] = shapedDesc
 				}
 			}
 		} else {
@@ -1348,9 +1395,8 @@ func renameAndCompleteTools(payload map[string]any, protocol Format) (*ToolRenam
 				entry["name"] = wireName
 			}
 			description, _ := entry["description"].(string)
-			if cleaned, replaced := sanitizeToolDescription(wireName, description); replaced {
-				description = cleaned
-				entry["description"] = cleaned
+			if shapedDesc, replaced := shapeToolDescription(wireName, description); replaced {
+				entry["description"] = shapedDesc
 			}
 		}
 		shaped = append(shaped, entry)
@@ -1735,32 +1781,61 @@ func officialContentMatches(ranked []map[string]any, protocol Format) bool {
 // 也就是说 subset 判据（只看名字）会把带指纹的请求整份放过去，然后 429。
 // 这里复用改名路径本来就有的 sanitizeToolDescription，把短语换成中性文本，
 // 既保住 12 进 12 出，又不给上游递指纹。ZEN_DESC_VERBATIM=1 时跳过（对照实验用）。
+// sanitizeRankedTools 处理透传分支（客户端工具名全在官方集合里）的描述：
+// 短语黑名单 + NBSP。返回改动条数。
+//
+// **官方工具名的那几条跳过**：它们就是上游认可的原文，动了反而破坏身份
+// 指纹（opencode2api v1.5.1 同样只处理客户端工具、不碰官方集）。
+// 只对「名字虽是官方名、但描述被客户端改过」的情况脱敏——那种描述不再是
+// 官方原文，才可能带上游封禁的措辞。
 func sanitizeRankedTools(ranked []map[string]any, protocol Format) int {
 	if verbatimDescMode() {
 		return 0
 	}
+	official := officialToolNameSet()
 	replaced := 0
 	for _, entry := range ranked {
 		name := entryToolName(entry, protocol)
+		if official[name] && officialDescriptionVerbatim(name, entry, protocol) {
+			continue
+		}
 		if protocol == FmtChat {
 			fn, ok := entry["function"].(map[string]any)
 			if !ok {
 				continue
 			}
 			description, _ := fn["description"].(string)
-			if cleaned, hit := sanitizeToolDescription(name, description); hit {
-				fn["description"] = cleaned
+			if shaped, hit := shapeToolDescription(name, description); hit {
+				fn["description"] = shaped
 				replaced++
 			}
 			continue
 		}
 		description, _ := entry["description"].(string)
-		if cleaned, hit := sanitizeToolDescription(name, description); hit {
-			entry["description"] = cleaned
+		if shaped, hit := shapeToolDescription(name, description); hit {
+			entry["description"] = shaped
 			replaced++
 		}
 	}
 	return replaced
+}
+
+// officialDescriptionVerbatim 报告这个官方名工具的描述是否与官方原文一致。
+// 一致就说明客户端没改过，整条保持原样（不动名字也不动描述）。
+func officialDescriptionVerbatim(name string, entry map[string]any, protocol Format) bool {
+	loadOfficialTools()
+	def, ok := opencodeToolsV2[name]
+	if !ok {
+		return false
+	}
+	description := ""
+	if protocol == FmtChat {
+		fn, _ := entry["function"].(map[string]any)
+		description, _ = fn["description"].(string)
+	} else {
+		description, _ = entry["description"].(string)
+	}
+	return description == def.Description
 }
 
 // noStubMode 恒为 false：v1.0 起不再提供跳过补桩的开关。

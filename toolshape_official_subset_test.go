@@ -114,22 +114,42 @@ func TestOfficialSubsetPassesThroughVerbatim(t *testing.T) {
 	}
 }
 
+// TestFullOfficialToolsetStaysVerbatim 验证完整官方集走透传：不改名、不补桩。
+//
+// 描述允许被脱敏（NBSP + 短语黑名单，见 shapeToolDescription），所以这里
+// 只比对名字与参数 schema，不比对描述文本。2026-11-21 起 NBSP 会改写描述，
+// 原先的「逐字节相同」断言已不适用。
 func TestFullOfficialToolsetStaysVerbatim(t *testing.T) {
 	payload := officialSubsetPayload(t, v2OfficialToolOrder)
-	before, err := json.Marshal(payload["tools"])
-	if err != nil {
-		t.Fatal(err)
+	beforeNames := make([]string, 0, len(v2OfficialToolOrder))
+	beforeParams := make([]string, 0, len(v2OfficialToolOrder))
+	for _, raw := range asArr(payload["tools"]) {
+		entry := asMap(raw)
+		beforeNames = append(beforeNames, entryToolName(entry, FmtChat))
+		fn := asMap(entry["function"])
+		encoded, _ := json.Marshal(fn["parameters"])
+		beforeParams = append(beforeParams, string(encoded))
 	}
+
 	_, shaped := renameAndCompleteTools(payload, FmtChat)
 	if shaped {
 		t.Fatal("full official set must be passed through verbatim")
 	}
-	after, err := json.Marshal(payload["tools"])
-	if err != nil {
-		t.Fatal(err)
+
+	out := asArr(payload["tools"])
+	if len(out) != len(v2OfficialToolOrder) {
+		t.Fatalf("透传不补桩：出站 %d 个，want %d", len(out), len(v2OfficialToolOrder))
 	}
-	if string(before) != string(after) {
-		t.Fatalf("full official set was modified:\nbefore %s\nafter  %s", before, after)
+	for i, raw := range out {
+		entry := asMap(raw)
+		if name := entryToolName(entry, FmtChat); name != beforeNames[i] {
+			t.Fatalf("第 %d 个名字被改：%q -> %q", i, beforeNames[i], name)
+		}
+		fn := asMap(entry["function"])
+		encoded, _ := json.Marshal(fn["parameters"])
+		if string(encoded) != beforeParams[i] {
+			t.Fatalf("第 %d 个参数 schema 被改：\nbefore %s\nafter  %s", i, beforeParams[i], encoded)
+		}
 	}
 }
 

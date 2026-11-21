@@ -1047,6 +1047,13 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 	}
 
 	var reqRenames *ToolRenames
+	// 客户端环境声明在整形前解析：它可能来自顶层 client_environment（读完即删）
+	// 或消息里的 <env> 块，必须在 buildUpstream 改写 payload 之前取出来。
+	reqEnv, envRejected, envErr := resolveClientEnvironment(in, entry)
+	if envErr != nil && envRejected {
+		writeErr(w, 400, "invalid_request_error", envErr.Error())
+		return
+	}
 	buildBody := func() ([]byte, error) {
 		u, rn, err := buildUpstream(entry, target, in)
 		if err != nil {
@@ -1061,7 +1068,7 @@ func forwardResponses(w http.ResponseWriter, req *http.Request, entry Format) {
 		// 免费层门禁：messages[0] 必须是 OpenCode 官方 system 提示词。
 		// 上游目标为 chat（/chat/completions）时一律注入，覆盖 entry=chat 及 entry=responses->target=chat 全路径。
 		if target == FmtChat {
-			injectOfficialSystemPrompt(u)
+			injectOfficialSystemPrompt(u, reqEnv)
 		}
 		// FreeTier 门禁实测要求上游 stream:true（否则 403）；
 		// 客户端非流由网关聚 SSE 回 JSON（见 nonstream.go）。

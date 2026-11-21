@@ -118,7 +118,8 @@ func TestOfficialToolsetPassesThroughWithSanitizedDescriptions(t *testing.T) {
 		if asStr(fn["name"]) != "read" {
 			continue
 		}
-		desc := asStr(fn["description"])
+		// 描述同时经过短语黑名单与 NBSP 替换，比较前把 NBSP 折回空格。
+		desc := strings.ReplaceAll(asStr(fn["description"]), "\u00a0", " ")
 		if strings.Contains(desc, "line-numbered content") {
 			t.Fatalf("指纹短语没洗掉: %q", desc)
 		}

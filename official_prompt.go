@@ -4,10 +4,7 @@ import (
 	_ "embed"
 	"log"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -53,51 +50,52 @@ Use the skill tool to load a skill when a task matches its description.
   </skill>
 </available_skills>`
 
-var (
-	opencodeEnvOnce sync.Once
-	opencodeWorkDir string
-)
-
-func opencodeEnvironment(model string) string {
-	opencodeEnvOnce.Do(func() {
-		directory := ""
-		if current, err := os.Getwd(); err == nil {
-			directory = filepath.Clean(strings.TrimSpace(current))
-		}
-		if directory == "" || directory == "." {
-			directory = "/workspace"
-		}
-		opencodeWorkDir = directory
-	})
-	platform := runtime.GOOS
-	if platform == "windows" {
-		platform = "win32"
-	}
+func opencodeEnvironment(model string, environment clientEnvironment) string {
 	// 逐字对齐官方 CLI 发出的动态尾部（system prompt 的最后一段）。
-	// 上游按完整 system prompt 指纹判定客户端身份，这段的措辞/空行/顺序
+	// 上游按完整 system prompt 识别客户端身份，这段的措辞/空行/顺序
 	// 与官方不一致就会 429。工作目录、模型名与日期是仅有的动态量。
 	//
-	// 格式取自官方 CLI 原文（与 opencode2api 的 opencodeEnvironment 一致）：
-	// 首行声明模型身份，随后是 <env> 块。不再插入本机专属路径等自造内容——
-	// 那不是官方措辞，只会让指纹偏离。
+	// 环境值一律来自客户端自报（见 client_environment.go），不再用网关主机的
+	// os.Getwd() / runtime.GOOS 冒充：网关跑在哪台机器上跟客户端在哪无关，
+	// 写错的路径还会让模型按错误的根目录组织操作。缺什么写 unknown。
 	apiModel := strings.TrimSpace(strings.TrimPrefix(model, "opencode/"))
 	if apiModel == "" {
 		apiModel = "unknown"
+	}
+	directory := strings.TrimSpace(environment.WorkingDirectory)
+	if directory == "" {
+		directory = "unknown"
+	}
+	workspace := strings.TrimSpace(environment.WorkspaceRoot)
+	if workspace == "" {
+		workspace = "unknown"
+	}
+	platform := strings.TrimSpace(environment.Platform)
+	if platform == "" {
+		platform = "unknown"
+	}
+	gitRepo := "unknown"
+	if environment.IsGitRepo != nil {
+		if *environment.IsGitRepo {
+			gitRepo = "yes"
+		} else {
+			gitRepo = "no"
+		}
 	}
 	return strings.Join([]string{
 		"You are powered by the model named " + apiModel + ". The exact model ID is opencode/" + apiModel,
 		"Here is some useful information about the environment you are running in:",
 		"<env>",
-		"  Working directory: " + opencodeWorkDir,
-		"  Workspace root folder: " + opencodeWorkDir,
-		"  Is directory a git repo: yes",
+		"  Working directory: " + directory,
+		"  Workspace root folder: " + workspace,
+		"  Is directory a git repo: " + gitRepo,
 		"  Platform: " + platform,
 		"  Today's date: " + time.Now().UTC().Format("Mon Jan 02 2006"),
 		"</env>",
 	}, "\n")
 }
 
-func opencodeSystemPrompt(model string) string {
+func opencodeSystemPrompt(model string, environment clientEnvironment) string {
 	// 静态正文（8.5KB 官方 CLI 原文，取自 opencode2api 的
 	// opencode_prompt_v2.txt）与动态尾部、skills 段逐字拼接。
 	//
@@ -110,15 +108,19 @@ func opencodeSystemPrompt(model string) string {
 		body = override
 	}
 	// skills 段单独追加：官方正文不含 <available_skills>，由 CLI 运行时补。
-	return body + opencodeEnvironment(model) + "\n" + opencodeSkills
+	return body + opencodeEnvironment(model, environment) + "\n" + opencodeSkills
 }
 
-func injectOfficialSystemPrompt(payload map[string]any) bool {
+// injectOfficialSystemPrompt 把官方提示词装成 messages[0]。
+//
+// environment 是本次请求的客户端环境声明（见 client_environment.go）。
+// 每个请求各带一份，不进全局变量，避免并发会话串线。
+func injectOfficialSystemPrompt(payload map[string]any, environment clientEnvironment) bool {
 	if payload == nil {
 		return false
 	}
 	model, _ := payload["model"].(string)
-	prompt := opencodeSystemPrompt(model)
+	prompt := opencodeSystemPrompt(model, effectiveClientEnvironment(environment))
 	return injectChatPrompt(payload, prompt)
 }
 
